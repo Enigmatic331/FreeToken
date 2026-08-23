@@ -70,6 +70,10 @@ class EnvClassSingleton:
     # backend runtime
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
+    # DSV4 MTP speculative decoding (scheduler/spec.py). Requires
+    # DISABLE_OVERLAP_SCHEDULING=1 and tp==1; the draft sidecar device comes from
+    # FREETOKEN_MTP_DEVICE (read in mtp_sidecar.py; point it at a spare GPU).
+    MTP_SPEC = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state

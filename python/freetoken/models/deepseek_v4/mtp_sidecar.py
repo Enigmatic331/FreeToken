@@ -13,6 +13,13 @@ API (bs=1):
                                   the token AFTER the one that produced hc[i]).
   sidecar.draft(hc1, tok)      -- one step: returns the greedy draft token id.
   sidecar.rewind(n)            -- back the ring position up n steps (rejection).
+  sidecar.reset()              -- pos back to 0 (new request; ring overwrites).
+  sidecar.extend(hc, tokens)   -- ingest S aligned pairs at the CURRENT position
+                                  (one forward at pos 0, single-token steps past
+                                  it -- the reference block's two modes); returns
+                                  the greedy draft after the last pair. The spec
+                                  driver feeds only COMMITTED pairs through this,
+                                  so its ring never needs a rejection rewind.
 
 The reference block is used verbatim except for three loading/runtime fixes
 proven in scripts/mtp_acceptance_probe.py: fp4 params direct-assigned (torch has
@@ -47,7 +54,7 @@ def _torch_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
 
 
 class MTPSidecar:
-    def __init__(self, model_path: str, device: str | None = None):
+    def __init__(self, model_path: str, device: str | None = None, max_seq_len: int = 8192):
         self.device = torch.device(device or os.environ.get("FREETOKEN_MTP_DEVICE", "cuda:0"))
         inf = os.path.join(model_path, "inference")
         spec = importlib.util.spec_from_file_location("_dsv4_reference", os.path.join(inf, "model.py"))
@@ -68,7 +75,9 @@ class MTPSidecar:
             cfg = json.load(f)
         args = ref.ModelArgs(**cfg)
         args.max_batch_size = 1
-        args.max_seq_len = 8192  # ring is window-sized; this only caps positional buffers
+        # ring is window-sized; this only caps positional buffers (freqs), so size it to
+        # the SERVING max_seq_len -- a draft at pos >= this would index freqs out of range.
+        args.max_seq_len = max(8192, int(max_seq_len))
         ref.world_size, ref.rank = 1, 0
         ref.default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         ref.scale_fmt = "ue8m0" if getattr(args, "scale_dtype", None) == "fp8" else getattr(args, "scale_fmt", None)
@@ -76,14 +85,14 @@ class MTPSidecar:
 
         prev_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
-        with torch.device(self.device):
+        with self._fwd_guard(self.device):
             self.blk = ref.MTPBlock(args.n_layers, args)
             self.blk.embed = ref.ParallelEmbedding(args.vocab_size, args.dim)
             self.blk.head = ref.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps)
+            self._load(model_path)
+            if os.environ.get("FREETOKEN_MTP_BF16", "1") == "1":
+                self._dequant_all_bf16()
         torch.set_default_dtype(prev_dtype)
-        self._load(model_path)
-        if os.environ.get("FREETOKEN_MTP_BF16", "1") == "1":
-            self._dequant_all_bf16()
         self.pos = 0
 
     def _dequant_all_bf16(self) -> None:
@@ -163,16 +172,61 @@ class MTPSidecar:
             h.__exit__(None, None, None)
 
     class _fwd_guard:
-        # reference forwards allocate under the global default dtype AND device
+        # Reference forwards allocate under the global default dtype AND device. Also pin
+        # the ACTIVE cuda device (torch.cuda.device == cudaSetDevice with restore): the
+        # reference block's ops otherwise leave it switched to the sidecar GPU, and the
+        # engine's next forward_batch would then read current_stream() on the wrong device
+        # (stream assert / async corruption when the sidecar shares a serving process).
         def __init__(self, device):
             self._dev_ctx = torch.device(device)
+            self._cuda_ctx = (
+                torch.cuda.device(device) if torch.device(device).type == "cuda" else None
+            )
         def __enter__(self):
             self._prev = torch.get_default_dtype()
             torch.set_default_dtype(torch.bfloat16)
+            if self._cuda_ctx is not None:
+                self._cuda_ctx.__enter__()
             self._dev_ctx.__enter__()
         def __exit__(self, *a):
             self._dev_ctx.__exit__(*a)
+            if self._cuda_ctx is not None:
+                self._cuda_ctx.__exit__(*a)
             torch.set_default_dtype(self._prev)
+
+    def reset(self) -> None:
+        """Start a new request: position back to 0. Ring/cache contents are stale but every
+        slot is overwritten before it can be attended (slot j is written at the first ingest
+        of a position p with p % window == j, which precedes any query with j in window)."""
+        self.pos = 0
+
+    @torch.inference_mode()
+    def extend(self, hc: torch.Tensor, tokens) -> int:
+        """Ingest S aligned (state@p -> token@p+1) pairs at the CURRENT ring position and
+        return the greedy draft for the position after the last pair. ``hc`` is [S,hc,d] or
+        [1,S,hc,d]; ``tokens`` a length-S int tensor/list.
+
+        The reference block supports exactly two modes: a multi-token forward at start_pos
+        0 (prefill) and single-token steps at any position (its pos>0 branch hard-assumes
+        seqlen 1 — ring write, topk helpers, compressor carry). So a batch at pos 0 runs
+        as ONE forward; anything else loops single-token steps. Callers sizing a bulk
+        ingest should also mind the plain-torch sparse_attn's [S, topk, d] gather: at pos
+        0 it materializes ~S*(win + S/4)*576*2 bytes on the sidecar device."""
+        hc = hc.to(self.device, torch.bfloat16, non_blocking=True).view(1, -1, *hc.shape[-2:])
+        if not torch.is_tensor(tokens):
+            tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.to(self.device).view(1, -1)
+        S = hc.shape[1]
+        assert tokens.shape[1] == S, (tokens.shape, hc.shape)
+        with self._fwd_guard(self.device):
+            if self.pos == 0 and S > 1:
+                logits = self.blk(hc, 0, tokens)
+                self.pos = S
+            else:
+                for i in range(S):
+                    logits = self.blk(hc[:, i : i + 1], self.pos, tokens[:, i : i + 1])
+                    self.pos += 1
+        return int(logits.view(-1, logits.shape[-1])[-1].argmax().item())
 
     @torch.inference_mode()
     def prefill(self, hc: torch.Tensor, tokens: torch.Tensor) -> int:

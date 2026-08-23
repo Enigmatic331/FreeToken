@@ -64,6 +64,12 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Owned by the MTP speculative-decoding driver (scheduler/spec.py). While True the request
+    # is stepped by SpecDecodeManager verify batches only: can_decode goes False so
+    # DecodeManager.filter_reqs never re-adopts it after a spec forward. The driver clears the
+    # flag (and hands the request back to the decode manager) only at a cycle boundary, where
+    # the counters are indistinguishable from a normal mid-decode request's.
+    spec_active: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -96,9 +102,21 @@ class Req:
         self._ids_buf[n:m] = next_token
         self.input_ids = self._ids_buf[:m]
 
+    def spec_rewind(self, length: int, tail_token: int) -> None:
+        """Speculative-decode reject: truncate to ``length`` tokens with the last one
+        replaced by ``tail_token`` (the true sample at the rejected draft's position).
+        KV for that position is stale but position-addressed; the next verify extend
+        overwrites it in place. cached_len drops to length-1 so that extend re-runs
+        exactly the rewritten position."""
+        assert 0 < length <= self.device_len
+        self._ids_buf[length - 1] = tail_token
+        self.input_ids = self._ids_buf[:length]
+        self.device_len = length
+        self.cached_len = length - 1
+
     @property
     def can_decode(self) -> bool:
-        return self.remain_len > 0
+        return self.remain_len > 0 and not self.spec_active
 
     def __repr__(self) -> str:
         return (
@@ -146,6 +164,16 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # MTP speculative verify batch (scheduler/spec.py): one request, a [last_sampled(, draft)]
+    # extend that runs the DSV4 fused spec path (per-token decode attention + batched MoE) and
+    # returns one logits row PER TOKEN instead of one per request. rows_per_req carries the
+    # per-request logit-row count for the sampler / write mapping (None = 1 row per request).
+    spec_verify: bool = field(default=False, init=False)
+    rows_per_req: List[int] | None = field(default=None, init=False)
+
+    @property
+    def num_logit_rows(self) -> int:
+        return sum(self.rows_per_req) if self.rows_per_req is not None else self.size
 
     @property
     def is_prefill(self) -> bool:

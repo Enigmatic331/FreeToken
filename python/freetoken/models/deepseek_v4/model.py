@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.core import get_global_ctx
+from freetoken.env import ENV
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 
 # MTP acceptance probe: when FREETOKEN_MTP_PROBE_DIR is set, dump
@@ -168,6 +169,34 @@ class Block(nn.Module):
         x = self.hc_post(x, residual, post, comb)
         return x
 
+    def spec_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctxs):
+        # MTP speculative verify: ``x`` is [T, 1, hc, dim] -- T CONSECUTIVE tokens of ONE
+        # request (not T requests). Per-token ops (HC / norms / MoE) run batched over the T
+        # rows exactly like a decode batch; MoE is the payoff (routes for all T tokens hit
+        # the offload cache in ONE ensure_experts, so the expert fetch is amortized over T
+        # tokens -- the speculative 2-for-1). Attention CANNOT batch the same way: token t+1
+        # attends token t's just-written window KV, and the compressor/indexer ring carries
+        # advance token-by-token (read prev page block -> write this page block). So attention
+        # runs as T sequential bs=1 decode_steps -- same stream, so the KV/carry writes of
+        # step t are ordered before step t+1's reads. The prefill extend path is NOT usable
+        # here: Compressor.extend requires a 128-aligned start, and a verify starts anywhere.
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        x = self.attn_norm(x)
+        outs = [
+            self.attn.decode_step(x[t : t + 1], pos[t : t + 1], rows, cmp_stage_cap, wctxs[t])
+            for t in range(x.size(0))
+        ]
+        x = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
+        x = self.hc_post(x, residual, post, comb)
+        return x
+
 
 class Transformer(nn.Module):
     def __init__(self, args: DeepseekV4Args):
@@ -185,6 +214,11 @@ class Transformer(nn.Module):
         self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32), requires_grad=False)
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32), requires_grad=False)
+        # MTP speculative decoding: the last forward's final-layer hc states (pre-hc_head, the
+        # exact tensor the acceptance probe validated the draft head against). Stashed under
+        # ENV.MTP_SPEC and consumed-and-cleared each drain by the spec driver, which requires
+        # non-overlapped scheduling (the next forward would overwrite the stash).
+        self.spec_hc: torch.Tensor | None = None
 
     def bind(self, pool, device: torch.device) -> None:
         for layer in self.layers:
@@ -220,9 +254,40 @@ class Transformer(nn.Module):
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
         if _MTP_PROBE_DIR is not None:
             _mtp_probe_dump("prefill", input_ids, h, flat_positions)
+        if ENV.MTP_SPEC:
+            self.spec_hc = h  # [1, T, hc, dim]
         h = self.hc_head(h)
         h = self.norm(h)
         return F.linear(h[0, last_indices], self.head)  # [B, vocab]
+
+    def spec_extend(
+        self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
+    ) -> torch.Tensor:
+        # MTP speculative verify (eager only, bs=1): ``input_ids``/``pos`` are [T] -- T
+        # consecutive positions of ONE request, e.g. [last_sampled@p, draft@p+1]. Runs the
+        # T tokens as batch ROWS through the per-token machinery (see Block.spec_step: HC /
+        # norms / MoE batched, attention sequential per token) against decode-style
+        # addressing: the metadata's one-row whole-history snapshot, window ring and the
+        # per-page compressor/indexer carry blocks -- all position-addressed, so a rejected
+        # draft's entries are simply overwritten when the position is re-extended. Returns
+        # one logits row PER TOKEN: row t is the true next-token distribution at pos[t],
+        # which is what makes acceptance (row0's sample == draft) exact at any temperature.
+        T = input_ids.numel()
+        rows = torch.zeros(1, dtype=torch.long, device=input_ids.device)
+        ids = input_ids.view(T, 1)
+        h = self.embed(ids)
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [T, 1, hc, dim]
+        md = get_global_ctx().batch.attn_metadata
+        # Window-ring context per token (layer-invariant, position-dependent). Computed up
+        # front: it resolves ring SLOTS (addresses), not contents, and the slots for all T
+        # positions were allocated before this forward.
+        wctxs = [md.window_ctx(pos[t : t + 1], rows) for t in range(T)]
+        for layer in self.layers:
+            h = layer.spec_step(h, pos, rows, cmp_stage_cap, ids, wctxs)
+        self.spec_hc = h  # [T, 1, hc, dim] -- the driver feeds accepted rows to the sidecar
+        h = self.hc_head(h)
+        h = self.norm(h)
+        return F.linear(h[:, -1], self.head)  # [T, vocab]
 
     def decode(
         self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
@@ -307,11 +372,36 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
         self._transformer.load_state_dict(casted, assign=True, strict=False)
 
+    def set_spec_hc(self, h: torch.Tensor) -> None:
+        """Graph-replay path: re-arm the consumed stash with the CAPTURED hc buffer. A spec
+        graph replay refreshes that buffer's content in place without running forward(), so
+        the driver's take_spec_hc would otherwise find the stash cleared."""
+        self._transformer.spec_hc = h
+
+    def take_spec_hc(self) -> torch.Tensor | None:
+        """The last forward's final-layer hc states as [T, hc, dim], consumed (cleared) so a
+        multi-GB prompt-chunk stash never outlives its drain. Both stash shapes ([1,T,hc,d]
+        prefill, [T,1,hc,d] spec verify) flatten to the same row-per-token layout."""
+        h = self._transformer.spec_hc
+        self._transformer.spec_hc = None
+        if h is None:
+            return None
+        return h.reshape(-1, h.shape[-2], h.shape[-1])
+
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
         batch = get_global_ctx().batch
         input_ids = batch.input_ids.long()
         md = batch.attn_metadata
+        if batch.spec_verify:
+            pos = batch.positions.long().view(-1)
+            if torch.cuda.is_current_stream_capturing():
+                # Same contract as decode capture: stage as wide as the snapshot; the
+                # kernels bound their work from device-side counts at replay.
+                cmp_stage_cap = md.stage_width - 1
+            else:
+                cmp_stage_cap = int(pos.max().item())
+            return self._transformer.spec_extend(input_ids.view(-1), pos, cmp_stage_cap)
         if batch.is_prefill:
             # Ragged batched prefill (bs >= 1): each request starts from its own cached_len.
             # A cold segment (start_pos == 0) re-seeds the compressor carry register inside its

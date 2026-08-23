@@ -183,8 +183,66 @@ class GraphRunner:
             self.graph_map[bs] = graph
 
         self._reset_moe_offload_cache()
+        self._capture_spec_graph(vocab_size, model, pool)
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+
+    # MTP speculative decoding: verify steps are 2-token extends of ONE request through the
+    # DSV4 fused spec path (Transformer.spec_extend). Eager, that walk is launch-bound
+    # (43 layers x per-token attention + MoE ~= hundreds of ms); captured, it costs about a
+    # decode step. Shapes are static (T=2, bs=1) and every constituent is the same
+    # capture-safe machinery the decode graphs already record (snapshot-addressed attention,
+    # device-side MoE slot path), so one extra graph suffices. T=1 spec steps (the
+    # output-budget edge) stay eager -- they are rare.
+    SPEC_T = 2
+
+    def _capture_spec_graph(self, vocab_size: int, model: BaseLLMModel, pool) -> None:
+        from freetoken.env import ENV
+
+        self.spec_graph: torch.cuda.CUDAGraph | None = None
+        if not ENV.MTP_SPEC or self.max_graph_bs == 0 or not hasattr(model, "take_spec_hc"):
+            return
+        T = self.SPEC_T
+        self.spec_input_ids = torch.zeros(T, dtype=torch.int32, device=self.device)
+        self.spec_positions = torch.zeros(T, dtype=torch.int32, device=self.device)
+        self.spec_logits = torch.empty(T, vocab_size, dtype=torch.float32, device=self.device)
+        batch = Batch(reqs=[self.dummy_req], phase="prefill")
+        batch.spec_verify = True
+        batch.rows_per_req = [T]
+        batch.padded_reqs = batch.reqs
+        # Dummy-row snapshot staging + capture metadata, same as a decode capture.
+        self.attn_backend.prepare_for_capture(batch)
+        batch.input_ids = self.spec_input_ids
+        batch.positions = self.spec_positions
+        graph = torch.cuda.CUDAGraph()
+        with get_global_ctx().forward_batch(batch):
+            self.spec_logits.copy_(model.forward())  # warmup (kernel compilation at T=2)
+            with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                self.spec_logits.copy_(model.forward())
+            self._reset_moe_offload_cache()
+        self.spec_graph = graph
+        # The captured stash buffer: replays refresh its content in place; re-arm the model's
+        # consumed stash with it after every replay (see replay_spec).
+        self._spec_model = model
+        self._spec_hc_buf = model.take_spec_hc()
+        assert self._spec_hc_buf is not None
+        logger.info_rank0("Captured MTP spec-verify CUDA graph (T=2)")
+
+    def can_use_spec_graph(self, batch: Batch) -> bool:
+        return (
+            getattr(self, "spec_graph", None) is not None
+            and batch.spec_verify
+            and batch.reqs[0].extend_len == self.SPEC_T
+        )
+
+    def replay_spec(self, batch: Batch) -> torch.Tensor:
+        assert self.can_use_spec_graph(batch)
+        self.spec_input_ids.copy_(batch.input_ids)
+        self.spec_positions.copy_(batch.positions)
+        self.attn_backend.prepare_for_spec_replay(batch)
+        self.spec_graph.replay()
+        self._spec_model.set_spec_hc(self._spec_hc_buf)
+        return self.spec_logits
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs

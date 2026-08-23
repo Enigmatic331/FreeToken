@@ -245,9 +245,13 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not ctx.batch.spec_verify:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
+            # Decode batches, and MTP spec-verify extends: a verify is 1-2 tokens of one
+            # request -- the same shape class as a tiny decode batch -- so the decode
+            # on-demand slot path serves it (device-side + fixed shapes = CUDA-graph
+            # capturable, which the spec verify graph relies on).
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
