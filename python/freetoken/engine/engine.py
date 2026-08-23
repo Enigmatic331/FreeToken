@@ -1093,6 +1093,16 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+
+    if is_dsv4 and config.tp_info.size > 1:
+        # DSV4 TP>1 == expert parallelism with replicated dense: everything below
+        # the router (offload cache, cpu executor, bank loaders, prefill streaming)
+        # sees only this rank's expert shard. model_config was parsed before the
+        # rank workers spawned, so the shard division lands here, after set_tp_info.
+        from freetoken.models.deepseek_v4.config import ep_shard
+
+        _, local = ep_shard(model_config.dsv4_args.n_routed_experts)
+        object.__setattr__(model_config, "num_experts", local)
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)

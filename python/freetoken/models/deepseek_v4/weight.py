@@ -189,9 +189,12 @@ def load_dsfp4_expert_sources(
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
+    from .config import ep_shard
+
     folder = model_path
     weight_map = _weight_map(folder)
-    L, E = args.n_layers, args.n_routed_experts
+    L = args.n_layers
+    ep_off, E = ep_shard(args.n_routed_experts)  # this rank's shard (EP under TP>1)
     H, I = args.dim, args.moe_inter_dim
 
     for shard in sorted(set(weight_map.values())):
@@ -203,6 +206,8 @@ def load_dsfp4_expert_sources(
         if m is None:
             continue
         if int(m.group("layer")) >= L:  # skip the MTP layer (index L)
+            continue
+        if not (ep_off <= int(m.group("expert")) < ep_off + E):  # not this rank's
             continue
         shards[shard].append((name, m))
 
@@ -223,7 +228,7 @@ def load_dsfp4_expert_sources(
             path = os.path.join(folder, shard)
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                 for name, m in shards[shard]:
-                    layer = _place_dsfp4(banks, name, f.get_tensor(name), I)
+                    layer = _place_dsfp4(banks, name, f.get_tensor(name), I, ep_off)
                     tracker.note(layer)
                     placed += 1
             drop_page_cache(path)
@@ -268,11 +273,12 @@ def is_expert_tensor(name: str) -> bool:
     return _EXPERT_RE.match(name) is not None
 
 
-def _place_dsfp4(banks: dict, name: str, t: torch.Tensor, I: int) -> int:
+def _place_dsfp4(banks: dict, name: str, t: torch.Tensor, I: int, ep_off: int = 0) -> int:
     """Copy one expert tensor into its layer/expert slot (shared by serial + parallel
-    readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index."""
+    readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index.
+    ``ep_off``: this rank's expert-shard offset — banks index local expert ids."""
     m = _EXPERT_RE.match(name)
-    layer, expert = int(m.group("layer")), int(m.group("expert"))
+    layer, expert = int(m.group("layer")), int(m.group("expert")) - ep_off
     proj, kind = m.group("proj"), m.group("kind")
     if kind == "weight":
         t = t.view(torch.uint8)
@@ -302,7 +308,10 @@ def load_dsfp4_expert_sources_parallel(
     from freetoken.models.weight import iter_expert_tensors_parallel
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
-    L, E = args.n_layers, args.n_routed_experts
+    from .config import ep_shard
+
+    L = args.n_layers
+    ep_off, E = ep_shard(args.n_routed_experts)  # this rank's shard (EP under TP>1)
     H, I = args.dim, args.moe_inter_dim
     e8m0 = torch.float8_e8m0fnu
     specs = {
@@ -316,13 +325,15 @@ def load_dsfp4_expert_sources_parallel(
 
     def _is_expert(name: str) -> bool:
         m = _EXPERT_RE.match(name)
-        return m is not None and int(m.group("layer")) < L  # skip the MTP layer (index L)
+        if m is None or int(m.group("layer")) >= L:  # skip the MTP layer (index L)
+            return False
+        return ep_off <= int(m.group("expert")) < ep_off + E  # this rank's shard
 
     def _load(sink) -> int:
         tracker = LayerCompletionTracker(E * 6, hb, sink)
         placed = 0
         for name, t in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
-            layer = _place_dsfp4(banks, name, t, I)
+            layer = _place_dsfp4(banks, name, t, I, ep_off)
             tracker.note(layer)
             placed += 1
         return placed

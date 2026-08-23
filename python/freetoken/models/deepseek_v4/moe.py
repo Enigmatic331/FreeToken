@@ -77,9 +77,14 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     (per-route dequant GEMV)."""
 
     def __init__(self, layer_id: int, args: DeepseekV4Args):
+        from .config import ep_shard
+
         super().__init__(
             layer_id=layer_id,
-            num_experts=args.n_routed_experts,
+            # EP under TP>1: this layer computes only this rank's expert shard
+            # (banks, cache and streaming are all local); partial outputs are
+            # summed across ranks by routed_forward's _maybe_all_reduce.
+            num_experts=ep_shard(args.n_routed_experts)[1],
             top_k=args.n_activated_experts,
             hidden_size=args.dim,
             intermediate_size=args.moe_inter_dim,
@@ -124,11 +129,15 @@ class MoE(nn.Module):
     """Sparse MoE: hash/score router -> offloaded FP4 routed experts + shared expert."""
 
     def __init__(self, layer_id: int, args: DeepseekV4Args):
+        from .config import ep_shard
+
         super().__init__()
         self.dim = args.dim
         self.gate = Gate(layer_id, args)
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
         self.experts = DSV4OffloadMoELayer(layer_id, args)
+        self.ep_off, self.ep_count = ep_shard(args.n_routed_experts)
+        self.ep_active = self.ep_count != args.n_routed_experts
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
@@ -138,6 +147,16 @@ class MoE(nn.Module):
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
         shared = self.shared_experts(x)
+        if self.ep_active:
+            # EP: keep only this rank's routes — remap to local bank ids, zero the
+            # weights of foreign routes (id sentinel 0 stays in-range; its zero
+            # weight nulls the contribution). Routes stay normalized globally, so
+            # the cross-rank all-reduce of partials reconstructs the full sum.
+            # (The shared expert is replicated and added after the reduce.)
+            local = indices - self.ep_off
+            owned = (local >= 0) & (local < self.ep_count)
+            indices = torch.where(owned, local, local.new_zeros(()))
+            weights = torch.where(owned, weights, weights.new_zeros(()))
         # routed_forward may mutate the ids in place (offload decode slot remap);
         # indices.to(int32) always copies (int64 source), so no clone needed here.
         routed = self.experts.routed_forward(

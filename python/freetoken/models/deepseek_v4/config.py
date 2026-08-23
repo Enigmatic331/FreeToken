@@ -20,6 +20,26 @@ from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, Rotar
 from .args import load_args
 
 
+def ep_shard(n_global: int) -> tuple[int, int]:
+    """(offset, count) of this rank's routed-expert shard. TP>1 serves DSV4 as
+    expert-parallel with replicated dense: rank r owns experts
+    [r*E/tp, (r+1)*E/tp)."""
+    from freetoken.distributed import try_get_tp_info
+
+    info = try_get_tp_info()
+    if info is None or info.size == 1:
+        return 0, n_global
+    assert n_global % info.size == 0, (
+        f"n_routed_experts={n_global} not divisible by tp_size={info.size}"
+    )
+    count = n_global // info.size
+    return info.rank * count, count
+
+
+def _ep_local_experts(n_global: int) -> int:
+    return ep_shard(n_global)[1]
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     model_path = getattr(hf_config, "_name_or_path", None) or getattr(
         hf_config, "name_or_path", None
@@ -64,7 +84,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
             base=args.rope_theta,
             scaling=rope_scaling,
         ),
-        num_experts=args.n_routed_experts,
+        # EP under TP>1: everything below the router (offload cache, cpu executor,
+        # bank loaders, prefill streaming) sees only this rank's expert shard; the
+        # router itself scores/selects over the global expert set from dsv4_args.
+        num_experts=_ep_local_experts(args.n_routed_experts),
         num_experts_per_tok=args.n_activated_experts,
         moe_intermediate_size=args.moe_inter_dim,
         norm_topk_prob=True,
