@@ -355,3 +355,79 @@ __all__ = [
     "load_dsfp4_expert_sources_parallel",
     "is_expert_tensor",
 ]
+
+
+# --------------------------------------------------------------------------------------
+# MTP (multi-token prediction) draft head: checkpoint tensors under ``mtp.0.*`` --
+# a full extra DSV4 block (own attention + 256 routed ds_fp4 experts) plus the
+# embedding/hidden merge (e_proj/h_proj/enorm/hnorm) and its own hc head mixer.
+# Groundwork for speculative decoding; not yet wired into the engine.
+# --------------------------------------------------------------------------------------
+_MTP_EXPERT_RE = re.compile(
+    r"^mtp\.0\.ffn\.experts\.(?P<expert>\d+)\.(?P<proj>w1|w2|w3)\.(?P<kind>weight|scale)$"
+)
+
+
+def iter_mtp_weights(model_path: str, device):
+    """Stream the MTP block's dense tensors as ``(name, tensor)`` (checkpoint dtype,
+    fp8 + e8m0 preserved), mirroring ``iter_weights``. Routed MTP experts come from
+    ``load_dsfp4_mtp_expert_bank`` instead."""
+    weight_map = _weight_map(model_path)
+    reader = _ShardReader(model_path, weight_map, device)
+    try:
+        for name in sorted(weight_map):
+            if name.startswith("mtp.0.") and _MTP_EXPERT_RE.match(name) is None:
+                yield name, reader.get(name)
+    finally:
+        reader.close()
+
+
+def load_dsfp4_mtp_expert_bank(model_path: str, args: DeepseekV4Args) -> dict[str, torch.Tensor]:
+    """Pinned host bank of the MTP block's routed ds_fp4 experts (single layer,
+    EP-sharded like the main layers). Returns the 4 bank tensors keyed like
+    ``load_dsfp4_expert_sources`` but without the per-layer list nesting."""
+    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
+
+    from .config import ep_shard
+
+    ep_off, E = ep_shard(args.n_routed_experts)
+    H, I = args.dim, args.moe_inter_dim
+    e8m0 = torch.float8_e8m0fnu
+    specs = {
+        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
+        "down_packed": ((E, H, I // 2), torch.uint8),
+        "down_scale": ((E, H, I // 32), e8m0),
+    }
+    hb = alloc_layer_banks(specs, 1)
+    banks = {name: hb[name][0].tensor for name in specs}
+    weight_map = _weight_map(model_path)
+    by_shard: dict[str, list[tuple[str, re.Match]]] = collections.defaultdict(list)
+    for name, shard in weight_map.items():
+        m = _MTP_EXPERT_RE.match(name)
+        if m is None or not (ep_off <= int(m.group("expert")) < ep_off + E):
+            continue
+        by_shard[shard].append((name, m))
+    placed = 0
+    for shard in sorted(by_shard):
+        with safetensors.safe_open(os.path.join(model_path, shard), framework="pt", device="cpu") as f:
+            for name, m in by_shard[shard]:
+                expert = int(m.group("expert")) - ep_off
+                proj, kind = m.group("proj"), m.group("kind")
+                t = f.get_tensor(name)
+                key = ("gate_up" if proj in ("w1", "w3") else "down") + (
+                    "_packed" if kind == "weight" else "_scale"
+                )
+                if kind == "weight":
+                    t = t.view(torch.uint8)
+                dst = banks[key][expert]
+                if proj == "w1":
+                    dst[:I] = t
+                elif proj == "w3":
+                    dst[I:] = t
+                else:
+                    dst[:] = t
+                placed += 1
+    assert placed == E * 6, f"MTP experts: placed {placed}, expected {E * 6}"
+    pin_banks(hb)
+    return banks
