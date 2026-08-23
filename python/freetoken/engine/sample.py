@@ -57,6 +57,10 @@ class Sampler:
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
+        if batch.rows_per_req is not None:
+            # Spec-verify batches sample one row PER TOKEN; repeat each request's params to
+            # match its logit-row count so the sampling tensors stay row-aligned.
+            params = [p for p, n in zip(params, batch.rows_per_req) for _ in range(n)]
         if all(p.is_greedy for p in params):
             return BatchSamplingArgs(temperatures=None)
 

@@ -274,6 +274,23 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def free_spec_tail(self, req: Req, keep_len: int) -> None:
+        """Speculative-decode reject: free the whole page(s) the rejected verify extend
+        allocated strictly past ``keep_len`` committed tokens, so the re-extend's
+        allocate_paged (which re-allocates every page >= div_ceil(keep_len, P)) does not
+        orphan them. Non-empty only when the rejected draft's position started a fresh page
+        (1-in-page_size case); a partial tail page is kept and overwritten in place. These
+        positions were allocated by this request's own extend and never inserted into the
+        prefix cache, so a direct free is safe. Call BEFORE rewinding req.cached_len."""
+        start = div_ceil(keep_len, self.page_size) * self.page_size
+        end = div_ceil(req.cached_len, self.page_size) * self.page_size
+        if end <= start:
+            return
+        slots = self.page_table[req.table_idx, start:end]
+        if self.swa_paged:
+            self._free_swa(slots)
+        self._free(slots)
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

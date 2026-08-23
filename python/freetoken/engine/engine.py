@@ -865,6 +865,8 @@ class Engine:
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
+            elif self.graph_runner.can_use_spec_graph(batch):
+                logits = self.graph_runner.replay_spec(batch)
             else:
                 logits = self.model.forward()
         if self.cpu_moe_executor is not None:
@@ -875,7 +877,7 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
-        batch_logits = logits[: batch.size]
+        batch_logits = logits[: batch.num_logit_rows]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()

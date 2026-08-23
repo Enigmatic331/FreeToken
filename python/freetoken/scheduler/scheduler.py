@@ -58,6 +58,11 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
+    # MTP speculative-decoding driver (scheduler/spec.py), set in __init__ under
+    # ENV.MTP_SPEC. A class-level default so duck-typed test schedulers that bypass
+    # __init__ read None instead of raising.
+    spec_manager = None
+
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
@@ -135,6 +140,14 @@ class Scheduler(SchedulerIOMixin):
             decode_log_interval=config.decode_log_interval,
         )
 
+        # MTP speculative decoding (DSV4 only; see scheduler/spec.py for the prerequisites).
+        # None when disabled or unavailable -- every call site guards on that.
+        self.spec_manager = None
+        if ENV.MTP_SPEC:
+            from .spec import create_spec_manager
+
+            self.spec_manager = create_spec_manager(self)
+
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
@@ -160,6 +173,9 @@ class Scheduler(SchedulerIOMixin):
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
+        assert self.spec_manager is None or not self.spec_manager.active, (
+            "rebuild requires no active speculative request"
+        )
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
@@ -251,16 +267,20 @@ class Scheduler(SchedulerIOMixin):
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable
+            or (self.spec_manager is not None and self.spec_manager.runnable)
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
-        # the scheduler is idle (no pending prefill / running decode). Without this, a
-        # rebuild in DISABLE_OVERLAP_SCHEDULING mode stays pending until the HTTP timeout.
+        # the scheduler is idle (no pending prefill / running decode / active speculation).
+        # Without this, a rebuild in DISABLE_OVERLAP_SCHEDULING mode stays pending until
+        # the HTTP timeout.
         if self._pending_rebuild is not None and not (
-            self.prefill_manager.runnable or self.decode_manager.runnable
+            self.prefill_manager.runnable
+            or self.decode_manager.runnable
+            or (self.spec_manager is not None and self.spec_manager.active)
         ):
             self._execute_pending_rebuild()
 
@@ -301,7 +321,23 @@ class Scheduler(SchedulerIOMixin):
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+        spec_manager = getattr(self, "spec_manager", None)  # getattr: stub-self in tests
+        if batch.spec_verify and spec_manager is not None:
+            import time as _time
+
+            _t0 = _time.monotonic()
+            copy_done.synchronize()
+            spec_manager.t_sync += _time.monotonic() - _t0
+        else:
+            copy_done.synchronize()
+        if batch.spec_verify:
+            # MTP speculative verify: acceptance / emits / rewind live in the driver. No
+            # report_batch (a per-cycle "prefill" line would spam the log; the driver logs
+            # its own acceptance/throughput line instead).
+            reply = spec_manager.process_drained(batch, next_tokens_cpu)
+            _stamp_usage(self, reply)
+            self.send_result(reply)
+            return
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -385,23 +421,16 @@ class Scheduler(SchedulerIOMixin):
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        if spec_manager is not None:
+            # Prompt-chunk hc ingestion + adoption (and consuming the model's hc stash so a
+            # multi-GB prompt-chunk tensor never outlives its drain).
+            spec_manager.observe_batch(batch, next_tokens_cpu, new_finished_reqs)
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
-        if reply:
-            mem = self._gpu_mem_bytes()
-            mamba_used, mamba_total = mamba_slots or (0, 0)
-            swa_used, swa_total = swa_tokens or (0, 0)
-            for m in reply:
-                m.kv_used_pages = used
-                m.kv_total_pages = total
-                m.mamba_used_slots = mamba_used
-                m.mamba_total_slots = mamba_total
-                m.swa_used_tokens = swa_used
-                m.swa_total_tokens = swa_total
-                m.gpu_mem_bytes = mem
+        _stamp_usage(self, reply, usage=(used, total, mamba_slots, swa_tokens))
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -531,6 +560,8 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            if req_to_free is None and self.spec_manager is not None:
+                req_to_free = self.spec_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 # SGLang-style abort: never free resources under an in-flight forward. If the
                 # request is in the launched-but-not-drained batch (overlap), only mark it;
@@ -569,7 +600,9 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "runtime rebuild unsupported under TP > 1"
                 )
-            elif self.prefill_manager.runnable or self.decode_manager.runnable:
+            elif self.prefill_manager.runnable or self.decode_manager.runnable or (
+                self.spec_manager is not None and self.spec_manager.active
+            ):
                 # if_idle: refuse rather than wait. (finished_reqs hold no resources — they
                 # are already freed — so they do not block a rebuild.)
                 self._reply_rebuild(msg.request_id, "busy")
@@ -827,8 +860,13 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        if self.spec_manager is not None:
+            # Must run before the prefill admission pass: a pending prefill exits speculation
+            # and returns its request to the decode manager, whose reservation the adder reads.
+            self.spec_manager.before_schedule()
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            or (self.spec_manager.schedule_next_batch() if self.spec_manager is not None else None)
             or self.decode_manager.schedule_next_batch()
         )
         if batch is None:
@@ -871,6 +909,31 @@ class Scheduler(SchedulerIOMixin):
         return forward_output
 
 
+def _stamp_usage(scheduler, reply: List[DetokenizeMsg], usage=None) -> None:
+    """Stamp each reply with the post-batch pool occupancy (see _process_last_data).
+    Module-level so duck-typed test schedulers that call the drain unbound still work."""
+    if not reply:
+        return
+    if usage is None:
+        usage = (
+            *scheduler._kv_usage_pages(),
+            scheduler._mamba_slot_usage(),
+            scheduler._swa_token_usage(),
+        )
+    used, total, mamba_slots, swa_tokens = usage
+    mem = scheduler._gpu_mem_bytes()
+    mamba_used, mamba_total = mamba_slots or (0, 0)
+    swa_used, swa_total = swa_tokens or (0, 0)
+    for m in reply:
+        m.kv_used_pages = used
+        m.kv_total_pages = total
+        m.mamba_used_slots = mamba_used
+        m.mamba_total_slots = mamba_total
+        m.swa_used_tokens = swa_used
+        m.swa_total_tokens = swa_total
+        m.gpu_mem_bytes = mem
+
+
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
@@ -898,6 +961,22 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    if batch.spec_verify:
+        # One sampled row per TOKEN: row t is the true sample for position cached_len+t+1,
+        # so write it there -- after the drain, token_pool holds the request's committed tail
+        # (s1 at the rejected/accepted draft position, s2 after it), which is exactly what a
+        # generic decode step would read if the driver hands the request back to the decode
+        # manager. Positions at/after max_device_len fall back to the ChunkedReq-style -1
+        # scratch column (the request finishes on that token anyway).
+        req = batch.reqs[0]
+        T = req.extend_len
+        mapping_host = torch.full((T,), req.table_idx, dtype=torch.int64, pin_memory=True)
+        write_list = [
+            (p if p < req.max_device_len else -1)
+            for p in range(req.cached_len + 1, req.cached_len + 1 + T)
+        ]
+        write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]

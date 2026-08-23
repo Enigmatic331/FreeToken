@@ -167,6 +167,18 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
+        if batch.spec_verify:
+            # MTP speculative verify: ONE request extending T consecutive tokens through the
+            # fused spec path (Transformer.spec_extend). It uses decode-style addressing --
+            # the whole-history snapshot (lazily materialized off table_rows) + window ring --
+            # and returns one logits row per TOKEN, so last_indices is arange(T).
+            req = batch.reqs[0]
+            batch.attn_metadata = DSV4AttnMetadata(
+                last_indices=torch.arange(req.extend_len, dtype=torch.int32, device=self.device),
+                table_rows=torch.tensor([req.table_idx], dtype=torch.int64, device=self.device),
+                window_ar=self._window_ar,
+            )
+            return
         last = torch.tensor(
             [r.extend_len for r in batch.padded_reqs], dtype=torch.int32, device=self.device
         ).cumsum_(0) - 1
@@ -207,6 +219,14 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
 
     def prepare_for_replay(self, batch: Batch) -> None:
         self._point_to_capture(batch, batch.padded_size, self._table_rows(batch))
+
+    def prepare_for_spec_replay(self, batch: Batch) -> None:
+        # MTP spec-verify replay: stage the lone request's whole-history full locs into the
+        # captured 1-row snapshot (shared with the decode captures -- never in flight at the
+        # same time). The rows come off the eager spec metadata built by prepare_metadata.
+        md = batch.attn_metadata
+        assert isinstance(md, DSV4AttnMetadata) and md.table_rows is not None
+        self._point_to_capture(batch, 1, md.table_rows)
 
     # ----- DSV4 addressing vocabulary ---------------------------------------------------
     def snapshot(self) -> torch.Tensor:
