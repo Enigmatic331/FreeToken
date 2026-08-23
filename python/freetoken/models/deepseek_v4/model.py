@@ -27,6 +27,48 @@ from torch import nn
 
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
+
+# MTP acceptance probe: when FREETOKEN_MTP_PROBE_DIR is set, dump
+# (input_ids, final-layer hc state, positions) per forward from rank 0 —
+# offline replay through the reference MTPBlock measures draft acceptance.
+# Requires eager decode (--cuda-graph-max-bs 0): hooks don't run in replays.
+import atexit as _atexit
+import os as _os
+import time as _time
+
+_MTP_PROBE_DIR = _os.environ.get("FREETOKEN_MTP_PROBE_DIR")
+_mtp_probe_buf: list = []
+
+
+def _mtp_probe_dump(kind, input_ids, h, positions):
+    from freetoken.distributed import try_get_tp_info
+
+    info = try_get_tp_info()
+    if info is not None and info.rank != 0:
+        return
+    _mtp_probe_buf.append((
+        kind,
+        input_ids.detach().cpu().clone(),
+        h.detach().float().cpu().clone(),
+        positions.detach().cpu().clone(),
+    ))
+    if len(_mtp_probe_buf) >= 128:
+        _mtp_probe_flush()
+
+
+def _mtp_probe_flush():
+    if not _mtp_probe_buf:
+        return
+    import torch as _torch
+
+    _torch.save(list(_mtp_probe_buf), _os.path.join(
+        _MTP_PROBE_DIR, f"probe_{_time.monotonic_ns()}.pt"))
+    _mtp_probe_buf.clear()
+
+
+if _MTP_PROBE_DIR is not None:
+    _os.makedirs(_MTP_PROBE_DIR, exist_ok=True)
+    _atexit.register(_mtp_probe_flush)
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.models.blocks import BaseLLMModel
 
@@ -176,6 +218,8 @@ class Transformer(nn.Module):
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
+        if _MTP_PROBE_DIR is not None:
+            _mtp_probe_dump("prefill", input_ids, h, flat_positions)
         h = self.hc_head(h)
         h = self.norm(h)
         return F.linear(h[0, last_indices], self.head)  # [B, vocab]
@@ -204,6 +248,8 @@ class Transformer(nn.Module):
         wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
         for layer in self.layers:
             h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
+        if _MTP_PROBE_DIR is not None:
+            _mtp_probe_dump("decode", input_ids, h, pos)
         h = self.hc_head(h)
         h = self.norm(h)
         return F.linear(h[:, -1], self.head)

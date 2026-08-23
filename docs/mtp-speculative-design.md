@@ -1,6 +1,9 @@
 # MTP speculative decoding for DeepSeek-V4-Flash — design notes
 
-Status: groundwork landed (weight loaders); engine integration not started.
+Status: groundwork + acceptance probe DONE — measured 80.4% greedy draft acceptance
+(essay 78% / technical 82% / code 90% / fiction 70%, 1,608 tokens, T=0) via
+FREETOKEN_MTP_PROBE_DIR dumps replayed through the reference MTPBlock
+(scripts/mtp_acceptance_probe.py). Projected ~1.5-1.7x decode. BUILD IS GO.
 Measured motivation: decode is latency-bound (~50ms/token walks 43 layers
 sequentially; DRAM/PCIe mostly idle between bursts). MTP verify converts
 decode into 2-token micro-prefill: same weight traffic serves 2 tokens.
