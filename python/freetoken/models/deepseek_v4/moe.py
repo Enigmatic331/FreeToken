@@ -10,9 +10,29 @@ from torch import nn
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import OffloadMoELayer
+from freetoken.moe.partition import ExpertPartition
 
 from .args import DeepseekV4Args
 from .layers import Linear
+
+
+def localize_expert_routes(
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    partition: ExpertPartition,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep this rank's routes and map their global ids to its local bank.
+
+    Foreign routes use the one-past-the-end expert id reserved by the grouped
+    MoE alignment kernels. Cache decode replaces the sentinel with an already-
+    requested local id immediately before admission, while retaining the zero
+    route weight.
+    """
+    local = indices - partition.global_offset
+    owned = (local >= 0) & (local < partition.local_count)
+    local = torch.where(owned, local, local.new_full((), partition.local_count))
+    weights = torch.where(owned, weights, weights.new_zeros(()))
+    return weights, local
 
 
 class Gate(nn.Module):
@@ -77,14 +97,16 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     (per-route dequant GEMV)."""
 
     def __init__(self, layer_id: int, args: DeepseekV4Args):
-        from .config import ep_shard
+        from .config import ep_partition
+
+        partition = ep_partition(args.n_routed_experts)
 
         super().__init__(
             layer_id=layer_id,
             # EP under TP>1: this layer computes only this rank's expert shard
             # (banks, cache and streaming are all local); partial outputs are
             # summed across ranks by routed_forward's _maybe_all_reduce.
-            num_experts=ep_shard(args.n_routed_experts)[1],
+            num_experts=partition.local_count,
             top_k=args.n_activated_experts,
             hidden_size=args.dim,
             intermediate_size=args.moe_inter_dim,
@@ -92,6 +114,46 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             activation="silu",
         )
         self.swiglu_limit = args.swiglu_limit
+
+    @staticmethod
+    def _cache_safe_route_ids(
+        topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Replace skipped sentinel routes before calling the slot-cache LRU.
+
+        Each skipped position duplicates the row's first live local expert, so
+        it creates no additional cache admission.  The all-foreign edge case
+        falls back to expert zero; its route weights remain zero and the DSV4
+        kernel masks its weight reads.
+        """
+        active = topk_weights != 0
+        first_pos = active.to(torch.int64).argmax(dim=-1, keepdim=True)
+        fallback = topk_ids.gather(-1, first_pos)
+        fallback = torch.where(
+            active.any(dim=-1, keepdim=True), fallback, fallback.new_zeros(())
+        )
+        return torch.where(active, topk_ids, fallback)
+
+    def _decode_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        cache = self.offload_cache
+        assert cache is not None
+        if cache.is_cpu_layer(self.layer_id):
+            # The CPU executor natively skips negative expert ids; translate
+            # the grouped-kernel sentinel only at this boundary.
+            cpu_ids = torch.where(
+                topk_weights != 0, topk_ids, topk_ids.new_full((), -1)
+            )
+            return super()._decode_routed(hidden_states, topk_weights, cpu_ids)
+        return super()._decode_routed(
+            hidden_states,
+            topk_weights,
+            self._cache_safe_route_ids(topk_weights, topk_ids),
+        )
 
     def _prefill_routed(
         self,
@@ -109,6 +171,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
         cache = self.offload_cache
         assert cache is not None
+        topk_ids = self._cache_safe_route_ids(topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
         cache.copy_missing()
         if cache.collect_stats:
@@ -129,15 +192,15 @@ class MoE(nn.Module):
     """Sparse MoE: hash/score router -> offloaded FP4 routed experts + shared expert."""
 
     def __init__(self, layer_id: int, args: DeepseekV4Args):
-        from .config import ep_shard
+        from .config import ep_partition
 
         super().__init__()
         self.dim = args.dim
         self.gate = Gate(layer_id, args)
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
         self.experts = DSV4OffloadMoELayer(layer_id, args)
-        self.ep_off, self.ep_count = ep_shard(args.n_routed_experts)
-        self.ep_active = self.ep_count != args.n_routed_experts
+        self.partition = ep_partition(args.n_routed_experts)
+        self.ep_active = self.partition.world_size > 1
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
@@ -148,18 +211,17 @@ class MoE(nn.Module):
         # to overlap the CPU overflow compute.
         shared = self.shared_experts(x)
         if self.ep_active:
-            # EP: keep only this rank's routes — remap to local bank ids, zero the
-            # weights of foreign routes (id sentinel 0 stays in-range; its zero
-            # weight nulls the contribution). Routes stay normalized globally, so
-            # the cross-rank all-reduce of partials reconstructs the full sum.
+            # EP: keep only this rank's routes — remap to local bank ids and mark
+            # foreign routes with the alignment sentinel. Routes stay normalized
+            # globally, so the cross-rank all-reduce reconstructs the full sum.
             # (The shared expert is replicated and added after the reduce.)
-            local = indices - self.ep_off
-            owned = (local >= 0) & (local < self.ep_count)
-            indices = torch.where(owned, local, local.new_zeros(()))
-            weights = torch.where(owned, weights, weights.new_zeros(()))
+            weights, indices = localize_expert_routes(weights, indices, self.partition)
         # routed_forward may mutate the ids in place (offload decode slot remap);
         # indices.to(int32) always copies (int64 source), so no clone needed here.
         routed = self.experts.routed_forward(
             x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
         )
         return (routed + shared).view(shape)
+
+
+__all__ = ["DSV4OffloadMoELayer", "Gate", "MoE", "localize_expert_routes"]

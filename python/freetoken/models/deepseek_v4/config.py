@@ -16,28 +16,34 @@ from __future__ import annotations
 from typing import Any
 
 from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, RotaryConfig
+from freetoken.moe.partition import ExpertPartition
 
 from .args import load_args
 
 
-def ep_shard(n_global: int) -> tuple[int, int]:
-    """(offset, count) of this rank's routed-expert shard. TP>1 serves DSV4 as
-    expert-parallel with replicated dense: rank r owns experts
-    [r*E/tp, (r+1)*E/tp)."""
+def ep_partition(n_global: int) -> ExpertPartition:
+    """Return this process's routed-expert ownership.
+
+    TP>1 serves DSV4 as expert parallelism with replicated dense layers.  The
+    balanced partition also supports non-divisible configurations such as
+    256 experts over three ranks (86/85/85).
+    """
     from freetoken.distributed import try_get_tp_info
 
     info = try_get_tp_info()
-    if info is None or info.size == 1:
-        return 0, n_global
-    assert n_global % info.size == 0, (
-        f"n_routed_experts={n_global} not divisible by tp_size={info.size}"
-    )
-    count = n_global // info.size
-    return info.rank * count, count
+    if info is None:
+        return ExpertPartition(n_global)
+    return ExpertPartition(n_global, world_size=info.size, rank=info.rank)
+
+
+def ep_shard(n_global: int) -> tuple[int, int]:
+    """Compatibility tuple ``(global_offset, local_count)`` for this rank."""
+    partition = ep_partition(n_global)
+    return partition.global_offset, partition.local_count
 
 
 def _ep_local_experts(n_global: int) -> int:
-    return ep_shard(n_global)[1]
+    return ep_partition(n_global).local_count
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -116,4 +122,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["ep_partition", "ep_shard", "parse_config"]

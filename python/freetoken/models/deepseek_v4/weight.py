@@ -189,12 +189,13 @@ def load_dsfp4_expert_sources(
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
-    from .config import ep_shard
+    from .config import ep_partition
 
     folder = model_path
     weight_map = _weight_map(folder)
     L = args.n_layers
-    ep_off, E = ep_shard(args.n_routed_experts)  # this rank's shard (EP under TP>1)
+    partition = ep_partition(args.n_routed_experts)
+    ep_off, E = partition.global_offset, partition.local_count
     H, I = args.dim, args.moe_inter_dim
 
     for shard in sorted(set(weight_map.values())):
@@ -207,7 +208,7 @@ def load_dsfp4_expert_sources(
             continue
         if int(m.group("layer")) >= L:  # skip the MTP layer (index L)
             continue
-        if not (ep_off <= int(m.group("expert")) < ep_off + E):  # not this rank's
+        if not partition.owns(int(m.group("expert"))):
             continue
         shards[shard].append((name, m))
 
@@ -249,7 +250,10 @@ def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Ten
     """Fabricate the 4 ds_fp4 banks for --dummy-weight (no checkpoint on disk)."""
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
-    L, E = args.n_layers, args.n_routed_experts
+    from .config import ep_partition
+
+    L = args.n_layers
+    E = ep_partition(args.n_routed_experts).local_count
     H, I = args.dim, args.moe_inter_dim
     e8m0 = torch.float8_e8m0fnu
     specs = {
@@ -308,10 +312,11 @@ def load_dsfp4_expert_sources_parallel(
     from freetoken.models.weight import iter_expert_tensors_parallel
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
-    from .config import ep_shard
+    from .config import ep_partition
 
     L = args.n_layers
-    ep_off, E = ep_shard(args.n_routed_experts)  # this rank's shard (EP under TP>1)
+    partition = ep_partition(args.n_routed_experts)
+    ep_off, E = partition.global_offset, partition.local_count
     H, I = args.dim, args.moe_inter_dim
     e8m0 = torch.float8_e8m0fnu
     specs = {
@@ -327,7 +332,7 @@ def load_dsfp4_expert_sources_parallel(
         m = _EXPERT_RE.match(name)
         if m is None or int(m.group("layer")) >= L:  # skip the MTP layer (index L)
             return False
-        return ep_off <= int(m.group("expert")) < ep_off + E  # this rank's shard
+        return partition.owns(int(m.group("expert")))
 
     def _load(sink) -> int:
         tracker = LayerCompletionTracker(E * 6, hb, sink)

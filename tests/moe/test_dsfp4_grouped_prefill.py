@@ -128,3 +128,34 @@ def test_sparse_chunk_falls_back_to_gemv():
     ref = fmod.routed_experts_fp4(x, slots.clone(), w, gup, gus, dp, ds, LIMIT)
     out = fmod.routed_experts_fp4_prefill(x, slots.clone(), w, gup, gus, dp, ds, LIMIT, E)
     assert torch.equal(ref, out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_grouped_prefill_ignores_one_past_end_ep_routes():
+    import freetoken.moe.fused_ds_fp4 as fmod
+
+    device = "cuda"
+    gup, gus, dp, ds = _banks(device)
+    x, slots, w = _routing(256, device)
+
+    # The first half is this rank's contribution. Foreign routes occupy the
+    # alignment kernel's reserved E sentinel and carry zero mixture weight.
+    valid_slots = slots[:, : TOP_K // 2].contiguous()
+    valid_weights = w[:, : TOP_K // 2].contiguous()
+    ep_slots = slots.clone()
+    ep_weights = w.clone()
+    ep_slots[:, TOP_K // 2 :] = E
+    ep_weights[:, TOP_K // 2 :] = 0
+
+    ref = fmod.routed_experts_fp4(
+        x, valid_slots, valid_weights, gup, gus, dp, ds, LIMIT
+    )
+    out = fmod.routed_experts_fp4_prefill(
+        x, ep_slots, ep_weights, gup, gus, dp, ds, LIMIT, E
+    )
+
+    torch.cuda.synchronize()
+    diff = (out.float() - ref.float()).abs()
+    denom = ref.float().pow(2).mean().sqrt()
+    assert (diff.pow(2).mean().sqrt() / denom).item() < 5e-3
+    assert diff.max().item() < 0.25 * ref.float().abs().max().item()

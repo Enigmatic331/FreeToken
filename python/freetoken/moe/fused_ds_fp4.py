@@ -58,6 +58,7 @@ def _grouped_decode(
     total_routes = T * top_k
     dtype = a.dtype
     out = torch.empty((T, top_k, N), dtype=dtype, device=a.device)
+    skip_zero_weight = topk_weights is not None
     if topk_weights is None:
         topk_weights = out.new_empty((1, 1), dtype=torch.float32)
     scale_u8 = scale_cache.view(torch.uint8)
@@ -88,6 +89,8 @@ def _grouped_decode(
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
+        SKIP_ZERO_WEIGHT=skip_zero_weight,
+        NUM_SLOTS=packed_cache.shape[0],
         compute_type=_compute_type(dtype),
         num_warps=_NW,
     )
@@ -118,7 +121,7 @@ def routed_experts_fp4(
 
     x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = _grouped_decode(
-        x, gate_up_packed, gate_up_scale, slots, None,
+        x, gate_up_packed, gate_up_scale, slots, topk_weights,
         a_row_is_route=False, mul_routed_weight=False,
     )  # [T, top_k, 2I]
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
@@ -175,6 +178,7 @@ def _grouped_prefill(
         GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
+        NUM_SLOTS=packed_cache.shape[0],
         compute_type=_compute_type(a.dtype),
         num_warps=cfg.get("num_warps", 4),
         num_stages=cfg.get("num_stages", 3),
@@ -218,7 +222,10 @@ def routed_experts_fp4_prefill(
     tw = topk_weights.reshape(-1).contiguous()
 
     x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
-    gate_up = torch.empty((T, top_k, two_I), dtype=x.dtype, device=x.device)
+    # One-past-the-end EP routes occupy the alignment kernel's reserved
+    # sentinel bin. Zero-init keeps those untouched rows inert through SwiGLU
+    # and the final reduction while the GEMM kernel masks the sentinel block.
+    gate_up = torch.zeros((T, top_k, two_I), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         x, gate_up_packed, gate_up_scale, gate_up, tw,
         sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
@@ -227,7 +234,7 @@ def routed_experts_fp4_prefill(
 
     act = act.reshape(routes, I)
     act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
-    down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
+    down = torch.zeros((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         act, down_packed, down_scale, down, tw,
         sorted_ids, expert_ids, ntpp, routes, 1, True, cfg,

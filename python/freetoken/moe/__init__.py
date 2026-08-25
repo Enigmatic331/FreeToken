@@ -5,6 +5,7 @@ from typing import Protocol
 from freetoken.utils import Registry, init_logger
 
 from .base import BaseMoeBackend
+from .partition import ExpertPartition
 
 logger = init_logger(__name__)
 
@@ -71,4 +72,5 @@ __all__ = [
     "SUPPORTED_MOE_BACKENDS",
     "OFFLOAD_MOE_BACKENDS",
     "is_offload_moe_backend",
+    "ExpertPartition",
 ]

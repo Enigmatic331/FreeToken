@@ -53,8 +53,8 @@ class MoELayer(BaseOP):
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.weight_format = weight_format
-        intermediate_size_per_partition = div_even(intermediate_size, tp_size)
         if allocate_experts:
+            intermediate_size_per_partition = div_even(intermediate_size, tp_size)
             self._alloc_resident_experts(intermediate_size_per_partition)
 
     def _alloc_resident_experts(self, intermediate_size_per_partition: int) -> None:

@@ -315,6 +315,22 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
+    @property
+    def host_bank_bytes(self) -> int:
+        """Bytes in this rank's pinned host expert sources."""
+        return sum(
+            source.numel() * source.element_size()
+            for per_layer in self.bank_sources.values()
+            for source in per_layer
+        )
+
+    @property
+    def gpu_bank_cache_bytes(self) -> int:
+        """Bytes in this rank's GPU expert slot-cache payload tensors."""
+        return sum(
+            cache.numel() * cache.element_size() for cache in self.bank_caches.values()
+        )
+
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
 

@@ -60,6 +60,8 @@ def _decode_dsfp4_moe_kernel(
     TOP_K: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    SKIP_ZERO_WEIGHT: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     route_id = tl.program_id(0)
@@ -71,6 +73,12 @@ def _decode_dsfp4_moe_kernel(
     n_mask = offs_n < N
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
+    route_active = (slot >= 0) & (slot < NUM_SLOTS)
+    if SKIP_ZERO_WEIGHT:
+        route_weight = tl.load(
+            topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k
+        )
+        route_active = route_active & (route_weight != 0.0)
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
 
@@ -89,7 +97,9 @@ def _decode_dsfp4_moe_kernel(
     for kb_start in range(0, K_BYTES // BLOCK_SIZE_KB):
         byte_idx = kb_start * BLOCK_SIZE_KB + offs_kb
         p_ptrs = packed_slot + offs_n[:, None] * stride_pn + byte_idx[None, :] * stride_pkb
-        bytes_ = tl.load(p_ptrs, mask=n_mask[:, None], other=0).to(tl.int32)
+        bytes_ = tl.load(
+            p_ptrs, mask=route_active & n_mask[:, None], other=0
+        ).to(tl.int32)
         b_lo = tl.load(lut_ptr + (bytes_ & 0xF))
         b_hi = tl.load(lut_ptr + ((bytes_ >> 4) & 0xF))
 
@@ -97,20 +107,28 @@ def _decode_dsfp4_moe_kernel(
         # constant over each 16-byte run): ~16x fewer SFU ops -> ~1.6x throughput.
         sblk = kb_start * NB + offs_nb
         codes = tl.load(scale_slot + offs_n[:, None] * stride_sn + sblk[None, :] * stride_sblk,
-                        mask=n_mask[:, None], other=0).to(tl.float32)
+                        mask=route_active & n_mask[:, None], other=0).to(tl.float32)
         sc = tl.exp2(codes - 127.0)                                          # [BLOCK_N, NB]
         b_lo = tl.reshape(b_lo, (BLOCK_SIZE_N, NB, 16)) * sc[:, :, None]
         b_hi = tl.reshape(b_hi, (BLOCK_SIZE_N, NB, 16)) * sc[:, :, None]
         b_lo = tl.reshape(b_lo, (BLOCK_SIZE_N, BLOCK_SIZE_KB))
         b_hi = tl.reshape(b_hi, (BLOCK_SIZE_N, BLOCK_SIZE_KB))
 
-        a_lo = tl.load(a_base + (2 * byte_idx) * stride_ak).to(tl.float32)
-        a_hi = tl.load(a_base + (2 * byte_idx + 1) * stride_ak).to(tl.float32)
+        a_lo = tl.load(
+            a_base + (2 * byte_idx) * stride_ak, mask=route_active, other=0.0
+        ).to(tl.float32)
+        a_hi = tl.load(
+            a_base + (2 * byte_idx + 1) * stride_ak, mask=route_active, other=0.0
+        ).to(tl.float32)
         accumulator += tl.sum(b_lo * a_lo[None, :], axis=1)
         accumulator += tl.sum(b_hi * a_hi[None, :], axis=1)
 
     if MUL_ROUTED_WEIGHT:
-        weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+        weight = tl.load(
+            topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k,
+            mask=route_active,
+            other=0.0,
+        )
         accumulator = accumulator * weight
 
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
@@ -189,6 +207,7 @@ def _prefill_dsfp4_moe_kernel(
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -214,6 +233,7 @@ def _prefill_dsfp4_moe_kernel(
     route_rows = offs_route // top_k
 
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    route_mask = route_mask & (slot >= 0) & (slot < NUM_SLOTS)
     a_ptrs = a_ptr + route_rows[:, None] * stride_am + offs_k[None, :] * stride_ak
     # B tile is built transposed [BN, ...]: the packed bytes then read
     # contiguously along their K-major axis (one byte per two k-values, loaded

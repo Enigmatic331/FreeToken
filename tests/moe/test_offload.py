@@ -64,6 +64,23 @@ def test_dummy_expert_sources_use_moe_layer_count(monkeypatch):
     assert {t.shape[0] for layers in banks.values() for t in layers} == {4}
 
 
+def test_offload_cache_reports_host_and_gpu_bank_bytes():
+    _, cache = _make_layer_and_cache()
+
+    host_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensors in cache.bank_sources.values()
+        for tensor in tensors
+    )
+    gpu_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in cache.bank_caches.values()
+    )
+
+    assert cache.host_bank_bytes == host_bytes
+    assert cache.gpu_bank_cache_bytes == gpu_bytes
+
+
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):
     layer, cache = _make_layer_and_cache()
     topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
