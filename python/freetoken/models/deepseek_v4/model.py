@@ -74,6 +74,7 @@ from freetoken.models.blocks import BaseLLMModel
 
 from .args import DeepseekV4Args
 from .attention import Attention
+from .execution import get_dsv4_execution_plan
 from .moe import MoE
 
 # Re-exports: keep every class/helper previously defined here importable from .model
@@ -255,6 +256,44 @@ class Transformer(nn.Module):
         return F.linear(h[:, -1], self.head)
 
 
+class ExpertWorkerBlock(nn.Module):
+    """The only per-layer modules needed on a heterogeneous expert worker."""
+
+    def __init__(self, layer_id: int, args: DeepseekV4Args):
+        super().__init__()
+        # Keep the ``ffn`` name identical to the full Block so checkpoint/router
+        # keys and the generic offload-cache layer walk stay unchanged.
+        self.ffn = MoE(layer_id, args)
+
+
+class ExpertWorkerTransformer(nn.Module):
+    """Routed-expert shell; owns no router, attention, HC, embedding, or head."""
+
+    def __init__(self, args: DeepseekV4Args):
+        super().__init__()
+        self.args = args
+        self.layers = nn.ModuleList(
+            [ExpertWorkerBlock(i, args) for i in range(args.n_layers)]
+        )
+
+    def forward(self, input_ids: torch.Tensor, *, is_prefill: bool, rows: int) -> torch.Tensor:
+        hidden_shape = (
+            (1, input_ids.numel(), self.args.dim)
+            if is_prefill
+            else (input_ids.numel(), 1, self.args.dim)
+        )
+        for layer in self.layers:
+            layer.ffn.worker_forward(input_ids, hidden_shape)
+        # Non-primary scheduler replicas do not consume logits: Engine broadcasts
+        # the authority's sampled token after the model forward. GraphRunner still
+        # requires the model contract and capture-buffer assignment shape.
+        return torch.zeros(
+            (rows, self.args.vocab_size),
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+
+
 class DeepseekV4ForCausalLM(BaseLLMModel):
     """Engine adapter: a registered :class:`BaseLLMModel` wrapping the DSV4 transformer.
 
@@ -266,11 +305,16 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def __init__(self, config):
         self._config = config
         self._args: DeepseekV4Args = config.dsv4_args
-        self._transformer = Transformer(self._args)
+        self._execution = get_dsv4_execution_plan()
+        self._transformer = (
+            ExpertWorkerTransformer(self._args)
+            if self._execution.is_expert_worker
+            else Transformer(self._args)
+        )
         self._bound = False
 
     def _ensure_bound(self) -> None:
-        if self._bound:
+        if self._bound or self._execution.is_expert_worker:
             return
         pool = get_global_ctx().kv_cache
         self._transformer.bind(pool, pool.device)
@@ -308,9 +352,15 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._transformer.load_state_dict(casted, assign=True, strict=False)
 
     def forward(self) -> torch.Tensor:
-        self._ensure_bound()
         batch = get_global_ctx().batch
         input_ids = batch.input_ids.long()
+        if self._execution.is_expert_worker:
+            return self._transformer.forward(
+                input_ids,
+                is_prefill=batch.is_prefill,
+                rows=batch.size,
+            )
+        self._ensure_bound()
         md = batch.attn_metadata
         if batch.is_prefill:
             # Ragged batched prefill (bs >= 1): each request starts from its own cached_len.
@@ -339,4 +389,8 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         return self._transformer.decode(input_ids.view(B, 1), pos, cmp_stage_cap)
 
 
-__all__ = ["Transformer", "DeepseekV4ForCausalLM"]
+__all__ = [
+    "Transformer",
+    "ExpertWorkerTransformer",
+    "DeepseekV4ForCausalLM",
+]

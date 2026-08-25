@@ -222,6 +222,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dsv4-backbone-rank",
+        type=int,
+        default=ServerArgs.dsv4_backbone_rank,
+        help=(
+            "Experimental DeepSeek-V4 heterogeneous EP: execute attention, HC, and "
+            "shared experts only on this rank; other TP ranks become routed-expert "
+            "workers. Omit to keep replicated-backbone EP."
+        ),
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",

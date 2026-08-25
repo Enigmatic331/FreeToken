@@ -9,7 +9,12 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import (
+    DistributedCommunicator,
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_tp_info,
+)
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -246,7 +251,13 @@ def _make_dummy_weight_state_dict(
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
     for key, param in model_state.items():
-        if param.dtype in fp8_dtypes:
+        if param.dtype == torch.float8_e8m0fnu:
+            # PyTorch has no randn/fill CUDA kernel for exponent-only E8M0.
+            # Code 127 represents scale 1.0 and is a stable dummy value.
+            t = torch.empty(param.shape, dtype=param.dtype, device=device)
+            t.view(torch.uint8).fill_(127)
+            state_dict[key] = t
+        elif param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
             # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).
@@ -295,6 +306,10 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
         _adjust_config(config)
+        from freetoken.models.deepseek_v4.execution import configure_dsv4_execution
+
+        self._dsv4_plan = configure_dsv4_execution(config.dsv4_backbone_rank)
+        self._execution_comm = DistributedCommunicator()
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -337,7 +352,11 @@ class Engine:
             self.model.prepare_for_runtime()
 
         # ======================= KV cache initialization ========================
-        new_free = self._sync_get_memory()[1]
+        # Heterogeneous expert workers intentionally omit the dense backbone and
+        # therefore have much more free VRAM. Size the common KV geometry from the
+        # authority (the cross-rank minimum), not the worker maximum.
+        new_free_pair = self._sync_get_memory()
+        new_free = new_free_pair[0] if self._dsv4_plan.enabled else new_free_pair[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
@@ -673,7 +692,10 @@ class Engine:
         )
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
-        if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
+        if (
+            max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024
+            and not self._dsv4_plan.enabled
+        ):
             logger.error(
                 f"Memory across TP ranks are imbalanced:"
                 f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
@@ -885,7 +907,18 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self._dsv4_plan.is_expert_worker:
+            # Only the backbone authority owns meaningful logits. Keep every
+            # scheduler replica byte-identical with one tiny token broadcast.
+            next_tokens_gpu = torch.empty(
+                batch.size, dtype=torch.int32, device=self.device
+            )
+        else:
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self._dsv4_plan.enabled:
+            next_tokens_gpu = self._execution_comm.broadcast(
+                next_tokens_gpu, self._dsv4_plan.backbone_rank
+            )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -1102,8 +1135,10 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    dsv4_backbone_rank = getattr(config, "dsv4_backbone_rank", None)
+    tp_info = getattr(config, "tp_info", None)
 
-    if is_dsv4 and config.tp_info.size > 1:
+    if is_dsv4 and tp_info is not None and tp_info.size > 1:
         # DSV4 TP>1 == expert parallelism with replicated dense: everything below
         # the router (offload cache, cpu executor, bank loaders, prefill streaming)
         # sees only this rank's expert shard. model_config was parsed before the
@@ -1379,6 +1414,31 @@ def _adjust_config(config: EngineConfig):
     if is_moe:
         object.__setattr__(model_config, "moe_backend", config.moe_backend)
     object.__setattr__(model_config, "nvfp4_backend", config.nvfp4_backend)
+
+    if dsv4_backbone_rank is not None:
+        if not is_dsv4:
+            raise ValueError("--dsv4-backbone-rank is valid only for DeepSeek-V4")
+        if tp_info is None or tp_info.size <= 1:
+            raise ValueError("--dsv4-backbone-rank requires --tensor-parallel-size > 1")
+        if not 0 <= dsv4_backbone_rank < tp_info.size:
+            raise ValueError(
+                f"--dsv4-backbone-rank {dsv4_backbone_rank} is outside "
+                f"[0, {tp_info.size})"
+            )
+        if not is_offload_moe_backend(config.moe_backend):
+            raise ValueError(
+                "--dsv4-backbone-rank requires an offload-family MoE backend"
+            )
+        if config.distributed_timeout == EngineConfig.distributed_timeout:
+            # The expert-only process skips dense materialization and can reach
+            # the post-load barrier minutes before the backbone authority.
+            override("distributed_timeout", 900.0)
+        logger.info_rank0(
+            "DSV4 heterogeneous EP enabled: backbone authority rank=%d; "
+            "remaining ranks execute routed experts only (timeout=%.0fs)",
+            dsv4_backbone_rank,
+            config.distributed_timeout,
+        )
 
     # Must stay LAST: page_size is only final here (_adjust_dsv4_config sets P=128, the
     # TRTLLM block sets 64). Also covers the programmatic LLM(...) path that bypasses parse_args.

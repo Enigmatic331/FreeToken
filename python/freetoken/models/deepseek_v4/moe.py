@@ -7,12 +7,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import OffloadMoELayer
 from freetoken.moe.partition import ExpertPartition
 
 from .args import DeepseekV4Args
+from .execution import get_dsv4_execution_plan
 from .layers import Linear
 
 
@@ -196,19 +198,44 @@ class MoE(nn.Module):
 
         super().__init__()
         self.dim = args.dim
-        self.gate = Gate(layer_id, args)
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
+        self.topk = args.n_activated_experts
+        self.execution = get_dsv4_execution_plan()
+        self._comm = DistributedCommunicator()
+        self.gate = None if self.execution.is_expert_worker else Gate(layer_id, args)
+        self.shared_experts = (
+            None
+            if self.execution.is_expert_worker
+            else Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
+        )
         self.experts = DSV4OffloadMoELayer(layer_id, args)
         self.partition = ep_partition(args.n_routed_experts)
         self.ep_active = self.partition.world_size > 1
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.execution.is_expert_worker:
+            raise RuntimeError("expert-worker ranks must call worker_forward")
         shape = x.size()
+        if self.execution.enabled:
+            # Workers are already waiting in the matching collective with an empty
+            # tensor. The authority is the sole source, so broadcast is exact even
+            # when PyNCCL implements it as source-only SUM.
+            x = self._comm.broadcast(x.contiguous(), self.execution.backbone_rank)
         x = x.view(-1, self.dim)
+        assert self.gate is not None
         weights, indices = self.gate(x, input_ids.flatten())
+        if self.execution.enabled:
+            # Route once on the authority. Sending int32 global ids avoids both
+            # duplicated router weights and mixed-SKU route disagreement.
+            weights = self._comm.broadcast(
+                weights.contiguous(), self.execution.backbone_rank
+            )
+            indices = self._comm.broadcast(
+                indices.to(torch.int32).contiguous(), self.execution.backbone_rank
+            )
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
+        assert self.shared_experts is not None
         shared = self.shared_experts(x)
         if self.ep_active:
             # EP: keep only this rank's routes — remap to local bank ids and mark
@@ -222,6 +249,38 @@ class MoE(nn.Module):
             x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
         )
         return (routed + shared).view(shape)
+
+    def worker_forward(
+        self, input_ids: torch.Tensor, hidden_shape: tuple[int, ...]
+    ) -> None:
+        """Receive one layer's normalized MoE input and contribute local experts.
+
+        The routed-expert all-reduce inside ``routed_forward`` is deliberately
+        retained: the authority consumes the reconstructed routed output while
+        workers discard it and wait for the next layer's broadcast.
+        """
+        if not self.execution.is_expert_worker:
+            raise RuntimeError("worker_forward is valid only on expert-worker ranks")
+        x = torch.empty(
+            hidden_shape,
+            dtype=torch.bfloat16,
+            device=input_ids.device,
+        )
+        x = self._comm.broadcast(x, self.execution.backbone_rank).view(-1, self.dim)
+        route_shape = (x.shape[0], self.topk)
+        weights = self._comm.broadcast(
+            torch.empty(route_shape, dtype=torch.float32, device=x.device),
+            self.execution.backbone_rank,
+        )
+        indices = self._comm.broadcast(
+            torch.empty(route_shape, dtype=torch.int32, device=x.device),
+            self.execution.backbone_rank,
+        )
+        if self.ep_active:
+            weights, indices = localize_expert_routes(weights, indices, self.partition)
+        self.experts.routed_forward(
+            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+        )
 
 
 __all__ = ["DSV4OffloadMoELayer", "Gate", "MoE", "localize_expert_routes"]

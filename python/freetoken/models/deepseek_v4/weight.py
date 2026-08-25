@@ -95,6 +95,9 @@ def iter_weights(
 
     args = load_args(model_path, max_batch_size=1)
     reader = _ShardReader(model_path, _weight_map(model_path), device)
+    from .execution import get_dsv4_execution_plan
+
+    execution = get_dsv4_execution_plan()
 
     def get(name: str) -> torch.Tensor:
         return reader.get(name)
@@ -105,6 +108,11 @@ def iter_weights(
             yield f"{prefix}.scale", get(f"{prefix}.scale")
 
     try:
+        if execution.is_expert_worker:
+            # Expert workers receive the authority's global route metadata and
+            # own no dense checkpoint parameters. Routed banks load separately.
+            return
+
         yield "embed.weight", get("embed.weight")
         yield "norm.weight", get("norm.weight")
         yield "head", get("head.weight")
@@ -264,10 +272,15 @@ def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Ten
     }
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
-    for t in banks["gate_up_packed"]:  # packed e2m1; scales stay 0 (valid e8m0)
-        t.random_(0, 256)
+    # A deterministic byte fill exercises the identical bank/cache kernels without
+    # spending minutes generating ~130 GiB of random bytes during startup tests.
+    for t in banks["gate_up_packed"]:
+        t.fill_(0x11)
     for t in banks["down_packed"]:
-        t.random_(0, 256)
+        t.fill_(0x11)
+    for name in ("gate_up_scale", "down_scale"):
+        for t in banks[name]:
+            t.view(torch.uint8).fill_(127)  # E8M0 code 127 -> unit scale
     pin_banks(hb)
     return banks
 

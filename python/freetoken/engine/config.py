@@ -75,6 +75,10 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
+    # DeepSeek-V4 heterogeneous EP (experimental): one rank owns the replicated
+    # backbone; all other ranks load/execute routed experts only. None
+    # preserves the established replicated-backbone EP path.
+    dsv4_backbone_rank: int | None = None
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
