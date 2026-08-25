@@ -303,6 +303,11 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        # Select this process's device before config validation asks CUDA about
+        # architecture/backend capabilities. Otherwise every nonzero rank briefly
+        # creates a primary context on physical GPU 0 (~0.5 GiB on this rig).
+        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        torch.cuda.set_device(self.device)
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
         _adjust_config(config)
@@ -311,8 +316,6 @@ class Engine:
         self._dsv4_plan = configure_dsv4_execution(config.dsv4_backbone_rank)
         self._execution_comm = DistributedCommunicator()
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
-        torch.cuda.set_device(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -364,7 +367,11 @@ class Engine:
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config,
+            self.num_pages,
+            device=self.device,
+            dtype=self.dtype,
+            metadata_only=self._dsv4_plan.is_expert_worker,
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -398,9 +405,14 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention & MoE backend initialization ========================
-        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
-            config.attention_backend, config.model_config
-        )
+        if self._dsv4_plan.is_expert_worker:
+            from freetoken.models.deepseek_v4.execution import ExpertWorkerAttentionBackend
+
+            self.ctx.attn_backend = self.attn_backend = ExpertWorkerAttentionBackend()
+        else:
+            self.ctx.attn_backend = self.attn_backend = create_attention_backend(
+                config.attention_backend, config.model_config
+            )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
@@ -433,7 +445,7 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            vocab_size=(1 if self._dsv4_plan.is_expert_worker else config.model_config.vocab_size),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -886,7 +898,7 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=free_min,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            vocab_size=(1 if self._dsv4_plan.is_expert_worker else config.model_config.vocab_size),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -999,9 +1011,9 @@ def _ensure_expandable_segments() -> None:
     reserved ~= allocated, so it is applied to every run, not just offload ones.
 
     Env vars are parsed once at import and ignored if set afterwards, so we apply the
-    setting via the runtime API instead. Must run before the first CUDA allocation (the
-    caller guarantees CUDA is not yet initialized). Any user-provided allocator config
-    is respected and left untouched.
+    setting via the runtime API instead. Must run before the first CUDA allocation; selecting
+    the process-local device may initialize the driver first, which is safe. Any user-provided
+    allocator config is respected and left untouched.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return

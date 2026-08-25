@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from freetoken.attention.base import BaseAttnBackend
 from freetoken.distributed import get_tp_info
 
 
@@ -42,6 +43,26 @@ class DSV4ExecutionPlan:
         return self.enabled and self.rank != self.backbone_rank
 
 
+class ExpertWorkerAttentionBackend(BaseAttnBackend):
+    """Scheduler-compatible attention shell for ranks that execute no attention."""
+
+    def forward(self, q, k, v, layer_id, batch, attn_spec=None):
+        raise RuntimeError("expert-worker ranks do not execute attention")
+
+    def prepare_metadata(self, batch) -> None:
+        # ExpertWorkerTransformer consumes only input ids and the prefill/decode phase.
+        batch.attn_metadata = None
+
+    def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:
+        pass
+
+    def prepare_for_capture(self, batch) -> None:
+        pass
+
+    def prepare_for_replay(self, batch) -> None:
+        pass
+
+
 _PLAN: DSV4ExecutionPlan | None = None
 
 
@@ -71,6 +92,7 @@ def _reset_dsv4_execution_for_tests() -> None:
 
 __all__ = [
     "DSV4ExecutionPlan",
+    "ExpertWorkerAttentionBackend",
     "configure_dsv4_execution",
     "get_dsv4_execution_plan",
 ]

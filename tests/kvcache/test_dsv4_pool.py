@@ -32,11 +32,17 @@ def _args(**over):
     return DeepseekV4Args(**base)
 
 
-def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1):
+def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1, metadata_only=False):
     args = _args()
     sizes = dsv4_pool_sizes(num_pages=num_pages, args=args, swa_ratio=swa_ratio, P=P)
     pool = DSV4PagedKVCache(
-        sizes=sizes, args=args, device=DEVICE, dtype=torch.bfloat16, P=P, n_scratch=n_scratch
+        sizes=sizes,
+        args=args,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+        P=P,
+        n_scratch=n_scratch,
+        metadata_only=metadata_only,
     )
     return pool, sizes, args
 
@@ -44,6 +50,24 @@ def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1):
 # --------------------------------------------------------------------------- #
 # pool construction / tier presence
 # --------------------------------------------------------------------------- #
+def test_metadata_only_pool_retains_allocator_without_kv_payloads():
+    pool, sizes, _ = _pool(metadata_only=True)
+    pool._init_paged_state(max_running_req=4, radix=True)
+
+    assert pool.window_pool == []
+    assert pool.cmp_pool == [None] * len(RATIOS)
+    assert pool.idx_pool == [None] * len(RATIOS)
+    assert pool.total_bytes() == pool.full_to_window.numel() * 8
+
+    full_page = torch.arange(P, dtype=torch.int32)
+    before = pool.swa_available_size()
+    pool.alloc_swa(full_page)
+    assert pool.swa_available_size() == before - P
+    assert bool((pool.translate_full_to_window(full_page) >= 0).all())
+    pool.free_swa(full_page)
+    assert pool.swa_available_size() == before
+
+
 def test_pool_tiers_present_per_ratio():
     pool, sizes, _ = _pool()
     for L, ratio in enumerate(RATIOS):

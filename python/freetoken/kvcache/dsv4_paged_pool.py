@@ -160,6 +160,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         dtype: torch.dtype = torch.bfloat16,
         P: int = 128,
         n_scratch: int = 1,
+        metadata_only: bool = False,
     ) -> None:
         assert dtype == torch.bfloat16, "KV pools are bf16 (fp4/fp8 is an in-place round-trip)"
         self.args = args
@@ -180,6 +181,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         # write), so the masked per-row scatter is graph-safe (no host sync, no -1 index, no
         # cross-row collision). One per running request row.
         self.n_scratch = int(n_scratch)
+        self.metadata_only = bool(metadata_only)
 
         # Logical full-loc currency: ONE mapping from the virtual full-token index space to window
         # slots; cmp/idx rows derive arithmetically (full_loc // ratio), the state ring off the
@@ -206,6 +208,19 @@ class DSV4PagedKVCache(BaseKVCachePool):
         # engine policy. Window slots come from ``full_to_window``; cmp/idx rows are arithmetic.
         if not hasattr(self, "full_loc_map"):
             self.full_loc_map: torch.Tensor | None = None
+
+        if self.metadata_only:
+            # Expert-worker schedulers retain the exact full/window allocation
+            # maps so admission and prefix decisions stay rank-identical. They
+            # execute no attention, so every payload/state tensor is omitted.
+            self.window_pool = []
+            self.cmp_pool = [None] * self._n_layers
+            self.idx_pool = [None] * self._n_layers
+            self.state_ring = [None] * self._n_layers
+            self.indexer_state_ring = [None] * self._n_layers
+            self.cmp_scratch_base = [None] * self._n_layers
+            self.idx_scratch_base = [None] * self._n_layers
+            return
 
         # Window KV: every layer.
         self.window_pool: list[torch.Tensor] = [

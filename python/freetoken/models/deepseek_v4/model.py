@@ -285,10 +285,10 @@ class ExpertWorkerTransformer(nn.Module):
         for layer in self.layers:
             layer.ffn.worker_forward(input_ids, hidden_shape)
         # Non-primary scheduler replicas do not consume logits: Engine broadcasts
-        # the authority's sampled token after the model forward. GraphRunner still
-        # requires the model contract and capture-buffer assignment shape.
+        # the authority's sampled token after the model forward. One placeholder
+        # column keeps GraphRunner's assignment contract without a full vocab slab.
         return torch.zeros(
-            (rows, self.args.vocab_size),
+            (rows, 1),
             dtype=torch.float32,
             device=input_ids.device,
         )

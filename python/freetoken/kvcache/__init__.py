@@ -66,7 +66,14 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(
+    config,
+    num_pages: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    metadata_only: bool = False,
+):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
@@ -86,6 +93,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
             n_scratch=config.max_running_req + 1,
+            metadata_only=metadata_only,
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
         return pool
