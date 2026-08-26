@@ -861,9 +861,13 @@ class OffloadMoeCache:
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
+            fetched = int(self.stat_fetched.item())
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
-        fetched = int(self.stat_fetched.item())
+            # Plain GPU offload fetches every miss. ``stat_fetched`` belongs to the
+            # capped hybrid path, so reporting it here used to claim zero PCIe fetches
+            # even while the LRU was visibly missing.
+            fetched = missing
         return {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
@@ -890,10 +894,11 @@ class OffloadMoeCache:
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()
+            fetched = self.stat_fetched_layer.tolist()
         else:
             cols = self.lru_stats.t().tolist()
             active, missing, steps = cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.CALLS]
-        fetched = self.stat_fetched_layer.tolist()
+            fetched = missing
         per_layer = []
         for L in range(self.num_layers):
             s, m, a, f = steps[L], missing[L], active[L], fetched[L]

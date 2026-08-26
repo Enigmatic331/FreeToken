@@ -557,6 +557,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect graph-safe MoE cache hit/miss counters and print one per-rank "
+            "summary whenever the scheduler becomes idle. Disabled by default."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,

@@ -135,13 +135,59 @@ class Scheduler(SchedulerIOMixin):
             decode_log_interval=config.decode_log_interval,
         )
 
+        # CUDA-graph capture executes each graph once, including graph-safe MoE stat
+        # increments. Start the user-visible measurement window after capture so an
+        # idle server never reports warm-up traffic as a real request.
+        if config.moe_collect_stats and self.engine.moe_offload_cache is not None:
+            self.engine.moe_offload_cache.reset_stats()
+
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
+        self._log_moe_cache_stats()
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+
+    def _log_moe_cache_stats(self) -> None:
+        """Publish one completed busy-window's MoE cache behavior on every TP rank.
+
+        Device counters are read only at the scheduler's idle barrier, never in the
+        decode hot path. Each rank logs its own local cache because an all-gather just
+        for telemetry would add synchronization to the system being measured.
+        """
+        cache = self.engine.moe_offload_cache
+        if cache is None or not self.config.moe_collect_stats:
+            return
+        totals = cache.decode_miss_stats()
+        if not totals["layer_calls"] and not totals["prefill_rows"]:
+            return
+        layers = cache.decode_miss_stats_per_layer()["per_layer"]
+        active_layers = [layer for layer in layers if layer["steps"]]
+        worst = sorted(active_layers, key=lambda layer: layer["miss_rate"], reverse=True)[:5]
+        worst_text = ",".join(
+            f"L{layer['layer']}={layer['miss_rate']:.1%}" for layer in worst
+        ) or "none"
+        prefill_hit_rate = (
+            totals["prefill_hit_rows"] / totals["prefill_rows"]
+            if totals["prefill_rows"] else 0.0
+        )
+        logger.info(
+            "MoE cache stats: active/layer=%.2f missing/layer=%.2f miss=%.2f%% "
+            "fetched/layer=%.2f fetch/miss=%.2f%% prefill-hit=%d/%d (%.2f%%) "
+            "worst-layers=%s",
+            totals["active_per_layer"],
+            totals["missing_per_layer"],
+            100 * totals["miss_rate"],
+            totals["fetched_per_layer"],
+            100 * totals["fetch_rate"],
+            totals["prefill_hit_rows"],
+            totals["prefill_rows"],
+            100 * prefill_hit_rate,
+            worst_text,
+        )
+        cache.reset_stats()
 
     @torch.inference_mode()
     def rebuild_cache(

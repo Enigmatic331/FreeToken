@@ -121,3 +121,15 @@ def test_dsv4_heterogeneous_rank_layout_arguments_parse_as_tuples():
     assert args.dsv4_expert_shards == (104, 120, 32)
     assert args.dsv4_moe_cache_sizes == (800, 1800, 1376)
     assert args.moe_cache_auto is False
+
+
+def test_moe_collect_stats_is_opt_in():
+    config = _Config(
+        {"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        default, _ = parse_args(["--model", ANON_PATH])
+        enabled, _ = parse_args(["--model", ANON_PATH, "--moe-collect-stats"])
+
+    assert default.moe_collect_stats is False
+    assert enabled.moe_collect_stats is True
