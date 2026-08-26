@@ -79,6 +79,12 @@ class EngineConfig:
     # backbone; all other ranks load/execute routed experts only. None
     # preserves the established replicated-backbone EP path.
     dsv4_backbone_rank: int | None = None
+    # Optional contiguous whole-expert counts for heterogeneous DSV4 ranks.
+    # The tuple length must equal TP size and its sum must equal n_routed_experts.
+    dsv4_expert_shards: tuple[int, ...] | None = None
+    # Optional rank-local GPU expert-slot capacities.  This lets expert-only
+    # workers spend the VRAM omitted by their dense backbone on a larger cache.
+    dsv4_moe_cache_sizes: tuple[int, ...] | None = None
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size

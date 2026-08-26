@@ -51,6 +51,34 @@ def test_more_ranks_than_experts_gives_trailing_empty_partitions():
     assert partitions[0].owner(1) == 1
 
 
+def test_explicit_heterogeneous_partition_covers_global_experts():
+    counts = (104, 120, 32)
+    partitions = [ExpertPartition(256, 3, rank, counts) for rank in range(3)]
+
+    assert [(p.global_offset, p.local_count) for p in partitions] == [
+        (0, 104),
+        (104, 120),
+        (224, 32),
+    ]
+    assert [expert for p in partitions for expert in p.global_range] == list(range(256))
+    assert [partitions[0].owner(expert) for expert in (0, 103, 104, 223, 224, 255)] == [
+        0, 0, 1, 1, 2, 2,
+    ]
+
+
+@pytest.mark.parametrize(
+    "counts, match",
+    [
+        ((128, 128), "one count per rank"),
+        ((104, 119, 32), "must sum"),
+        ((104, 120, -1), "non-negative"),
+    ],
+)
+def test_invalid_explicit_partition_counts(counts, match):
+    with pytest.raises(ValueError, match=match):
+        ExpertPartition(256, 3, 0, counts)
+
+
 @pytest.mark.parametrize(
     "args",
     [(-1, 1, 0), (1, 0, 0), (1, 1, -1), (1, 1, 1)],

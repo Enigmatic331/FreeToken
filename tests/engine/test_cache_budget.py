@@ -97,6 +97,17 @@ def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     assert expert_bytes_per_slot(sources) == 512 + 256
 
 
+def test_real_weight_engine_rejects_skipped_moe_cache_copies(monkeypatch):
+    from freetoken.engine.engine import Engine
+
+    monkeypatch.setenv("FREETOKEN_SKIP_FAST_INDEX_COPY", "1")
+    engine = object.__new__(Engine)
+    config = SimpleNamespace(use_dummy_weight=False)
+
+    with pytest.raises(ValueError, match="makes real-weight outputs invalid"):
+        engine._init_offload_moe_cache(config)
+
+
 def test_resolve_auto_applies_ratio_once_and_marlin_cap():
     # baseline 1000, weights 100, ratio 0.9 -> budget = 900 - 100 - 0(fixed) = 800
     size, pages, overlap = resolve_moe_cache_auto(
@@ -176,6 +187,49 @@ def test_adjust_config_resolves_num_tokens_for_dsv4():
     _adjust_config(cfg)
     assert cfg.page_size == 128
     assert cfg.num_page_override == 1024
+
+
+def test_adjust_config_applies_rank_local_dsv4_partition_and_cache(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.moe.partition import ExpertPartition
+
+    cfg = _dsv4_adjust_cfg(
+        tp_info=SimpleNamespace(rank=1, size=3),
+        dsv4_expert_shards=(104, 120, 32),
+        dsv4_moe_cache_sizes=(800, 1800, 1376),
+        moe_cache_rate=0.5,
+    )
+    cfg.model_config.dsv4_args.n_routed_experts = 256
+    monkeypatch.setattr(
+        "freetoken.models.deepseek_v4.config.ep_partition",
+        lambda total: ExpertPartition(total, 3, 1, (104, 120, 32)),
+    )
+
+    _adjust_config(cfg)
+
+    assert cfg.model_config.num_experts == 120
+    assert cfg.moe_cache_size == 1800
+    assert cfg.moe_cache_rate is None
+    assert cfg.moe_cache_auto is False
+
+
+def test_adjust_config_rejects_rank_local_cache_smaller_than_expert_shard(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.moe.partition import ExpertPartition
+
+    cfg = _dsv4_adjust_cfg(
+        tp_info=SimpleNamespace(rank=2, size=3),
+        dsv4_expert_shards=(104, 120, 32),
+        dsv4_moe_cache_sizes=(800, 1800, 31),
+    )
+    cfg.model_config.dsv4_args.n_routed_experts = 256
+    monkeypatch.setattr(
+        "freetoken.models.deepseek_v4.config.ep_partition",
+        lambda total: ExpertPartition(total, 3, 2, (104, 120, 32)),
+    )
+
+    with pytest.raises(ValueError, match="smaller than its 32 local experts"):
+        _adjust_config(cfg)
 
 
 def test_adjust_config_rejects_num_tokens_not_multiple_of_page():

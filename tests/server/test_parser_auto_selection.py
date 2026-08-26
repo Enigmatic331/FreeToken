@@ -94,3 +94,30 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_dsv4_heterogeneous_rank_layout_arguments_parse_as_tuples():
+    config = _Config(
+        {"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--tensor-parallel-size",
+                "3",
+                "--moe-backend",
+                "offload",
+                "--dsv4-backbone-rank",
+                "0",
+                "--dsv4-expert-shards",
+                "104,120,32",
+                "--dsv4-moe-cache-sizes",
+                "800,1800,1376",
+            ]
+        )
+
+    assert args.dsv4_expert_shards == (104, 120, 32)
+    assert args.dsv4_moe_cache_sizes == (800, 1800, 1376)
+    assert args.moe_cache_auto is False

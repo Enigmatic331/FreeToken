@@ -1,9 +1,10 @@
 """Expert ownership for expert-parallel model execution.
 
-The partition is contiguous and balanced: lower ranks receive one extra expert
-when ``total_experts`` is not evenly divisible by ``world_size``.  Keeping this
-logic in one value object prevents loaders, caches, and routers from developing
-slightly different ideas of expert ownership.
+Partitions are contiguous.  By default they are balanced, with lower ranks
+receiving one extra expert when necessary.  Heterogeneous rigs can instead
+provide an explicit count for every rank.  Keeping both policies in one value
+object prevents loaders, caches, and routers from developing slightly different
+ideas of expert ownership.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ class ExpertPartition:
     total_experts: int
     world_size: int = 1
     rank: int = 0
+    shard_counts: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.total_experts < 0:
@@ -28,14 +30,35 @@ class ExpertPartition:
             raise ValueError(
                 f"rank must be in [0, {self.world_size}), got {self.rank}"
             )
+        if self.shard_counts is not None:
+            counts = tuple(self.shard_counts)
+            object.__setattr__(self, "shard_counts", counts)
+            if len(counts) != self.world_size:
+                raise ValueError(
+                    "shard_counts must contain exactly one count per rank: "
+                    f"expected {self.world_size}, got {len(counts)}"
+                )
+            if any(not isinstance(count, int) or isinstance(count, bool) for count in counts):
+                raise ValueError("shard_counts must contain integers")
+            if any(count < 0 for count in counts):
+                raise ValueError("shard_counts must be non-negative")
+            if sum(counts) != self.total_experts:
+                raise ValueError(
+                    f"shard_counts must sum to total_experts={self.total_experts}, "
+                    f"got {sum(counts)}"
+                )
 
     @property
     def local_count(self) -> int:
+        if self.shard_counts is not None:
+            return self.shard_counts[self.rank]
         base, remainder = divmod(self.total_experts, self.world_size)
         return base + (self.rank < remainder)
 
     @property
     def global_offset(self) -> int:
+        if self.shard_counts is not None:
+            return sum(self.shard_counts[: self.rank])
         base, remainder = divmod(self.total_experts, self.world_size)
         return self.rank * base + min(self.rank, remainder)
 
@@ -70,6 +93,13 @@ class ExpertPartition:
             raise ValueError(
                 f"global expert {global_expert} is outside [0, {self.total_experts})"
             )
+        if self.shard_counts is not None:
+            stop = 0
+            for rank, count in enumerate(self.shard_counts):
+                stop += count
+                if global_expert < stop:
+                    return rank
+            raise AssertionError("validated shard counts did not cover global expert")
         base, remainder = divmod(self.total_experts, self.world_size)
         wide = base + 1
         wide_experts = wide * remainder

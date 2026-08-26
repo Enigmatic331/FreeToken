@@ -109,6 +109,19 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _csv_nonnegative_ints(value: str) -> tuple[int, ...]:
+        try:
+            values = tuple(int(part.strip()) for part in value.split(","))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated non-negative integers"
+            ) from exc
+        if not values or any(n < 0 for n in values):
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated non-negative integers"
+            )
+        return values
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -229,6 +242,24 @@ def parse_args(
             "Experimental DeepSeek-V4 heterogeneous EP: execute attention, HC, and "
             "shared experts only on this rank; other TP ranks become routed-expert "
             "workers. Omit to keep replicated-backbone EP."
+        ),
+    )
+    parser.add_argument(
+        "--dsv4-expert-shards",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.dsv4_expert_shards,
+        help=(
+            "Optional comma-separated whole-expert counts per TP rank for "
+            "heterogeneous DeepSeek-V4 EP (for example 104,120,32)."
+        ),
+    )
+    parser.add_argument(
+        "--dsv4-moe-cache-sizes",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.dsv4_moe_cache_sizes,
+        help=(
+            "Optional comma-separated GPU MoE cache slots per DeepSeek-V4 TP "
+            "rank (for example 800,1800,1376)."
         ),
     )
 
@@ -653,6 +684,7 @@ def parse_args(
         kwargs["moe_cache_size"] == 0
         and not kwargs["moe_cache_auto"]
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
+        and kwargs["dsv4_moe_cache_sizes"] is None
     )
     if is_offload_moe_backend(kwargs["moe_backend"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True

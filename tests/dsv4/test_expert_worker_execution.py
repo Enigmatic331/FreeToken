@@ -22,6 +22,43 @@ def test_execution_plan_assigns_one_backbone_and_remaining_workers():
     assert [p.is_expert_worker for p in plans] == [False, True, True]
 
 
+def test_execution_plan_carries_heterogeneous_expert_shards():
+    plans = [
+        DSV4ExecutionPlan(
+            rank=r,
+            world_size=3,
+            backbone_rank=0,
+            expert_shards=(104, 120, 32),
+        )
+        for r in range(3)
+    ]
+
+    assert all(plan.expert_shards == (104, 120, 32) for plan in plans)
+
+
+def test_dsv4_config_partition_uses_execution_plan_shards(monkeypatch):
+    from freetoken.models.deepseek_v4 import config as dsv4_config
+
+    plan = DSV4ExecutionPlan(
+        rank=1,
+        world_size=3,
+        backbone_rank=0,
+        expert_shards=(104, 120, 32),
+    )
+    monkeypatch.setattr(
+        "freetoken.distributed.try_get_tp_info",
+        lambda: SimpleNamespace(rank=1, size=3),
+    )
+    monkeypatch.setattr(
+        "freetoken.models.deepseek_v4.execution.get_dsv4_execution_plan",
+        lambda: plan,
+    )
+
+    partition = dsv4_config.ep_partition(256)
+
+    assert (partition.global_offset, partition.local_count) == (104, 120)
+
+
 def test_dummy_weights_materialize_e8m0_as_unit_scale():
     from freetoken.engine.engine import _make_dummy_weight_state_dict
 

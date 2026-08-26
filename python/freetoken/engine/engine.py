@@ -310,10 +310,15 @@ class Engine:
         torch.cuda.set_device(self.device)
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
-        _adjust_config(config)
         from freetoken.models.deepseek_v4.execution import configure_dsv4_execution
 
-        self._dsv4_plan = configure_dsv4_execution(config.dsv4_backbone_rank)
+        # Expert ownership participates in ModelConfig adjustment and weight shape
+        # construction, so configure it before _adjust_config asks for ep_partition.
+        self._dsv4_plan = configure_dsv4_execution(
+            config.dsv4_backbone_rank,
+            config.dsv4_expert_shards,
+        )
+        _adjust_config(config)
         self._execution_comm = DistributedCommunicator()
 
         torch.manual_seed(42)
@@ -525,6 +530,14 @@ class Engine:
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled
+
+        if _skip_fast_index_copy_enabled() and not config.use_dummy_weight:
+            raise ValueError(
+                "FREETOKEN_SKIP_FAST_INDEX_COPY intentionally disables MoE cache-miss "
+                "weight copies and makes real-weight outputs invalid; unset it when "
+                "serving a checkpoint (the switch is allowed only with --dummy-weight)."
+            )
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
         # falls back to per-quant providers, and the engine wires the banks into cache.
@@ -1148,7 +1161,25 @@ def _adjust_config(config: EngineConfig):
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     dsv4_backbone_rank = getattr(config, "dsv4_backbone_rank", None)
+    dsv4_expert_shards = getattr(config, "dsv4_expert_shards", None)
+    dsv4_moe_cache_sizes = getattr(config, "dsv4_moe_cache_sizes", None)
     tp_info = getattr(config, "tp_info", None)
+
+    for flag, values in (
+        ("--dsv4-expert-shards", dsv4_expert_shards),
+        ("--dsv4-moe-cache-sizes", dsv4_moe_cache_sizes),
+    ):
+        if values is None:
+            continue
+        if not is_dsv4:
+            raise ValueError(f"{flag} is valid only for DeepSeek-V4")
+        if tp_info is None or tp_info.size <= 1:
+            raise ValueError(f"{flag} requires --tensor-parallel-size > 1")
+        if len(values) != tp_info.size:
+            raise ValueError(
+                f"{flag} needs one value per TP rank: expected {tp_info.size}, "
+                f"got {len(values)}"
+            )
 
     if is_dsv4 and tp_info is not None and tp_info.size > 1:
         # DSV4 TP>1 == expert parallelism with replicated dense: everything below
@@ -1168,6 +1199,22 @@ def _adjust_config(config: EngineConfig):
             partition.global_offset,
             partition.global_stop,
         )
+        if dsv4_moe_cache_sizes is not None:
+            cache_size = dsv4_moe_cache_sizes[tp_info.rank]
+            if cache_size < partition.local_count:
+                raise ValueError(
+                    f"--dsv4-moe-cache-sizes rank {tp_info.rank} value {cache_size} "
+                    f"is smaller than its {partition.local_count} local experts"
+                )
+            override("moe_cache_size", cache_size)
+            override("moe_cache_rate", None)
+            override("moe_cache_auto", False)
+            logger.info(
+                "DSV4 rank-local MoE cache: rank=%d/%d slots=%d",
+                tp_info.rank,
+                tp_info.size,
+                cache_size,
+            )
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)

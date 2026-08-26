@@ -19,6 +19,7 @@ class DSV4ExecutionPlan:
     rank: int
     world_size: int
     backbone_rank: int | None = None
+    expert_shards: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.world_size <= 0:
@@ -29,6 +30,14 @@ class DSV4ExecutionPlan:
             raise ValueError(
                 f"backbone_rank must be in [0, {self.world_size}), got {self.backbone_rank}"
             )
+        if self.expert_shards is not None:
+            shards = tuple(self.expert_shards)
+            object.__setattr__(self, "expert_shards", shards)
+            if len(shards) != self.world_size:
+                raise ValueError(
+                    "expert_shards must contain exactly one count per rank: "
+                    f"expected {self.world_size}, got {len(shards)}"
+                )
 
     @property
     def enabled(self) -> bool:
@@ -66,11 +75,14 @@ class ExpertWorkerAttentionBackend(BaseAttnBackend):
 _PLAN: DSV4ExecutionPlan | None = None
 
 
-def configure_dsv4_execution(backbone_rank: int | None) -> DSV4ExecutionPlan:
+def configure_dsv4_execution(
+    backbone_rank: int | None,
+    expert_shards: tuple[int, ...] | None = None,
+) -> DSV4ExecutionPlan:
     """Configure this engine process once TP rank information is available."""
     global _PLAN
     tp = get_tp_info()
-    plan = DSV4ExecutionPlan(tp.rank, tp.size, backbone_rank)
+    plan = DSV4ExecutionPlan(tp.rank, tp.size, backbone_rank, expert_shards)
     if _PLAN is not None and _PLAN != plan:
         raise RuntimeError(f"DSV4 execution plan already configured as {_PLAN}, got {plan}")
     _PLAN = plan

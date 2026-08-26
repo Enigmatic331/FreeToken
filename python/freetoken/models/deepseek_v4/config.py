@@ -25,15 +25,24 @@ def ep_partition(n_global: int) -> ExpertPartition:
     """Return this process's routed-expert ownership.
 
     TP>1 serves DSV4 as expert parallelism with replicated dense layers.  The
-    balanced partition also supports non-divisible configurations such as
-    256 experts over three ranks (86/85/85).
+    default balanced partition supports non-divisible configurations such as
+    256 experts over three ranks (86/85/85).  A configured heterogeneous
+    execution plan can replace that with explicit per-rank counts.
     """
     from freetoken.distributed import try_get_tp_info
 
     info = try_get_tp_info()
     if info is None:
         return ExpertPartition(n_global)
-    return ExpertPartition(n_global, world_size=info.size, rank=info.rank)
+    from .execution import get_dsv4_execution_plan
+
+    plan = get_dsv4_execution_plan()
+    return ExpertPartition(
+        n_global,
+        world_size=info.size,
+        rank=info.rank,
+        shard_counts=plan.expert_shards,
+    )
 
 
 def ep_shard(n_global: int) -> tuple[int, int]:
