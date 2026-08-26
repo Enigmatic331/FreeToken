@@ -9,6 +9,7 @@ from typing import Callable
 
 import safetensors
 import torch
+from freetoken.moe.partition import ExpertPartition
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
@@ -70,6 +71,7 @@ def load_nvfp4_expert_source_banks(
     drop_page_cache: DropPageCache,
     primary: bool,
     layer_sink=None,
+    partition: ExpertPartition | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Build the 6 native NVFP4 source banks by streaming checkpoint shards (serial per-shard read).
 
@@ -92,6 +94,12 @@ def load_nvfp4_expert_source_banks(
         weight_map = json.load(f)["weight_map"]
 
     E = config.num_experts
+    partition = partition or ExpertPartition(E)
+    if partition.local_count != E:
+        raise ValueError(
+            f"{spec.desc}: config.num_experts={E} does not match partition local_count="
+            f"{partition.local_count}"
+        )
     H = config.hidden_size
     I = config.moe_intermediate_size
     num_layers = _num_moe_layers(config)
@@ -108,6 +116,8 @@ def load_nvfp4_expert_source_banks(
         layer = int(match.group("layer"))
         bank_layer = _bank_layer(spec, layer, config)
         if bank_layer is None:
+            continue
+        if not partition.owns(int(match.group("expert"))):
             continue
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
@@ -151,7 +161,8 @@ def load_nvfp4_expert_source_banks(
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                 for name, match, bank_layer_id in weight_shards[shard]:
                     layer = int(match.group("layer"))
-                    expert = int(match.group("expert"))
+                    global_expert = int(match.group("expert"))
+                    expert = partition.global_to_local(global_expert)
                     proj = match.group("proj")
                     role = spec.proj_to_role[proj]
                     kind = match.group("kind")
@@ -166,7 +177,7 @@ def load_nvfp4_expert_source_banks(
                         else:
                             raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
                     else:
-                        global_scale = globals_map[(layer, expert, proj)]
+                        global_scale = globals_map[(layer, global_expert, proj)]
                         if role == "gate":
                             gate_up_scale[bank_layer_id][expert, :I] = tensor
                             gate_up_global[bank_layer_id][expert, :I] = global_scale
@@ -211,6 +222,7 @@ def load_nvfp4_expert_source_banks_parallel(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    partition: ExpertPartition | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel counterpart of :func:`load_nvfp4_expert_source_banks`, byte-for-byte same
     placement. bulk weight/weight_scale read via chunked multi-threaded O_DIRECT reader
@@ -223,6 +235,12 @@ def load_nvfp4_expert_source_banks_parallel(
         weight_map = json.load(f)["weight_map"]
 
     E = config.num_experts
+    partition = partition or ExpertPartition(E)
+    if partition.local_count != E:
+        raise ValueError(
+            f"{spec.desc}: config.num_experts={E} does not match partition local_count="
+            f"{partition.local_count}"
+        )
     H = config.hidden_size
     I = config.moe_intermediate_size
     num_layers = _num_moe_layers(config)
@@ -235,6 +253,8 @@ def load_nvfp4_expert_source_banks_parallel(
             continue
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
+            continue
+        if not partition.owns(int(match.group("expert"))):
             continue
         kind = match.group("kind")
         if kind == "weight_scale_2":
@@ -276,7 +296,8 @@ def load_nvfp4_expert_source_banks_parallel(
         ):
             match, bank_layer_id = weight_info[name]
             layer = int(match.group("layer"))
-            expert = int(match.group("expert"))
+            global_expert = int(match.group("expert"))
+            expert = partition.global_to_local(global_expert)
             proj = match.group("proj")
             role = spec.proj_to_role[proj]
             kind = match.group("kind")
@@ -288,7 +309,7 @@ def load_nvfp4_expert_source_banks_parallel(
                 else:
                     down_packed[bank_layer_id][expert] = tensor
             else:
-                g = globals_map[(layer, expert, proj)]
+                g = globals_map[(layer, global_expert, proj)]
                 if role == "gate":
                     gate_up_scale[bank_layer_id][expert, :I] = tensor
                     gate_up_global[bank_layer_id][expert, :I] = g

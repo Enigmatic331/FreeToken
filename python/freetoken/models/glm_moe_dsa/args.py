@@ -17,6 +17,9 @@ from typing import Any, Tuple
 class GlmMoeDsaArgs:
     hidden_size: int
     num_heads: int
+    # Global routed-expert count. ``ModelConfig.num_experts`` becomes rank-local
+    # under EP, so the router and ownership mapping need this immutable source.
+    num_experts: int
     # MLA
     q_lora_rank: int
     kv_lora_rank: int
@@ -54,6 +57,10 @@ def load_args(hf_config: Any) -> GlmMoeDsaArgs:
     return GlmMoeDsaArgs(
         hidden_size=hf_config.hidden_size,
         num_heads=hf_config.num_attention_heads,
+        num_experts=int(
+            getattr(hf_config, "n_routed_experts", None)
+            or getattr(hf_config, "num_experts", 0)
+        ),
         q_lora_rank=hf_config.q_lora_rank,
         kv_lora_rank=hf_config.kv_lora_rank,
         qk_nope_head_dim=hf_config.qk_nope_head_dim,

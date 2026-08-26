@@ -22,14 +22,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Iterator
 
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.glm4_moe.weight import (
-    load_nvfp4_expert_sources,
-    load_nvfp4_expert_sources_parallel,
+from freetoken.models.nvfp4_banks import (
+    Nvfp4ExpertSourceSpec,
+    load_nvfp4_expert_source_banks,
+    load_nvfp4_expert_source_banks_parallel,
 )
 from freetoken.models.loader import drop_page_cache
 from freetoken.utils import cached_load_hf_config, download_hf_weight
@@ -39,6 +41,22 @@ from .config import parse_config
 
 # fp8-e4m3 dynamic range for the per-row W8A16 quantization of the big MLA projections.
 _FP8_MAX = 448.0
+
+_ROUTED_EXPERT_KEY_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight|weight_scale|weight_scale_2)$"
+)
+_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_ROUTED_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: (
+        None
+        if layer < config.first_k_dense_replace or layer >= config.num_layers
+        else layer - config.first_k_dense_replace
+    ),
+    desc="GLM-5.2 rank-local NVFP4 experts",
+)
 
 
 def _quant_fp8_per_row(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -177,6 +195,47 @@ def iter_weights(
             yield "lm_head.weight", head
     finally:
         reader.close()
+
+
+def load_nvfp4_expert_sources(
+    model_path: str, config, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """Load only this EP rank's contiguous GLM-5.2 expert shard."""
+    from .config import ep_partition
+
+    return load_nvfp4_expert_source_banks(
+        model_path,
+        config,
+        _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(),
+        layer_sink=layer_sink,
+        partition=ep_partition(config.glm_dsa_args.num_experts),
+    )
+
+
+def load_nvfp4_expert_sources_parallel(
+    model_path: str,
+    config,
+    *,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+    layer_sink=None,
+):
+    """Parallel-reader counterpart of :func:`load_nvfp4_expert_sources`."""
+    from .config import ep_partition
+
+    return load_nvfp4_expert_source_banks_parallel(
+        model_path,
+        config,
+        _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(),
+        workers=workers,
+        chunk=chunk,
+        layer_sink=layer_sink,
+        partition=ep_partition(config.glm_dsa_args.num_experts),
+    )
 
 
 __all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]

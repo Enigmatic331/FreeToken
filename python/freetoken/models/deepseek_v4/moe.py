@@ -10,31 +10,12 @@ from torch import nn
 from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
-from freetoken.layers import OffloadMoELayer
-from freetoken.moe.partition import ExpertPartition
+from freetoken.layers import ExpertParallelOffloadMoELayer
+from freetoken.moe.partition import ExpertPartition, localize_expert_routes
 
 from .args import DeepseekV4Args
 from .execution import get_dsv4_execution_plan
 from .layers import Linear
-
-
-def localize_expert_routes(
-    weights: torch.Tensor,
-    indices: torch.Tensor,
-    partition: ExpertPartition,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep this rank's routes and map their global ids to its local bank.
-
-    Foreign routes use the one-past-the-end expert id reserved by the grouped
-    MoE alignment kernels. Cache decode replaces the sentinel with an already-
-    requested local id immediately before admission, while retaining the zero
-    route weight.
-    """
-    local = indices - partition.global_offset
-    owned = (local >= 0) & (local < partition.local_count)
-    local = torch.where(owned, local, local.new_full((), partition.local_count))
-    weights = torch.where(owned, weights, weights.new_zeros(()))
-    return weights, local
 
 
 class Gate(nn.Module):
@@ -92,7 +73,7 @@ class Expert(nn.Module):
         return self.w2(h)
 
 
-class DSV4OffloadMoELayer(OffloadMoELayer):
+class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
     """Routed FP4 experts on the shared offload cache: the base whole-layer
     streaming prefill (grouped inline-dequant GEMM for dense chunks, GEMV
     below the route crossover) and slot-cache / cpu / hybrid decode paths
@@ -116,61 +97,6 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             activation="silu",
         )
         self.swiglu_limit = args.swiglu_limit
-
-    @staticmethod
-    def _cache_safe_route_ids(
-        topk_weights: torch.Tensor, topk_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Replace skipped sentinel routes before calling the slot-cache LRU.
-
-        Each skipped position duplicates the row's first live local expert, so
-        it creates no additional cache admission.  The all-foreign edge case
-        falls back to expert zero; its route weights remain zero and the DSV4
-        kernel masks its weight reads.
-        """
-        active = topk_weights != 0
-        first_pos = active.to(torch.int64).argmax(dim=-1, keepdim=True)
-        fallback = topk_ids.gather(-1, first_pos)
-        fallback = torch.where(
-            active.any(dim=-1, keepdim=True), fallback, fallback.new_zeros(())
-        )
-        return torch.where(active, topk_ids, fallback)
-
-    def _decode_routed(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        cache = self.offload_cache
-        assert cache is not None
-        # EP marks foreign routes with zero weights, then cache_safe_route_ids duplicates
-        # a live local id into those positions. Record the original active routes so the
-        # diagnostic histogram measures real router demand rather than cache sentinels.
-        # Frequency collection is eager-only; suppress the generic cache hook while the
-        # already-recorded ids flow through the normal implementation.
-        collect_freq = cache.collect_decode_freq
-        if collect_freq:
-            cache.record_decode_routes(self.layer_id, topk_ids, topk_weights != 0)
-            cache.collect_decode_freq = False
-        if cache.is_cpu_layer(self.layer_id):
-            # The CPU executor natively skips negative expert ids; translate
-            # the grouped-kernel sentinel only at this boundary.
-            cpu_ids = torch.where(
-                topk_weights != 0, topk_ids, topk_ids.new_full((), -1)
-            )
-            try:
-                return super()._decode_routed(hidden_states, topk_weights, cpu_ids)
-            finally:
-                cache.collect_decode_freq = collect_freq
-        try:
-            return super()._decode_routed(
-                hidden_states,
-                topk_weights,
-                self._cache_safe_route_ids(topk_weights, topk_ids),
-            )
-        finally:
-            cache.collect_decode_freq = collect_freq
 
     def _prefill_routed(
         self,

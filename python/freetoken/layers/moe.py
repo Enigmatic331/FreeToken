@@ -584,6 +584,55 @@ class OffloadMoELayer(MoELayer):
         )
 
 
+class ExpertParallelOffloadMoELayer(OffloadMoELayer):
+    """Offload layer for rank-local expert banks and globally normalized routes.
+
+    EP routers leave foreign routes in the fixed top-k shape with zero weights and
+    a one-past-the-end local id. Grouped prefill kernels accept that alignment
+    sentinel; the LRU and CPU decode paths do not, so this boundary translates it
+    without changing the route contribution.
+    """
+
+    @staticmethod
+    def _cache_safe_route_ids(
+        topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> torch.Tensor:
+        from freetoken.moe.partition import cache_safe_route_ids
+
+        return cache_safe_route_ids(topk_weights, topk_ids)
+
+    def _decode_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        cache = self.offload_cache
+        assert cache is not None
+        # Record only true local routes. The generic cache hook would otherwise
+        # count the duplicated cache-safe ids used to keep fixed graph shapes.
+        collect_freq = cache.collect_decode_freq
+        if collect_freq:
+            cache.record_decode_routes(self.layer_id, topk_ids, topk_weights != 0)
+            cache.collect_decode_freq = False
+        if cache.is_cpu_layer(self.layer_id):
+            cpu_ids = torch.where(
+                topk_weights != 0, topk_ids, topk_ids.new_full((), -1)
+            )
+            try:
+                return super()._decode_routed(hidden_states, topk_weights, cpu_ids)
+            finally:
+                cache.collect_decode_freq = collect_freq
+        try:
+            return super()._decode_routed(
+                hidden_states,
+                topk_weights,
+                self._cache_safe_route_ids(topk_weights, topk_ids),
+            )
+        finally:
+            cache.collect_decode_freq = collect_freq
+
+
 def make_moe_layer(
     config: "ModelConfig",
     *,

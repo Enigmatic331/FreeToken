@@ -27,6 +27,7 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_expert_quant,
 )
+from freetoken.moe.partition import ExpertPartition
 
 from .args import load_args
 
@@ -37,6 +38,16 @@ from .args import load_args
 # served under the same one (see weight.py).
 _ATTN_FP8 = os.getenv("FREETOKEN_GLM_ATTN_FP8", "1") != "0"
 _MLP_FP8 = os.getenv("FREETOKEN_GLM_MLP_FP8", "1") != "0"
+
+
+def ep_partition(n_global: int) -> ExpertPartition:
+    """Balanced routed-expert ownership for GLM-5.2 replicated-backbone EP."""
+    from freetoken.distributed import try_get_tp_info
+
+    info = try_get_tp_info()
+    if info is None:
+        return ExpertPartition(n_global)
+    return ExpertPartition(n_global, world_size=info.size, rank=info.rank)
 
 
 def _dsa_on(args, num_layers: int) -> bool:
@@ -105,10 +116,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
                 ),
             ),
         ),
-        num_experts=(
-            getattr(hf_config, "n_routed_experts", None)
-            or getattr(hf_config, "num_experts", 0)
-        ),
+        # TP>1 is expert parallelism: dense/attention weights and latent KV stay
+        # replicated, while every rank owns a contiguous routed-expert shard.
+        # The parent parses before worker rank setup, so engine._adjust_config repeats
+        # this resolution after set_tp_info; args.num_experts remains global for routing.
+        num_experts=ep_partition(args.num_experts).local_count,
         num_experts_per_tok=hf_config.num_experts_per_tok,
         moe_intermediate_size=getattr(hf_config, "moe_intermediate_size", 0)
         or hf_config.intermediate_size,
@@ -134,4 +146,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["ep_partition", "parse_config"]

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 
 @dataclass(frozen=True, slots=True)
 class ExpertPartition:
@@ -110,4 +112,40 @@ class ExpertPartition:
         return remainder + (global_expert - wide_experts) // base
 
 
-__all__ = ["ExpertPartition"]
+def localize_expert_routes(
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    partition: ExpertPartition,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep this rank's routes and map global expert ids into its local bank.
+
+    Foreign routes receive zero weight and the one-past-the-end local expert id.
+    The grouped prefill kernels use that id as their alignment sentinel; slot-cache
+    decode paths must replace it with a live local id before admission.
+    """
+    local = indices - partition.global_offset
+    owned = (local >= 0) & (local < partition.local_count)
+    local = torch.where(owned, local, local.new_full((), partition.local_count))
+    weights = torch.where(owned, weights, weights.new_zeros(()))
+    return weights, local
+
+
+def cache_safe_route_ids(
+    weights: torch.Tensor,
+    local_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Replace zero-weight EP sentinels before an LRU cache sees route ids.
+
+    Skipped positions duplicate the row's first live local expert, adding no cache
+    admission. An all-foreign row uses expert zero; all of its weights remain zero.
+    """
+    active = weights != 0
+    first_pos = active.to(torch.int64).argmax(dim=-1, keepdim=True)
+    fallback = local_ids.gather(-1, first_pos)
+    fallback = torch.where(
+        active.any(dim=-1, keepdim=True), fallback, fallback.new_zeros(())
+    )
+    return torch.where(active, local_ids, fallback)
+
+
+__all__ = ["ExpertPartition", "cache_safe_route_ids", "localize_expert_routes"]

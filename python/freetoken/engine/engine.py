@@ -1157,6 +1157,7 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    is_glm_dsa = getattr(model_config, "glm_dsa_args", None) is not None
     dsv4_backbone_rank = getattr(config, "dsv4_backbone_rank", None)
     dsv4_expert_shards = getattr(config, "dsv4_expert_shards", None)
     dsv4_moe_cache_sizes = getattr(config, "dsv4_moe_cache_sizes", None)
@@ -1212,6 +1213,24 @@ def _adjust_config(config: EngineConfig):
                 tp_info.size,
                 cache_size,
             )
+    elif is_glm_dsa and tp_info is not None and tp_info.size > 1:
+        # GLM-5.2 uses the same replicated-backbone EP shape as DSV4, but only
+        # needs the balanced partition today (no heterogeneous execution plan).
+        # The model config was parsed in the parent before worker ranks existed,
+        # so resolve its local expert count again after set_tp_info.
+        from freetoken.models.glm_moe_dsa.config import ep_partition
+
+        partition = ep_partition(model_config.glm_dsa_args.num_experts)
+        object.__setattr__(model_config, "num_experts", partition.local_count)
+        logger.info(
+            "GLM-5.2 expert partition: rank=%d/%d global=%d local=%d range=[%d,%d)",
+            partition.rank,
+            partition.world_size,
+            partition.total_experts,
+            partition.local_count,
+            partition.global_offset,
+            partition.global_stop,
+        )
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
