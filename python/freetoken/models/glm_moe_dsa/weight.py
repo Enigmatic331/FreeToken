@@ -47,14 +47,25 @@ _ROUTED_EXPERT_KEY_RE = re.compile(
     r"(?P<proj>gate_proj|up_proj|down_proj)\."
     r"(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
+
+
+def _layer_to_bank(layer: int, config) -> int | None:
+    if layer < config.first_k_dense_replace or layer >= config.num_layers:
+        return None
+    local_ids = getattr(config, "local_layer_ids", None)
+    if local_ids is None:
+        return layer - config.first_k_dense_replace
+    local_moe = [i for i in local_ids if i >= config.first_k_dense_replace]
+    try:
+        return local_moe.index(layer)
+    except ValueError:
+        return None
+
+
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_ROUTED_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: (
-        None
-        if layer < config.first_k_dense_replace or layer >= config.num_layers
-        else layer - config.first_k_dense_replace
-    ),
+    layer_to_bank=_layer_to_bank,
     desc="GLM-5.2 rank-local NVFP4 experts",
 )
 
@@ -65,6 +76,20 @@ def _quant_fp8_per_row(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = (wf.abs().amax(dim=1) / _FP8_MAX).clamp(min=1e-12)
     q = (wf / scale[:, None]).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
     return q, scale.to(torch.float32)
+
+
+def dummy_moe_expert_sources(config, *, dtype: torch.dtype):
+    """BF16 dummy banks with stage-local layers and unsharded expert widths."""
+    from freetoken.kernel.pinned import copy_to_pinned_tensor
+
+    layers = config.num_moe_layers
+    E, H, I = config.num_experts, config.hidden_size, config.moe_intermediate_size
+    gate_up = [torch.randn(E, 2 * I, H, dtype=dtype) for _ in range(layers)]
+    down = [torch.randn(E, H, I, dtype=dtype) for _ in range(layers)]
+    if torch.cuda.is_available():
+        gate_up = [copy_to_pinned_tensor(t) for t in gate_up]
+        down = [copy_to_pinned_tensor(t) for t in down]
+    return gate_up, down
 
 
 class _ShardReader:
@@ -110,6 +135,9 @@ def iter_weights(
     )
     assert include_non_moe
     config = parse_config(cached_load_hf_config(model_path))
+    from .execution import glm_pipeline_plan
+
+    plan = glm_pipeline_plan(config.num_layers, config.glm_dsa_args.indexer_types)
     folder = download_hf_weight(model_path)
     with open(os.path.join(folder, "model.safetensors.index.json")) as f:
         weight_map = json.load(f)["weight_map"]
@@ -129,7 +157,7 @@ def iter_weights(
         )
     try:
         for layer in tqdm(
-            range(config.num_layers),
+            plan.layer_ids,
             desc="Loading GLM-5.2 dense weights",
             disable=not primary,
         ):
@@ -184,15 +212,17 @@ def iter_weights(
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield from _mlp_weight(f"{m}.shared_experts.{proj}")
 
-        yield "model.embed_tokens.weight", reader.get("model.embed_tokens.weight")
-        yield "model.norm.weight", reader.get("model.norm.weight")
-        head = reader.get("lm_head.weight")
-        if head_fp8 and not config.tie_word_embeddings:
-            q, scale = _quant_fp8_per_row(head)
-            yield "lm_head.weight", q
-            yield "lm_head.weight_scale", scale
-        else:
-            yield "lm_head.weight", head
+        if plan.is_first:
+            yield "model.embed_tokens.weight", reader.get("model.embed_tokens.weight")
+        if plan.is_last:
+            yield "model.norm.weight", reader.get("model.norm.weight")
+            head = reader.get("lm_head.weight")
+            if head_fp8 and not config.tie_word_embeddings:
+                q, scale = _quant_fp8_per_row(head)
+                yield "lm_head.weight", q
+                yield "lm_head.weight_scale", scale
+            else:
+                yield "lm_head.weight", head
     finally:
         reader.close()
 
@@ -201,7 +231,16 @@ def load_nvfp4_expert_sources(
     model_path: str, config, *, layer_sink=None
 ) -> dict[str, list[torch.Tensor]]:
     """Load only this EP rank's contiguous GLM-5.2 expert shard."""
+    from freetoken.moe.partition import ExpertPartition
     from .config import ep_partition
+    from .execution import glm_pipeline_plan
+
+    plan = glm_pipeline_plan(config.num_layers, config.glm_dsa_args.indexer_types)
+    partition = (
+        ExpertPartition(config.glm_dsa_args.num_experts)
+        if plan.enabled
+        else ep_partition(config.glm_dsa_args.num_experts)
+    )
 
     return load_nvfp4_expert_source_banks(
         model_path,
@@ -210,7 +249,7 @@ def load_nvfp4_expert_sources(
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
-        partition=ep_partition(config.glm_dsa_args.num_experts),
+        partition=partition,
     )
 
 
@@ -223,7 +262,16 @@ def load_nvfp4_expert_sources_parallel(
     layer_sink=None,
 ):
     """Parallel-reader counterpart of :func:`load_nvfp4_expert_sources`."""
+    from freetoken.moe.partition import ExpertPartition
     from .config import ep_partition
+    from .execution import glm_pipeline_plan
+
+    plan = glm_pipeline_plan(config.num_layers, config.glm_dsa_args.indexer_types)
+    partition = (
+        ExpertPartition(config.glm_dsa_args.num_experts)
+        if plan.enabled
+        else ep_partition(config.glm_dsa_args.num_experts)
+    )
 
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
@@ -234,8 +282,13 @@ def load_nvfp4_expert_sources_parallel(
         workers=workers,
         chunk=chunk,
         layer_sink=layer_sink,
-        partition=ep_partition(config.glm_dsa_args.num_experts),
+        partition=partition,
     )
 
 
-__all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]
+__all__ = [
+    "dummy_moe_expert_sources",
+    "iter_weights",
+    "load_nvfp4_expert_sources",
+    "load_nvfp4_expert_sources_parallel",
+]

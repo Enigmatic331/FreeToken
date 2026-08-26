@@ -75,6 +75,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if _cap:
         num_layers = min(num_layers, int(_cap))
 
+    from .execution import glm_pipeline_plan
+
+    plan = glm_pipeline_plan(num_layers, args.indexer_types)
+    layer_ids = plan.layer_ids
+
     rotary_config = RotaryConfig(
         head_dim=args.qk_head_dim,
         rotary_dim=args.qk_rope_head_dim,
@@ -103,24 +108,26 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
-                layer_ids=tuple(range(num_layers)),
+                layer_ids=layer_ids,
                 num_kv_heads=1,
                 head_dim=latent_dim,
                 rotary_config=rotary_config,
                 mla=True,
                 index_head_dim=args.index_head_dim if _dsa_on(args, num_layers) else 0,
                 num_index_layers=(
-                    sum(1 for t in args.indexer_types[:num_layers] if t == "full")
+                    sum(1 for i in layer_ids if args.indexer_types[i] == "full")
                     if _dsa_on(args, num_layers)
                     else 0
                 ),
             ),
         ),
-        # TP>1 is expert parallelism: dense/attention weights and latent KV stay
-        # replicated, while every rank owns a contiguous routed-expert shard.
+        # Replicated mode uses expert parallelism. Pipeline mode owns all routed
+        # experts for only its local layers.
         # The parent parses before worker rank setup, so engine._adjust_config repeats
         # this resolution after set_tp_info; args.num_experts remains global for routing.
-        num_experts=ep_partition(args.num_experts).local_count,
+        num_experts=(
+            args.num_experts if plan.enabled else ep_partition(args.num_experts).local_count
+        ),
         num_experts_per_tok=hf_config.num_experts_per_tok,
         moe_intermediate_size=getattr(hf_config, "moe_intermediate_size", 0)
         or hf_config.intermediate_size,
@@ -143,6 +150,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         dense_quant="fp8_pertensor" if _MLP_FP8 else "none",
         lm_head_quant="fp8_pertensor" if _MLP_FP8 else "none",
         glm_dsa_args=args,
+        local_layer_ids=layer_ids if plan.enabled else None,
     )
 
 

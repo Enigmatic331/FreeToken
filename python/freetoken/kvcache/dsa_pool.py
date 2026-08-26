@@ -37,9 +37,14 @@ class MLAKVCache(BaseKVCachePool):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        layer_ids: tuple[int, ...] | None = None,
     ) -> None:
         self._latent_dim = latent_dim
-        self._num_layers = num_layers
+        self._layer_ids = tuple(range(num_layers)) if layer_ids is None else tuple(layer_ids)
+        self._layer_to_slot = {layer_id: i for i, layer_id in enumerate(self._layer_ids)}
+        if len(self._layer_to_slot) != len(self._layer_ids):
+            raise ValueError(f"duplicate MLA KV layer ids: {self._layer_ids}")
+        self._num_layers = len(self._layer_ids)
         self._page_size = page_size
         self._dtype = dtype
         self._device = device
@@ -56,7 +61,8 @@ class MLAKVCache(BaseKVCachePool):
     # -- views ------------------------------------------------------------------
     def k_cache(self, layer_id: int) -> torch.Tensor:
         """Paged latent view ``[num_pages, page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(self._num_pages, self._page_size, -1)
+        slot = self._layer_to_slot[layer_id]
+        return self._kv_buffer[0, slot].view(self._num_pages, self._page_size, -1)
 
     def v_cache(self, layer_id: int) -> torch.Tensor:
         # MLA: K == V (single latent); same buffer, dsv4_paged_pool precedent.
@@ -64,7 +70,8 @@ class MLAKVCache(BaseKVCachePool):
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:
         """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(-1, self._latent_dim)
+        slot = self._layer_to_slot[layer_id]
+        return self._kv_buffer[0, slot].view(-1, self._latent_dim)
 
     # -- writes -----------------------------------------------------------------
     def store_kv(
@@ -141,10 +148,14 @@ class DSAKVCache(MLAKVCache):
         device: torch.device,
         index_head_dim: int,
         num_index_layers: int,
+        layer_ids: tuple[int, ...] | None = None,
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
-        super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device)
+        super().__init__(
+            latent_dim, num_layers, num_pages, page_size, dtype, device,
+            layer_ids=layer_ids,
+        )
 
     def _alloc(self, num_pages: int) -> None:
         # Both slabs in one allocation step: rebuild can never leave the pool with a

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from freetoken.layers import (
     BaseOP,
     ExpertParallelOffloadMoELayer,
+    PipelineOffloadMoELayer,
     LinearReplicated,
     make_moe_layer,
 )
@@ -33,8 +34,18 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 class GlmMoeDsaSparseBlock(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         from .config import ep_partition
+        from .execution import glm_pipeline_plan
+        from freetoken.moe.partition import ExpertPartition
 
-        self.partition = ep_partition(config.glm_dsa_args.num_experts)
+        plan = glm_pipeline_plan(
+            getattr(config, "num_layers", 1),
+            tuple(getattr(config.glm_dsa_args, "indexer_types", ())),
+        )
+        self.partition = (
+            ExpertPartition(config.glm_dsa_args.num_experts)
+            if plan.enabled
+            else ep_partition(config.glm_dsa_args.num_experts)
+        )
         self.top_k = config.num_experts_per_tok
         # Router geometry stays global; only the expert bank/cache is rank-local.
         self.num_experts = self.partition.total_experts
@@ -50,12 +61,19 @@ class GlmMoeDsaSparseBlock(BaseOP):
 
         # The offload cache indexes experts by *MoE* layer (global layer minus
         # first_k_dense_replace), matching how the loader packs the expert banks.
+        cache_layer_id = (
+            plan.moe_index(layer_id, config.first_k_dense_replace)
+            if plan.enabled
+            else layer_id - config.first_k_dense_replace
+        )
         self.experts = make_moe_layer(
             config,
-            layer_id=layer_id - config.first_k_dense_replace,
+            layer_id=cache_layer_id,
             renormalize=config.norm_topk_prob,
             num_experts=self.partition.local_count,
-            offload_cls=ExpertParallelOffloadMoELayer,
+            offload_cls=(
+                PipelineOffloadMoELayer if plan.enabled else ExpertParallelOffloadMoELayer
+            ),
         )
         self.shared_experts = GlmDsaGatedMLP(
             config.hidden_size,

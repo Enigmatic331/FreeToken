@@ -318,7 +318,20 @@ class Engine:
             config.dsv4_backbone_rank,
             config.dsv4_expert_shards,
         )
+        from freetoken.models.glm_moe_dsa.execution import configure_glm_pipeline
+
+        configure_glm_pipeline(config.glm_pipeline_parallel)
         _adjust_config(config)
+        from freetoken.models.glm_moe_dsa.execution import glm_pipeline_plan
+
+        self._glm_plan = (
+            glm_pipeline_plan(
+                config.model_config.num_layers,
+                getattr(config.model_config.glm_dsa_args, "indexer_types", ()),
+            )
+            if config.model_config.glm_dsa_args is not None
+            else None
+        )
         self._execution_comm = DistributedCommunicator()
 
         torch.manual_seed(42)
@@ -354,7 +367,10 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
-        if is_offload_moe_backend(config.moe_backend):
+        if (
+            is_offload_moe_backend(config.moe_backend)
+            and config.model_config.num_moe_layers > 0
+        ):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
@@ -364,12 +380,22 @@ class Engine:
         # therefore have much more free VRAM. Size the common KV geometry from the
         # authority (the cross-rank minimum), not the worker maximum.
         new_free_pair = self._sync_get_memory()
-        new_free = new_free_pair[0] if self._dsv4_plan.enabled else new_free_pair[1]
+        new_free = (
+            new_free_pair[0]
+            if self._dsv4_plan.enabled or (self._glm_plan is not None and self._glm_plan.enabled)
+            else new_free_pair[1]
+        )
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        if self._glm_plan is not None and self._glm_plan.enabled:
+            pages = torch.tensor(self.num_pages, dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(
+                pages, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            self.num_pages = int(pages.item())
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config,
@@ -450,7 +476,12 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=(1 if self._dsv4_plan.is_expert_worker else config.model_config.vocab_size),
+            vocab_size=(
+                1
+                if self._dsv4_plan.is_expert_worker
+                or (self._glm_plan is not None and self._glm_plan.enabled and not self._glm_plan.is_last)
+                else config.model_config.vocab_size
+            ),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -720,6 +751,7 @@ class Engine:
         if (
             max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024
             and not self._dsv4_plan.enabled
+            and not (self._glm_plan is not None and self._glm_plan.enabled)
         ):
             logger.error(
                 f"Memory across TP ranks are imbalanced:"
@@ -911,7 +943,12 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=free_min,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=(1 if self._dsv4_plan.is_expert_worker else config.model_config.vocab_size),
+            vocab_size=(
+                1
+                if self._dsv4_plan.is_expert_worker
+                or (self._glm_plan is not None and self._glm_plan.enabled and not self._glm_plan.is_last)
+                else config.model_config.vocab_size
+            ),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -932,7 +969,12 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        if self._dsv4_plan.is_expert_worker:
+        glm_nonfinal = (
+            self._glm_plan is not None
+            and self._glm_plan.enabled
+            and not self._glm_plan.is_last
+        )
+        if self._dsv4_plan.is_expert_worker or glm_nonfinal:
             # Only the backbone authority owns meaningful logits. Keep every
             # scheduler replica byte-identical with one tiny token broadcast.
             next_tokens_gpu = torch.empty(
@@ -943,6 +985,10 @@ class Engine:
         if self._dsv4_plan.enabled:
             next_tokens_gpu = self._execution_comm.broadcast(
                 next_tokens_gpu, self._dsv4_plan.backbone_rank
+            )
+        elif self._glm_plan is not None and self._glm_plan.enabled:
+            next_tokens_gpu = self._execution_comm.broadcast(
+                next_tokens_gpu, self._glm_plan.final_rank
             )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
@@ -1161,7 +1207,22 @@ def _adjust_config(config: EngineConfig):
     dsv4_backbone_rank = getattr(config, "dsv4_backbone_rank", None)
     dsv4_expert_shards = getattr(config, "dsv4_expert_shards", None)
     dsv4_moe_cache_sizes = getattr(config, "dsv4_moe_cache_sizes", None)
+    glm_pipeline_parallel = getattr(config, "glm_pipeline_parallel", False)
     tp_info = getattr(config, "tp_info", None)
+
+    if glm_pipeline_parallel:
+        if not is_glm_dsa:
+            raise ValueError("--glm-pipeline-parallel is valid only for GLM-5.2 DSA")
+        if tp_info is None or tp_info.size <= 1:
+            raise ValueError("--glm-pipeline-parallel requires --tensor-parallel-size > 1")
+        if dsv4_backbone_rank is not None:
+            raise ValueError(
+                "--glm-pipeline-parallel cannot be combined with --dsv4-backbone-rank"
+            )
+        if config.distributed_timeout == EngineConfig.distributed_timeout:
+            # Stage-local checkpoint/expert volumes need not be identical, so one
+            # worker may wait at a post-load barrier while another is still reading.
+            override("distributed_timeout", 900.0)
 
     for flag, values in (
         ("--dsv4-expert-shards", dsv4_expert_shards),
@@ -1214,23 +1275,57 @@ def _adjust_config(config: EngineConfig):
                 cache_size,
             )
     elif is_glm_dsa and tp_info is not None and tp_info.size > 1:
-        # GLM-5.2 uses the same replicated-backbone EP shape as DSV4, but only
-        # needs the balanced partition today (no heterogeneous execution plan).
         # The model config was parsed in the parent before worker ranks existed,
-        # so resolve its local expert count again after set_tp_info.
-        from freetoken.models.glm_moe_dsa.config import ep_partition
+        # so resolve replicated EP or stage-local pipeline ownership here.
+        if glm_pipeline_parallel:
+            from dataclasses import replace
 
-        partition = ep_partition(model_config.glm_dsa_args.num_experts)
-        object.__setattr__(model_config, "num_experts", partition.local_count)
-        logger.info(
-            "GLM-5.2 expert partition: rank=%d/%d global=%d local=%d range=[%d,%d)",
-            partition.rank,
-            partition.world_size,
-            partition.total_experts,
-            partition.local_count,
-            partition.global_offset,
-            partition.global_stop,
-        )
+            from freetoken.models.glm_moe_dsa.execution import glm_pipeline_plan
+
+            plan = glm_pipeline_plan(
+                model_config.num_layers, model_config.glm_dsa_args.indexer_types
+            )
+            object.__setattr__(model_config, "local_layer_ids", plan.layer_ids)
+            object.__setattr__(
+                model_config,
+                "attention_groups",
+                tuple(
+                    replace(
+                        group,
+                        layer_ids=plan.layer_ids,
+                        num_index_layers=sum(
+                            model_config.glm_dsa_args.indexer_types[i] == "full"
+                            for i in plan.layer_ids
+                        ),
+                    )
+                    for group in model_config.attention_groups
+                ),
+            )
+            object.__setattr__(
+                model_config, "num_experts", model_config.glm_dsa_args.num_experts
+            )
+            logger.info(
+                "GLM-5.2 pipeline stage: rank=%d/%d layers=[%d,%d) local_moe_layers=%d",
+                plan.rank,
+                plan.world_size,
+                plan.start_layer,
+                plan.stop_layer,
+                model_config.num_moe_layers,
+            )
+        else:
+            from freetoken.models.glm_moe_dsa.config import ep_partition
+
+            partition = ep_partition(model_config.glm_dsa_args.num_experts)
+            object.__setattr__(model_config, "num_experts", partition.local_count)
+            logger.info(
+                "GLM-5.2 expert partition: rank=%d/%d global=%d local=%d range=[%d,%d)",
+                partition.rank,
+                partition.world_size,
+                partition.total_experts,
+                partition.local_count,
+                partition.global_offset,
+                partition.global_stop,
+            )
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)

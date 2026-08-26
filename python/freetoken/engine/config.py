@@ -85,6 +85,9 @@ class EngineConfig:
     # Optional rank-local GPU expert-slot capacities.  This lets expert-only
     # workers spend the VRAM omitted by their dense backbone on a larger cache.
     dsv4_moe_cache_sizes: tuple[int, ...] | None = None
+    # GLM-5.2 contiguous pipeline parallelism: TP ranks become layer stages
+    # instead of replicated-backbone expert-parallel ranks.
+    glm_pipeline_parallel: bool = False
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size

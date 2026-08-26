@@ -283,6 +283,10 @@ class ModelConfig:
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
     glm_dsa_args: Any | None = None
+    # Optional stage-local global layer IDs. Pipeline models keep ``num_layers`` as
+    # checkpoint/global geometry while pools, loaders, and MoE caches allocate only
+    # these layers. None preserves the established all-layer behavior.
+    local_layer_ids: tuple[int, ...] | None = None
     # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
     # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
@@ -303,6 +307,8 @@ class ModelConfig:
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
         """
+        if self.local_layer_ids is not None:
+            return sum(i >= self.first_k_dense_replace for i in self.local_layer_ids)
         return self.num_layers - self.first_k_dense_replace
 
     @property

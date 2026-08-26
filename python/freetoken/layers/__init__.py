@@ -10,6 +10,7 @@ from .linear import (
 )
 from .moe import (
     ExpertParallelOffloadMoELayer,
+    PipelineOffloadMoELayer,
     MoELayer,
     OffloadMoELayer,
     make_moe_layer,
@@ -48,5 +49,6 @@ __all__ = [
     "MoELayer",
     "OffloadMoELayer",
     "ExpertParallelOffloadMoELayer",
+    "PipelineOffloadMoELayer",
     "make_moe_layer",
 ]

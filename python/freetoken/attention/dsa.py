@@ -100,9 +100,16 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         self._idx_slot: Dict[int, int] = {}
         if self.dsa_enabled:
             lead = None
-            # Capped to the SERVED layer count (dev num_layers overrides must not
-            # index slots past the pool the factory sized from the same cap).
-            for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
+            specs_fn = getattr(config, "kv_cache_group_specs", None)
+            layer_ids = (
+                specs_fn()[0].layer_ids
+                if specs_fn is not None
+                else tuple(range(config.num_layers))
+            )
+            # Stage-local global ids; pipeline boundaries always start on a full
+            # IndexShare leader, so no selection state crosses the stage boundary.
+            for lid in layer_ids:
+                kind = args.indexer_types[lid]
                 if kind == "full":
                     lead = lid
                     self._idx_slot[lid] = len(self._idx_slot)

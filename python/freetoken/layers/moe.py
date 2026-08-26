@@ -584,6 +584,13 @@ class OffloadMoELayer(MoELayer):
         )
 
 
+class PipelineOffloadMoELayer(OffloadMoELayer):
+    """Stage-local offload layer: all experts are local, so no TP all-reduce."""
+
+    def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
 class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     """Offload layer for rank-local expert banks and globally normalized routes.
 

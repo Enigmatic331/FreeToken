@@ -189,21 +189,23 @@ def create_kvcache_pool(
         if spec.index_head_dim > 0 and spec.num_index_layers > 0:
             return DSAKVCache(
                 latent_dim=spec.head_dim,
-                num_layers=model_config.num_layers,
+                num_layers=spec.num_layers,
                 num_pages=num_pages,
                 page_size=page_size,
                 dtype=dtype,
                 device=device,
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
+                layer_ids=spec.layer_ids,
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,
-            num_layers=model_config.num_layers,
+            num_layers=spec.num_layers,
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
             device=device,
+            layer_ids=spec.layer_ids,
         )
 
     return MHAKVCache(

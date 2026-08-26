@@ -264,6 +264,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--glm-pipeline-parallel",
+        action="store_true",
+        default=ServerArgs.glm_pipeline_parallel,
+        help=(
+            "Use tensor-parallel workers as contiguous GLM-5.2 pipeline stages. "
+            "Each stage owns local dense weights, KV, and all routed experts for "
+            "its layers."
+        ),
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",
