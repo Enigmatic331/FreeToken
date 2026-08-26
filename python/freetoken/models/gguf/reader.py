@@ -11,6 +11,7 @@ dim; row_bytes spans whole quant blocks of the fastest dim).
 from __future__ import annotations
 
 import functools
+import mmap
 import os
 import re
 import struct
@@ -138,10 +139,41 @@ class GgufTensor:
     rows: int  # product of shape[:-1] over the *ggml* layout = blocks-major rows
     row_bytes: int  # packed bytes per row (whole quant blocks of the fastest dim)
     _raw: np.ndarray  # uint8 view, shape [rows, row_bytes]
+    _mapping: mmap.mmap | None = None
+    _mapping_offset: int = 0
+    _mapping_length: int = 0
 
     def packed(self) -> torch.Tensor:
         """Zero-copy ``[rows, row_bytes]`` uint8 tensor of the native block bytes."""
         return torch.from_numpy(self._raw)
+
+    def drop_cache(self) -> None:
+        """Discard this tensor's source pages after a consumer has copied them.
+
+        Split GGUF serving copies routed experts into anonymous pinned host banks. Without
+        this hint, source file pages remain mapped and recently referenced while the
+        destination grows, transiently requiring almost two copies of a very large model.
+        A later access remains safe and simply faults the clean file data back in.
+        """
+        if self._mapping is None or self._mapping_length <= 0:
+            return
+        advice = getattr(mmap, "MADV_DONTNEED", None)
+        if advice is None or not hasattr(self._mapping, "madvise"):
+            return
+        page = mmap.PAGESIZE
+        start = self._mapping_offset // page * page
+        stop = min(
+            len(self._mapping),
+            ((self._mapping_offset + self._mapping_length + page - 1) // page) * page,
+        )
+        if stop <= start:
+            return
+        try:
+            self._mapping.madvise(advice, start, stop - start)
+        except (OSError, ValueError):
+            # Cache eviction is an optimization. Unsupported filesystems/platforms retain
+            # the original, correct mmap behavior rather than failing model loading.
+            pass
 
 
 def _field_value(reader, name: str) -> Any:
@@ -194,6 +226,10 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
             # normalize everything to a flat byte view before shaping into [rows, row_bytes].
             flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
             raw = flat.reshape(rows, row_bytes)
+            mapping = reader.data.base if isinstance(reader.data.base, mmap.mmap) else None
+            mapping_offset = (
+                int(raw.ctypes.data - reader.data.ctypes.data) if mapping is not None else 0
+            )
             yield GgufTensor(
                 name=t.name,
                 shape=torch_shape,
@@ -201,6 +237,9 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
                 rows=rows,
                 row_bytes=row_bytes,
                 _raw=raw,
+                _mapping=mapping,
+                _mapping_offset=mapping_offset,
+                _mapping_length=raw.nbytes,
             )
 
 

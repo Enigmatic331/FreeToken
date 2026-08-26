@@ -180,6 +180,9 @@ def load_gguf_q2_k_xl_expert_sources(
                 role = "down"
             else:
                 continue
+            drop_cache = getattr(tensor, "drop_cache", None)
+            if drop_cache is not None:
+                drop_cache()
             seen[role].add(layer)
             if tracker is not None:
                 tracker.note(slot)
@@ -339,21 +342,26 @@ def _dequant_gguf_tensor(tensor, device: torch.device) -> torch.Tensor:
     """Materialize one non-expert GGUF tensor as bf16 on the serving device."""
     from freetoken.models.gguf.dequant import GGML_BF16, GGML_F16, GGML_F32, dequantize
 
-    if tensor.ggml_type in (GGML_F32, GGML_F16, GGML_BF16):
-        return dequantize(tensor.packed(), tensor.ggml_type, torch.bfloat16).reshape(
-            tensor.shape
-        ).to(device)
-    if device.type != "cuda":
-        raise NotImplementedError(
-            "GLM mixed-quant GGUF dense weights currently dequantize through the CUDA "
-            "ggml kernel; serve directly on CUDA (CPU FTW conversion is not yet supported)"
-        )
-    from freetoken.kernel.gguf import ggml_dequantize
+    try:
+        if tensor.ggml_type in (GGML_F32, GGML_F16, GGML_BF16):
+            return dequantize(tensor.packed(), tensor.ggml_type, torch.bfloat16).reshape(
+                tensor.shape
+            ).to(device)
+        if device.type != "cuda":
+            raise NotImplementedError(
+                "GLM mixed-quant GGUF dense weights currently dequantize through the CUDA "
+                "ggml kernel; serve directly on CUDA (CPU FTW conversion is not yet supported)"
+            )
+        from freetoken.kernel.gguf import ggml_dequantize
 
-    packed = tensor.packed().to(device)
-    return ggml_dequantize(
-        packed, tensor.ggml_type, tensor.rows, tensor.shape[-1], torch.bfloat16
-    ).reshape(tensor.shape)
+        packed = tensor.packed().to(device)
+        return ggml_dequantize(
+            packed, tensor.ggml_type, tensor.rows, tensor.shape[-1], torch.bfloat16
+        ).reshape(tensor.shape)
+    finally:
+        drop_cache = getattr(tensor, "drop_cache", None)
+        if drop_cache is not None:
+            drop_cache()
 
 
 def iter_gguf_weights(

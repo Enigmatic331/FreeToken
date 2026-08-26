@@ -1,6 +1,40 @@
 from types import SimpleNamespace
 
 
+def test_gguf_tensor_drop_cache_aligns_the_mmap_range():
+    import mmap
+
+    import numpy as np
+
+    from freetoken.models.gguf.reader import GgufTensor
+
+    class Mapping:
+        def __init__(self):
+            self.calls = []
+
+        def __len__(self):
+            return 4 * mmap.PAGESIZE
+
+        def madvise(self, advice, start, length):
+            self.calls.append((advice, start, length))
+
+    mapping = Mapping()
+    tensor = GgufTensor(
+        name="weight",
+        shape=(32,),
+        ggml_type=0,
+        rows=1,
+        row_bytes=32,
+        _raw=np.zeros((1, 32), dtype=np.uint8),
+        _mapping=mapping,
+        _mapping_offset=mmap.PAGESIZE - 8,
+        _mapping_length=32,
+    )
+    tensor.drop_cache()
+
+    assert mapping.calls == [(mmap.MADV_DONTNEED, 0, 2 * mmap.PAGESIZE)]
+
+
 def _shim():
     p = "glm-dsa."
     metadata = {

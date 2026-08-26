@@ -214,9 +214,13 @@ def test_glm_q2_loader_materializes_only_stage_layers(monkeypatch):
             self.name = name
             self.ggml_type = ggml_type
             self._packed = packed
+            self.cache_drops = 0
 
         def packed(self) -> torch.Tensor:
             return self._packed
+
+        def drop_cache(self) -> None:
+            self.cache_drops += 1
 
     tensors = []
     for layer in (3, 4, 5):
@@ -259,6 +263,7 @@ def test_glm_q2_loader_materializes_only_stage_layers(monkeypatch):
     assert banks["gate_up"][0][0, 0, 0].item() == 14
     assert banks["gate_up"][0][0, intermediate, 0].item() == 24
     assert banks["down"][1][0, 0, 0].item() == 35
+    assert sum(t.cache_drops for t in tensors) == 6
 
 
 def test_split_gguf_paths_require_complete_set(tmp_path):
