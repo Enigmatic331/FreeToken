@@ -529,7 +529,40 @@ class OffloadMoELayer(MoELayer):
 
             gate_up, down = views
             return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                intermediate_size=self.intermediate_size,
+            )
+        if fmt == "gguf_q2_k_xl":
+            # GLM-5.2 UD-Q2_K_XL: mixed IQ2_XS gate/up and IQ3_XXS down rows,
+            # both dequantized inside the borrowed llama.cpp MMVQ kernels.
+            from freetoken.models.gguf.dequant import (
+                GGML_IQ2_XS,
+                GGML_IQ3_XXS,
+                GGML_IQ4_XS,
+                row_bytes,
+            )
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q2_k_xl
+
+            gate_up, down = views
+            gu_row = cache.bank_feature_bytes["gate_up"][self.layer_id] // (
+                2 * self.intermediate_size
+            )
+            down_row = cache.bank_feature_bytes["down"][self.layer_id] // (
+                self.hidden_size
+            )
+            gu_types = (GGML_IQ2_XS, GGML_IQ3_XXS)
+            down_types = (GGML_IQ3_XXS, GGML_IQ4_XS)
+            gate_up_type = next(
+                q for q in gu_types if row_bytes(self.hidden_size, q) == gu_row
+            )
+            down_type = next(
+                q for q in down_types if row_bytes(self.intermediate_size, q) == down_row
+            )
+            return fused_experts_gguf_q2_k_xl(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                gate_up_type=gate_up_type,
+                down_type=down_type,
+                intermediate_size=self.intermediate_size,
             )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV

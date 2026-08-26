@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import struct
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -25,6 +26,37 @@ def is_gguf_path(model_path: str) -> bool:
     return isinstance(model_path, str) and os.path.isfile(model_path) and model_path.endswith(
         ".gguf"
     )
+
+
+_SPLIT_RE = re.compile(r"^(?P<prefix>.+)-(?P<part>\d{5})-of-(?P<count>\d{5})\.gguf$")
+
+
+def gguf_shard_paths(model_path: str) -> tuple[str, ...]:
+    """Resolve llama.cpp split-GGUF siblings from any one shard path.
+
+    Split files repeat the metadata but partition the tensor table/data.  FreeToken
+    treats the set as one logical checkpoint while retaining per-shard mmap reads.
+    """
+    name = os.path.basename(model_path)
+    match = _SPLIT_RE.match(name)
+    if match is None:
+        return (model_path,)
+    count = int(match.group("count"))
+    folder = os.path.dirname(model_path)
+    paths = tuple(
+        os.path.join(
+            folder,
+            f"{match.group('prefix')}-{part:05d}-of-{count:05d}.gguf",
+        )
+        for part in range(1, count + 1)
+    )
+    missing = [path for path in paths if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            f"split GGUF is incomplete: missing {len(missing)}/{count} shards; "
+            f"first missing {missing[0]}"
+        )
+    return paths
 
 
 # Canonical name of the metadata-only GGUF that ``convert_checkpoint`` drops into an FTW
@@ -144,39 +176,41 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
     """Yield every tensor with its torch shape, ggml type, and packed block bytes."""
     import gguf
 
-    reader = _reader(model_path)
-    for t in reader.tensors:
-        ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
-        torch_shape = tuple(reversed(ne))
-        block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
-        n_fast = ne[0]
-        if n_fast % block != 0:
-            raise ValueError(
-                f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
-                f"for {t.tensor_type.name}"
+    for shard_path in gguf_shard_paths(model_path):
+        reader = _reader(shard_path)
+        for t in reader.tensors:
+            ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
+            torch_shape = tuple(reversed(ne))
+            block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
+            n_fast = ne[0]
+            if n_fast % block != 0:
+                raise ValueError(
+                    f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
+                    f"for {t.tensor_type.name}"
+                )
+            row_bytes = n_fast // block * type_size
+            rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
+            # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
+            # normalize everything to a flat byte view before shaping into [rows, row_bytes].
+            flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
+            raw = flat.reshape(rows, row_bytes)
+            yield GgufTensor(
+                name=t.name,
+                shape=torch_shape,
+                ggml_type=int(t.tensor_type),
+                rows=rows,
+                row_bytes=row_bytes,
+                _raw=raw,
             )
-        row_bytes = n_fast // block * type_size
-        rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
-        # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
-        # normalize everything to a flat byte view before shaping into [rows, row_bytes].
-        flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
-        raw = flat.reshape(rows, row_bytes)
-        yield GgufTensor(
-            name=t.name,
-            shape=torch_shape,
-            ggml_type=int(t.tensor_type),
-            rows=rows,
-            row_bytes=row_bytes,
-            _raw=raw,
-        )
 
 
 def gguf_tensor_names(model_path: str) -> set[str]:
-    return {t.name for t in _reader(model_path).tensors}
+    return {t.name for path in gguf_shard_paths(model_path) for t in _reader(path).tensors}
 
 
 __all__ = [
     "is_gguf_path",
+    "gguf_shard_paths",
     "FTW_METADATA_GGUF",
     "OUTPUT_WEIGHT_PRESENT_KV",
     "gguf_config_source",

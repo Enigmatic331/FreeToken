@@ -23,9 +23,13 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """
     # marlin/b12x gate_up/down alpha scales are fixed [L*E] residency (do not scale
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
-    # tensor[0].numel() is the per-row element count (one expert slot); see the matching
-    # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    # A mixed GGUF recipe can promote a handful of layers to a wider block type.
+    # The unified GPU cache needs the maximum expert stride for each bank even though
+    # host layers remain exact-sized, so budget from max rather than layer zero.
+    return sum(
+        max(layer[0].numel() * layer.element_size() for layer in layers)
+        for layers in sources.values()
+    )
 
 
 def net_cache_budget_bytes(

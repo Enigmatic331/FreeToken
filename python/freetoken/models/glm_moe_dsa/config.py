@@ -19,6 +19,7 @@ resolved config is the single record of what the served weights actually are.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from typing import Any
 
 from freetoken.models.config import (
@@ -154,4 +155,57 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["ep_partition", "parse_config"]
+def parse_gguf_config(shim) -> ModelConfig:
+    """Build the GLM serving config from llama.cpp's ``glm-dsa`` metadata."""
+    m = shim.metadata
+    p = "glm-dsa."
+    block_count = int(m[p + "block_count"])
+    mtp_layers = int(m.get(p + "nextn_predict_layers", 0))
+    num_layers = block_count - mtp_layers
+    leading_dense = int(m[p + "leading_dense_block_count"])
+    indexer_types = tuple(
+        "full" if i < leading_dense or (i - leading_dense) % 4 == 3 else "shared"
+        for i in range(num_layers)
+    )
+    qk_dim = int(m[p + "attention.key_length_mla"])
+    rope_dim = int(m[p + "rope.dimension_count"])
+    hf = SimpleNamespace(
+        architectures=list(shim.architectures),
+        model_type="glm_moe_dsa",
+        hidden_size=int(m[p + "embedding_length"]),
+        vocab_size=int(m.get(p + "vocab_size", shim.vocab_size)),
+        intermediate_size=int(m[p + "feed_forward_length"]),
+        moe_intermediate_size=int(m[p + "expert_feed_forward_length"]),
+        hidden_act="silu",
+        rms_norm_eps=float(m[p + "attention.layer_norm_rms_epsilon"]),
+        tie_word_embeddings=shim.tie_word_embeddings,
+        num_hidden_layers=num_layers,
+        first_k_dense_replace=leading_dense,
+        num_attention_heads=int(m[p + "attention.head_count"]),
+        n_routed_experts=int(m[p + "expert_count"]),
+        num_experts_per_tok=int(m[p + "expert_used_count"]),
+        n_shared_experts=int(m[p + "expert_shared_count"]),
+        norm_topk_prob=bool(m[p + "expert_weights_norm"]),
+        routed_scaling_factor=float(m[p + "expert_weights_scale"]),
+        n_group=int(m[p + "expert_group_count"]),
+        topk_group=int(m[p + "expert_group_used_count"]),
+        q_lora_rank=int(m[p + "attention.q_lora_rank"]),
+        kv_lora_rank=int(m[p + "attention.kv_lora_rank"]),
+        qk_nope_head_dim=qk_dim - rope_dim,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=int(m[p + "attention.value_length_mla"]),
+        max_position_embeddings=int(m[p + "context_length"]),
+        rope_theta=float(m[p + "rope.freq_base"]),
+        rope_interleave=True,
+        indexer_rope_interleave=True,
+        index_n_heads=int(m[p + "attention.indexer.head_count"]),
+        index_head_dim=int(m[p + "attention.indexer.key_length"]),
+        index_topk=int(m[p + "attention.indexer.top_k"]),
+        indexer_types=indexer_types,
+        attention_bias=False,
+        quantization_config={"quant_method": "gguf_q2_k_xl"},
+    )
+    return parse_config(hf)
+
+
+__all__ = ["ep_partition", "parse_config", "parse_gguf_config"]

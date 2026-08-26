@@ -23,7 +23,13 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q2_K = 10
 GGML_Q6_K = 14
+GGML_IQ2_XXS = 16
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
+GGML_IQ2_S = 22
+GGML_IQ4_XS = 23
 GGML_BF16 = 30
 
 # (block numel, bytes per block) per ggml type.
@@ -33,7 +39,13 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q2_K: (256, 84),
     GGML_Q6_K: (256, 210),
+    GGML_IQ2_XXS: (256, 66),
+    GGML_IQ2_XS: (256, 74),
+    GGML_IQ3_XXS: (256, 98),
+    GGML_IQ2_S: (256, 82),
+    GGML_IQ4_XS: (256, 136),
 }
 
 GGML_NAME = {
@@ -42,7 +54,13 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q2_K: "Q2_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ2_XXS: "IQ2_XXS",
+    GGML_IQ2_XS: "IQ2_XS",
+    GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_IQ2_S: "IQ2_S",
+    GGML_IQ4_XS: "IQ4_XS",
 }
 
 
@@ -143,7 +161,13 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q2_K",
     "GGML_Q6_K",
+    "GGML_IQ2_XXS",
+    "GGML_IQ2_XS",
+    "GGML_IQ3_XXS",
+    "GGML_IQ2_S",
+    "GGML_IQ4_XS",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",

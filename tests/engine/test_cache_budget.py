@@ -97,6 +97,20 @@ def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     assert expert_bytes_per_slot(sources) == 512 + 256
 
 
+def test_expert_bytes_per_slot_uses_widest_mixed_quant_layer():
+    sources = {
+        "gate_up": [
+            torch.zeros(4, 10, dtype=torch.uint8),
+            torch.zeros(4, 14, dtype=torch.uint8),
+        ],
+        "down": [
+            torch.zeros(4, 7, dtype=torch.uint8),
+            torch.zeros(4, 11, dtype=torch.uint8),
+        ],
+    }
+    assert expert_bytes_per_slot(sources) == 14 + 11
+
+
 def test_real_weight_engine_rejects_skipped_moe_cache_copies(monkeypatch):
     from freetoken.engine.engine import Engine
 

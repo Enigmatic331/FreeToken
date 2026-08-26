@@ -122,6 +122,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
     ),
+    "GlmMoeDsaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm_moe_dsa",
+        "GlmMoeDsaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
 }
 
 
