@@ -1050,8 +1050,7 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     """DSV4 engine-config reconciliation at config-resolution time (before the pool exists).
     Syncs the resolved runtime config into the opaque ``dsv4_args`` payload, sets
-    page_size to the window page P, forces single-chunk prefill, and clamps cuda_graph_bs/max_bs to
-    the DSV4 decode batch size.
+    page_size to the window page P, and clamps cuda_graph_bs/max_bs to the DSV4 decode batch size.
     """
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
@@ -1068,11 +1067,9 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
     # 'radix' (SWARadixCache on the full-loc currency, carry-aware re-prefill) is the default and is
-    # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
-    # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
-    # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
-        override("max_extend_tokens", config.max_seq_len)
+    # honored, as is an explicit 'naive'. Respect max_extend_tokens: DSV4's scheduler and cache
+    # manager preserve the compressor carry and reclaim out-of-window SWA pages across chunks, and
+    # bounding a forward is essential when a large KV allocation leaves little activation scratch.
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
     # so a graph bs above it would exceed the backend's captured snapshot rows. Clamp any

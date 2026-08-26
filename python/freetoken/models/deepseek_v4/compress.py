@@ -419,9 +419,8 @@ class Indexer(nn.Module):
         self.compressor(x, start_pos, window_slots, ti=ti)  # scatters indexer keys to idx_pool
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         keys = self.attn.indexer_keys(ti, end_pos // ratio, ratio, self.layer_id, bsz)
-        scores = self.attn.indexer_prefill_logits(q, keys, weights)
-        return self.attn.indexer_select_prefill(
-            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
+        return self.attn.indexer_prefill_select(
+            q, keys, weights, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
             topk=self.index_topk, offset=offset,
         )
 
@@ -440,9 +439,8 @@ class Indexer(nn.Module):
         self.compressor(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
-        scores = self.attn.indexer_prefill_logits(q, keys, weights)
-        return self.attn.indexer_select_prefill(
-            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
+        return self.attn.indexer_prefill_select(
+            q, keys, weights, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
             topk=self.index_topk, offset=offset,
         )
 

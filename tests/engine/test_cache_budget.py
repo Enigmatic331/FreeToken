@@ -179,6 +179,14 @@ def test_adjust_config_allows_auto_for_dsv4():
     assert cfg.page_size == 128  # DSV4's KV page is the P-token window page
 
 
+def test_adjust_config_honors_dsv4_prefill_chunk_limit():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(max_seq_len=300_032, max_extend_tokens=4096)
+    _adjust_config(cfg)
+    assert cfg.max_extend_tokens == 4096
+
+
 def test_adjust_config_resolves_num_tokens_for_dsv4():
     # --num-tokens resolves AFTER every page_size override, so DSV4's P=128 page divides it.
     from freetoken.engine.engine import _adjust_config

@@ -16,6 +16,11 @@ from __future__ import annotations
 import torch
 
 
+# Keep the fp32 [query, compressed-history] score slab bounded at long context. The selected
+# top-k rows are concatenated, so this changes peak scratch only, not selection semantics.
+_PREFILL_SCORE_BYTES = 128 << 20
+
+
 class IndexerBackendMixin:
     def indexer_keys(
         self, ti: int, n_blocks: int, ratio: int, layer_id: int, bsz: int
@@ -68,10 +73,43 @@ class IndexerBackendMixin:
         device = scores.device
         n_blocks = scores.shape[-1]
         live = ((start_pos + torch.arange(1, seqlen + 1, device=device)) // ratio).unsqueeze(1)
-        blk = torch.arange(n_blocks, device=device).repeat(seqlen, 1)
-        scores = scores + torch.where(blk >= live, float("-inf"), 0)
+        # Broadcasting avoids an int64 [seqlen, n_blocks] repeat, and masking in place avoids
+        # both the fp32 torch.where result and the subsequent add result. Those three temporaries
+        # exceed 1 GiB near DSV4's 300k context even with a 4k-token outer prefill chunk.
+        blk = torch.arange(n_blocks, device=device)
+        scores.masked_fill_(blk >= live, float("-inf"))
         picks = scores.topk(min(topk, n_blocks), dim=-1)[1]
         return torch.where(picks >= live, -1, picks + offset)
+
+    def indexer_prefill_select(
+        self, q: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor, *,
+        start_pos: int, seqlen: int, ratio: int, topk: int, offset: int,
+    ) -> torch.Tensor:
+        """Score and causally select in bounded query chunks.
+
+        DSV4's outer prefill chunk bounds activations, but the indexer score width grows with
+        compressed history. Split only this score/top-k stage so its fp32 slab remains bounded
+        independently of context length.
+        """
+        n_blocks = keys.shape[1]
+        k_sel = min(topk, n_blocks)
+        if seqlen == 0:
+            return torch.empty(
+                (q.shape[0], 0, k_sel), dtype=torch.int64, device=q.device
+            )
+        score_row_bytes = max(n_blocks * torch.float32.itemsize, 1)
+        chunk = max(1, min(seqlen, _PREFILL_SCORE_BYTES // score_row_bytes))
+        selected = torch.empty(
+            (q.shape[0], seqlen, k_sel), dtype=torch.int64, device=q.device
+        )
+        for s0 in range(0, seqlen, chunk):
+            s1 = min(s0 + chunk, seqlen)
+            scores = self.indexer_prefill_logits(q[:, s0:s1], keys, weights[:, s0:s1])
+            selected[:, s0:s1] = self.indexer_select_prefill(
+                scores, start_pos=start_pos + s0, seqlen=s1 - s0, ratio=ratio,
+                topk=topk, offset=offset,
+            )
+        return selected
 
     def indexer_select_decode(
         self, scores: torch.Tensor, *, valid: torch.Tensor, topk: int, offset: int
