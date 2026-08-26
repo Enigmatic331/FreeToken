@@ -139,7 +139,12 @@ class Scheduler(SchedulerIOMixin):
         # increments. Start the user-visible measurement window after capture so an
         # idle server never reports warm-up traffic as a real request.
         if config.moe_collect_stats and self.engine.moe_offload_cache is not None:
-            self.engine.moe_offload_cache.reset_stats()
+            cache = self.engine.moe_offload_cache
+            cache.reset_stats()
+            # The routing histogram uses a host-launched scatter and therefore cannot
+            # replay dynamic ids inside a CUDA graph. Eager diagnostic runs opt in
+            # automatically; normal graph-backed stats retain kernel-side counters only.
+            cache.collect_decode_freq = self.engine.graph_runner.max_graph_bs == 0
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -187,6 +192,21 @@ class Scheduler(SchedulerIOMixin):
             100 * prefill_hit_rate,
             worst_text,
         )
+        routing = cache.decode_routing_stats()
+        if routing:
+            coverage = routing["static_coverage"]
+            logger.info(
+                "MoE routing concentration: working-set/layer=%.1f 90%%/layer=%.1f "
+                "static-cover@64/128/256/512=%.1f%%/%.1f%%/%.1f%%/%.1f%% "
+                "pairs-for-90%%=%d",
+                routing["working_set_mean"],
+                routing["experts_for_90pct"],
+                100 * coverage["64"],
+                100 * coverage["128"],
+                100 * coverage["256"],
+                100 * coverage["512"],
+                routing["expert_pairs_for_90pct"],
+            )
         cache.reset_stats()
 
     @torch.inference_mode()

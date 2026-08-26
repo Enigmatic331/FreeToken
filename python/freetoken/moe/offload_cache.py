@@ -778,10 +778,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import ensure_experts
 
         if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            self.record_decode_routes(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         ensure_experts(self, layer_id, expert_ids)
 
@@ -798,8 +795,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            self.record_decode_routes(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
@@ -831,6 +827,25 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        self.decode_freq.zero_()
+
+    def record_decode_routes(
+        self,
+        layer_id: int,
+        expert_ids: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Accumulate an eager-mode histogram before expert ids become cache slots.
+
+        ``active_mask`` lets EP models exclude zero-weight foreign-route sentinels.
+        This host-launched scatter is enabled only for short diagnostic runs with
+        CUDA graphs disabled; graph-backed serving uses the kernel-side counters.
+        """
+        ids = expert_ids.reshape(-1).long()
+        if active_mask is not None:
+            ids = ids[active_mask.reshape(-1)]
+        if ids.numel():
+            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -935,6 +950,14 @@ class OffloadMoeCache:
         p = freq / total.clamp(min=1).unsqueeze(1)
         ent = -(p * p.clamp(min=1e-12).log()).sum(dim=1)[valid]
         norm_ent = (ent / torch.log(torch.tensor(float(self.num_experts)))).mean().item()
+        flat = torch.sort(freq.flatten(), descending=True).values
+        flat_total = flat.sum()
+        static_coverage = {}
+        for slots in (64, 128, 256, 512, self.cache_size):
+            k = min(max(1, slots), flat.numel())
+            static_coverage[str(slots)] = (flat[:k].sum() / flat_total).item()
+        flat_cdf = torch.cumsum(flat, dim=0) / flat_total
+        pairs_for_90 = int((flat_cdf < 0.9).sum().item() + 1)
         return {
             "slots_per_layer": slots_per_layer,
             "working_set_mean": ws[valid].mean().item(),
@@ -942,6 +965,8 @@ class OffloadMoeCache:
             "experts_for_90pct": cover90.mean().item(),
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
+            "static_coverage": static_coverage,
+            "expert_pairs_for_90pct": pairs_for_90,
         }
 
     def copy_missing(self) -> None:

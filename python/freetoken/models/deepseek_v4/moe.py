@@ -144,18 +144,33 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     ) -> torch.Tensor:
         cache = self.offload_cache
         assert cache is not None
+        # EP marks foreign routes with zero weights, then cache_safe_route_ids duplicates
+        # a live local id into those positions. Record the original active routes so the
+        # diagnostic histogram measures real router demand rather than cache sentinels.
+        # Frequency collection is eager-only; suppress the generic cache hook while the
+        # already-recorded ids flow through the normal implementation.
+        collect_freq = cache.collect_decode_freq
+        if collect_freq:
+            cache.record_decode_routes(self.layer_id, topk_ids, topk_weights != 0)
+            cache.collect_decode_freq = False
         if cache.is_cpu_layer(self.layer_id):
             # The CPU executor natively skips negative expert ids; translate
             # the grouped-kernel sentinel only at this boundary.
             cpu_ids = torch.where(
                 topk_weights != 0, topk_ids, topk_ids.new_full((), -1)
             )
-            return super()._decode_routed(hidden_states, topk_weights, cpu_ids)
-        return super()._decode_routed(
-            hidden_states,
-            topk_weights,
-            self._cache_safe_route_ids(topk_weights, topk_ids),
-        )
+            try:
+                return super()._decode_routed(hidden_states, topk_weights, cpu_ids)
+            finally:
+                cache.collect_decode_freq = collect_freq
+        try:
+            return super()._decode_routed(
+                hidden_states,
+                topk_weights,
+                self._cache_safe_route_ids(topk_weights, topk_ids),
+            )
+        finally:
+            cache.collect_decode_freq = collect_freq
 
     def _prefill_routed(
         self,
