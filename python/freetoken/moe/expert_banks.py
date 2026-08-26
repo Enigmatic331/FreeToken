@@ -283,6 +283,38 @@ def _gguf_q2_k_xl_banks(
     )
 
 
+def _gguf_glm_iq_banks(
+    model_path,
+    model_config,
+    device,
+    dtype,
+    dummy,
+    parallel=False,
+    workers=8,
+    chunk=_PARALLEL_CHUNK,
+    decode_target="gpu",
+    layer_sink=None,
+) -> ExpertBanks:
+    if dummy:
+        raise NotImplementedError("GLM mixed-IQ dummy expert banks are not implemented")
+    if parallel:
+        raise NotImplementedError("parallel split-GGUF expert reads are not implemented")
+    if decode_target == "cpu":
+        raise NotImplementedError(
+            "CPU/hybrid decode is not yet implemented for GLM IQ experts"
+        )
+    from freetoken.models.glm_moe_dsa.weight import load_gguf_glm_iq_expert_sources
+
+    sources = load_gguf_glm_iq_expert_sources(
+        model_path, model_config, layer_sink=layer_sink
+    )
+    return ExpertBanks(
+        "gguf_glm_iq",
+        {name: sources[name] for name in _BANK_SCHEMAS["gguf_glm_iq"]},
+        streamed=layer_sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -333,6 +365,7 @@ _PROVIDERS = {
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
     "gguf_q2_k_xl": _gguf_q2_k_xl_banks,
+    "gguf_glm_iq": _gguf_glm_iq_banks,
 }
 
 

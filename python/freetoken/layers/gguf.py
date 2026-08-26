@@ -20,6 +20,8 @@ from freetoken.models.gguf.dequant import (
     GGML_BF16,
     GGML_F16,
     GGML_F32,
+    GGML_IQ1_M,
+    GGML_IQ1_S,
     GGML_IQ2_S,
     GGML_IQ2_XS,
     GGML_IQ2_XXS,
@@ -38,7 +40,15 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_IQ = {GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ2_S, GGML_IQ4_XS}
+_IQ = {
+    GGML_IQ1_S,
+    GGML_IQ1_M,
+    GGML_IQ2_XXS,
+    GGML_IQ2_XS,
+    GGML_IQ3_XXS,
+    GGML_IQ2_S,
+    GGML_IQ4_XS,
+}
 _MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q2_K, GGML_Q6_K, *_IQ}
 _MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q2_K, GGML_Q6_K}
 _DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q2_K, GGML_Q6_K, *_IQ}

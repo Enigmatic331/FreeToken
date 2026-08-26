@@ -698,6 +698,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            W.stride(0) * W.element_size(),
             stream);
         break;
       case 17:
@@ -739,6 +740,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            W.stride(0) * W.element_size(),
             stream);
         break;
       case 20:
@@ -805,6 +807,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            W.stride(0) * W.element_size(),
             stream);
         break;
     }

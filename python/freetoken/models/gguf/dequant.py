@@ -28,8 +28,10 @@ GGML_Q6_K = 14
 GGML_IQ2_XXS = 16
 GGML_IQ2_XS = 17
 GGML_IQ3_XXS = 18
+GGML_IQ1_S = 19
 GGML_IQ2_S = 22
 GGML_IQ4_XS = 23
+GGML_IQ1_M = 29
 GGML_BF16 = 30
 
 # (block numel, bytes per block) per ggml type.
@@ -44,8 +46,10 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_IQ2_XXS: (256, 66),
     GGML_IQ2_XS: (256, 74),
     GGML_IQ3_XXS: (256, 98),
+    GGML_IQ1_S: (256, 50),
     GGML_IQ2_S: (256, 82),
     GGML_IQ4_XS: (256, 136),
+    GGML_IQ1_M: (256, 56),
 }
 
 GGML_NAME = {
@@ -59,8 +63,10 @@ GGML_NAME = {
     GGML_IQ2_XXS: "IQ2_XXS",
     GGML_IQ2_XS: "IQ2_XS",
     GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_IQ1_S: "IQ1_S",
     GGML_IQ2_S: "IQ2_S",
     GGML_IQ4_XS: "IQ4_XS",
+    GGML_IQ1_M: "IQ1_M",
 }
 
 
@@ -166,8 +172,10 @@ __all__ = [
     "GGML_IQ2_XXS",
     "GGML_IQ2_XS",
     "GGML_IQ3_XXS",
+    "GGML_IQ1_S",
     "GGML_IQ2_S",
     "GGML_IQ4_XS",
+    "GGML_IQ1_M",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",

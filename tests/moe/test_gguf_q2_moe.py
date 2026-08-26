@@ -88,6 +88,69 @@ def test_glm_q2_k_xl_format_geometry():
     assert row_bytes(6144, GGML_IQ2_XS) == 1776
     assert row_bytes(2048, GGML_IQ3_XXS) == 784
     assert _BANK_SCHEMAS["gguf_q2_k_xl"] == ("gate_up", "down")
+    assert _BANK_SCHEMAS["gguf_glm_iq"] == ("gate_up", "down")
+
+
+def test_iq1_layers_share_one_max_stride_offload_cache():
+    from freetoken.models.gguf.dequant import (
+        GGML_IQ1_S,
+        GGML_IQ2_XXS,
+        GGML_IQ3_XXS,
+        row_bytes,
+    )
+    from freetoken.moe.fused_q4_0 import fused_experts_gguf
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    experts, hidden, intermediate = 2, 256, 256
+    gu_iq1 = _valid_iq_rows_pinned(
+        (experts, 2 * intermediate, row_bytes(hidden, GGML_IQ1_S)), 50, 0.02
+    )
+    gu_iq2 = _valid_iq_rows_pinned(
+        (experts, 2 * intermediate, row_bytes(hidden, GGML_IQ2_XXS)), 66, 0.02
+    )
+    down = _valid_iq_rows_pinned(
+        (experts, hidden, row_bytes(intermediate, GGML_IQ3_XXS)), 98, 0.02
+    )
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=experts,
+        cache_size=experts,
+        device=torch.device("cuda"),
+        quant_format="gguf_glm_iq",
+    )
+    cache.set_bank_sources(
+        {"gate_up": [gu_iq1, gu_iq2], "down": [down, down.clone()]}
+    )
+    cache.materialize_layer(0)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    gu_cache, down_cache = cache.bank_views(experts)
+
+    x = torch.randn(1, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    ids = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    expected = fused_experts_gguf(
+        x,
+        gu_iq1.cuda(),
+        down.cuda(),
+        weights,
+        ids,
+        "silu",
+        gate_up_type=GGML_IQ1_S,
+        down_type=GGML_IQ3_XXS,
+    )
+    actual = fused_experts_gguf(
+        x,
+        gu_cache,
+        down_cache,
+        weights,
+        ids,
+        "silu",
+        gate_up_type=GGML_IQ1_S,
+        down_type=GGML_IQ3_XXS,
+        intermediate_size=intermediate,
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_mixed_q2_layers_share_one_max_stride_offload_cache():

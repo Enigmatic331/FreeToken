@@ -48,6 +48,8 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # name: usually IQ2_XS/IQ3_XXS, with a few IQ3_XXS/IQ4_XS layers. Banks remain
     # native GGUF bytes and the cache uses a maximum per-expert stride.
     "gguf_q2_k_xl": ("gate_up", "down"),
+    # Generic GLM mixed-IQ path; gguf_q2_k_xl remains as a checkpoint alias.
+    "gguf_glm_iq": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)

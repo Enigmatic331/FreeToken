@@ -259,12 +259,14 @@ static void moe_vec_iq2_xxs_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int64_t expert_stride_bytes,
     cudaStream_t stream) {
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_q<scalar_t, QK_K, QI2_XXS, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1>
-      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+      <<<block_nums, block_dims, 0, stream>>>(
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride, expert_stride_bytes);
 }
 
 template <typename scalar_t>
@@ -339,12 +341,14 @@ static void moe_vec_iq1_s_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int64_t expert_stride_bytes,
     cudaStream_t stream) {
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_q<scalar_t, QK_K, QI1_S, block_iq1_s, 1, vec_dot_iq1_s_q8_1>
-      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+      <<<block_nums, block_dims, 0, stream>>>(
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride, expert_stride_bytes);
 }
 
 template <typename scalar_t>
@@ -358,12 +362,14 @@ static void moe_vec_iq1_m_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int64_t expert_stride_bytes,
     cudaStream_t stream) {
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_q<scalar_t, QK_K, QI1_M, block_iq1_m, 1, vec_dot_iq1_m_q8_1>
-      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+      <<<block_nums, block_dims, 0, stream>>>(
+          vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride, expert_stride_bytes);
 }
 
 template <typename scalar_t>

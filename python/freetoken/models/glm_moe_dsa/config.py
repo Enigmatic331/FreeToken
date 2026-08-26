@@ -203,7 +203,9 @@ def parse_gguf_config(shim) -> ModelConfig:
         index_topk=int(m[p + "attention.indexer.top_k"]),
         indexer_types=indexer_types,
         attention_bias=False,
-        quantization_config={"quant_method": "gguf_q2_k_xl"},
+        # Named GLM GGUF releases are mixed importance recipes. The expert loader
+        # discovers the exact per-layer IQ types from the tensor table.
+        quantization_config={"quant_method": "gguf_glm_iq"},
     )
     return parse_config(hf)
 

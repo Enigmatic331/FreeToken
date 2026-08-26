@@ -532,16 +532,20 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
                 intermediate_size=self.intermediate_size,
             )
-        if fmt == "gguf_q2_k_xl":
-            # GLM-5.2 UD-Q2_K_XL: mixed IQ2_XS gate/up and IQ3_XXS down rows,
-            # both dequantized inside the borrowed llama.cpp MMVQ kernels.
+        if fmt in ("gguf_glm_iq", "gguf_q2_k_xl"):
+            # GLM-5.2 mixed importance quants: native IQ rows are dequantized
+            # inside the borrowed llama.cpp MMVQ kernels.
             from freetoken.models.gguf.dequant import (
+                GGML_IQ1_M,
+                GGML_IQ1_S,
+                GGML_IQ2_S,
+                GGML_IQ2_XXS,
                 GGML_IQ2_XS,
                 GGML_IQ3_XXS,
                 GGML_IQ4_XS,
                 row_bytes,
             )
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q2_k_xl
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
             gate_up, down = views
             gu_row = cache.bank_feature_bytes["gate_up"][self.layer_id] // (
@@ -550,15 +554,22 @@ class OffloadMoELayer(MoELayer):
             down_row = cache.bank_feature_bytes["down"][self.layer_id] // (
                 self.hidden_size
             )
-            gu_types = (GGML_IQ2_XS, GGML_IQ3_XXS)
-            down_types = (GGML_IQ3_XXS, GGML_IQ4_XS)
+            iq_types = (
+                GGML_IQ1_S,
+                GGML_IQ1_M,
+                GGML_IQ2_XXS,
+                GGML_IQ2_XS,
+                GGML_IQ2_S,
+                GGML_IQ3_XXS,
+                GGML_IQ4_XS,
+            )
             gate_up_type = next(
-                q for q in gu_types if row_bytes(self.hidden_size, q) == gu_row
+                q for q in iq_types if row_bytes(self.hidden_size, q) == gu_row
             )
             down_type = next(
-                q for q in down_types if row_bytes(self.intermediate_size, q) == down_row
+                q for q in iq_types if row_bytes(self.intermediate_size, q) == down_row
             )
-            return fused_experts_gguf_q2_k_xl(
+            return fused_experts_gguf(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
                 gate_up_type=gate_up_type,
                 down_type=down_type,

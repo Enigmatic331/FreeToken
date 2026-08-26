@@ -105,15 +105,79 @@ def _gguf_q2_k_xl_types(layer: int) -> tuple[int, int]:
     return gate_up, down
 
 
-def load_gguf_q2_k_xl_expert_sources(
+def _gguf_glm_iq_types(model_path: str, layer_ids) -> dict[int, tuple[int, int]]:
+    """Derive each routed layer's (gate/up, down) types from the tensor table."""
+    from freetoken.models.gguf.dequant import (
+        GGML_IQ1_M,
+        GGML_IQ1_S,
+        GGML_IQ2_S,
+        GGML_IQ2_XXS,
+        GGML_IQ2_XS,
+        GGML_IQ3_XXS,
+        GGML_IQ4_XS,
+        GGML_NAME,
+    )
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    supported = {
+        GGML_IQ1_S,
+        GGML_IQ1_M,
+        GGML_IQ2_XXS,
+        GGML_IQ2_XS,
+        GGML_IQ2_S,
+        GGML_IQ3_XXS,
+        GGML_IQ4_XS,
+    }
+    wanted = set(layer_ids)
+    found: dict[int, dict[str, int]] = {layer: {} for layer in wanted}
+    for tensor in iter_gguf_tensors(model_path):
+        name = tensor.name
+        if not name.startswith("blk.") or not name.endswith("_exps.weight"):
+            continue
+        layer = int(name.split(".")[1])
+        if layer not in wanted:
+            continue
+        if name.endswith("ffn_gate_exps.weight"):
+            role = "gate"
+        elif name.endswith("ffn_up_exps.weight"):
+            role = "up"
+        elif name.endswith("ffn_down_exps.weight"):
+            role = "down"
+        else:
+            continue
+        found[layer][role] = tensor.ggml_type
+
+    result = {}
+    for layer in sorted(wanted):
+        roles = found[layer]
+        missing = {"gate", "up", "down"} - roles.keys()
+        if missing:
+            raise ValueError(
+                f"GGUF layer {layer}: missing routed expert tensors {sorted(missing)}"
+            )
+        if roles["gate"] != roles["up"]:
+            raise ValueError(
+                f"GGUF layer {layer}: gate/up types differ "
+                f"({GGML_NAME.get(roles['gate'], roles['gate'])}/"
+                f"{GGML_NAME.get(roles['up'], roles['up'])})"
+            )
+        unsupported = set(roles.values()) - supported
+        if unsupported:
+            names = [GGML_NAME.get(q, str(q)) for q in sorted(unsupported)]
+            raise NotImplementedError(
+                f"GGUF layer {layer}: unsupported routed expert types {names}"
+            )
+        result[layer] = (roles["gate"], roles["down"])
+    return result
+
+
+def load_gguf_glm_iq_expert_sources(
     model_path: str, config, *, layer_sink=None
 ) -> dict[str, list[torch.Tensor]]:
-    """Load stage-local GLM UD-Q2_K_XL experts without dequantizing them.
+    """Load stage-local GLM mixed-IQ experts without dequantizing them.
 
-    The release name is an importance-quant recipe, not one uniform type. Most
-    routed gate/up tensors are IQ2_XS and down tensors IQ3_XXS; layer 8 promotes
-    both sides and layers 75--77 promote down to IQ4_XS. Exact host sizes are
-    retained; only the GPU slot cache uses a maximum stride.
+    Exact host sizes are retained; only the GPU slot cache uses a maximum stride.
+    Types come from the GGUF table, supporting Q2_K_XL and mixed IQ1 recipes.
     """
     from freetoken.models.gguf.dequant import row_bytes
     from freetoken.models.gguf.reader import iter_gguf_tensors
@@ -134,7 +198,8 @@ def load_gguf_q2_k_xl_expert_sources(
     all_ids = range(config.num_layers) if configured_ids is None else configured_ids
     local_ids = tuple(i for i in all_ids if i >= config.first_k_dense_replace)
     layer_to_bank = {layer: slot for slot, layer in enumerate(local_ids)}
-    types = [_gguf_q2_k_xl_types(layer) for layer in local_ids]
+    type_by_layer = _gguf_glm_iq_types(model_path, local_ids)
+    types = [type_by_layer[layer] for layer in local_ids]
     hb = {"gate_up": [], "down": []}
     for gate_up_type, down_type in types:
         hb["gate_up"].append(
@@ -197,10 +262,14 @@ def load_gguf_q2_k_xl_expert_sources(
 
     want = set(local_ids)
     assert all(layers == want for layers in seen.values()), (
-        "missing stage-local UD-Q2_K_XL experts: "
+        "missing stage-local GLM GGUF experts: "
         + ", ".join(f"{role}={sorted(want - layers)}" for role, layers in seen.items())
     )
     return banks
+
+
+# Compatibility for callers/checkpoints created while only Q2_K_XL was wired.
+load_gguf_q2_k_xl_expert_sources = load_gguf_glm_iq_expert_sources
 
 
 class _ShardReader:
@@ -556,6 +625,7 @@ __all__ = [
     "dummy_moe_expert_sources",
     "iter_gguf_weights",
     "iter_weights",
+    "load_gguf_glm_iq_expert_sources",
     "load_gguf_q2_k_xl_expert_sources",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",

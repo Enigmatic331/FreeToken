@@ -79,7 +79,7 @@ def test_glm_gguf_config_excludes_mtp_and_expands_indexshare():
     config = parse_gguf_config(_shim())
     assert config.num_layers == 78
     assert config.num_moe_layers == 75
-    assert config.expert_quant == "gguf_q2_k_xl"
+    assert config.expert_quant == "gguf_glm_iq"
     assert config.glm_dsa_args.qk_nope_head_dim == 192
     full = [
         i for i, kind in enumerate(config.glm_dsa_args.indexer_types) if kind == "full"
@@ -96,6 +96,47 @@ def test_q2_k_xl_exception_profile_matches_release():
     assert _gguf_q2_k_xl_types(8) == (GGML_IQ3_XXS, GGML_IQ4_XS)
     assert _gguf_q2_k_xl_types(75) == (GGML_IQ2_XS, GGML_IQ4_XS)
     assert _gguf_q2_k_xl_types(77) == (GGML_IQ2_XS, GGML_IQ4_XS)
+
+
+def test_glm_iq_profile_is_read_from_tensor_table(monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.models.gguf.dequant import (
+        GGML_IQ1_S,
+        GGML_IQ2_XXS,
+        GGML_IQ3_XXS,
+        GGML_IQ4_XS,
+    )
+    from freetoken.models.gguf import reader
+    from freetoken.models.glm_moe_dsa.weight import _gguf_glm_iq_types
+
+    tensors = [
+        SimpleNamespace(name="blk.3.ffn_gate_exps.weight", ggml_type=GGML_IQ1_S),
+        SimpleNamespace(name="blk.3.ffn_up_exps.weight", ggml_type=GGML_IQ1_S),
+        SimpleNamespace(name="blk.3.ffn_down_exps.weight", ggml_type=GGML_IQ3_XXS),
+        SimpleNamespace(name="blk.4.ffn_gate_exps.weight", ggml_type=GGML_IQ2_XXS),
+        SimpleNamespace(name="blk.4.ffn_up_exps.weight", ggml_type=GGML_IQ2_XXS),
+        SimpleNamespace(name="blk.4.ffn_down_exps.weight", ggml_type=GGML_IQ4_XS),
+    ]
+    monkeypatch.setattr(reader, "iter_gguf_tensors", lambda path: iter(tensors))
+
+    assert _gguf_glm_iq_types("unused.gguf", (3, 4)) == {
+        3: (GGML_IQ1_S, GGML_IQ3_XXS),
+        4: (GGML_IQ2_XXS, GGML_IQ4_XS),
+    }
+
+
+def test_iq1_row_geometry():
+    from freetoken.models.gguf.dequant import (
+        GGML_IQ1_M,
+        GGML_IQ1_S,
+        GGML_IQ2_XXS,
+        row_bytes,
+    )
+
+    assert row_bytes(6144, GGML_IQ1_S) == 1200
+    assert row_bytes(6144, GGML_IQ1_M) == 1344
+    assert row_bytes(6144, GGML_IQ2_XXS) == 1584
 
 
 def test_glm_gguf_uses_embedded_gpt2_bpe_converter():
