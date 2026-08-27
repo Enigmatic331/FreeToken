@@ -96,6 +96,11 @@ class EngineConfig:
     # GLM-5.2 contiguous pipeline parallelism: TP ranks become layer stages
     # instead of replicated-backbone expert-parallel ranks.
     glm_pipeline_parallel: bool = False
+    # Split a single long GLM pipeline prefill into this many tokens per pipeline
+    # microbatch. 0 disables it. The intended first use is one 8k scheduler chunk
+    # split into two 4k stage-overlapped chunks without increasing expert traffic
+    # relative to the established two-forward 4k workaround.
+    glm_pipeline_microbatch_tokens: int = 0
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size

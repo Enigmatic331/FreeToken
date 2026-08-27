@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -101,6 +102,7 @@ class GlmMoeDsaModel(BaseOP):
 
         self._plan = glm_pipeline_plan(config.num_layers, config.glm_dsa_args.indexer_types)
         self._hidden_size = config.hidden_size
+        self._head_batch = None
         self._comm = DistributedCommunicator()
         if self._plan.is_first:
             self.embed_tokens: BaseOP | None = (
@@ -136,13 +138,8 @@ class GlmMoeDsaModel(BaseOP):
         assert residual is not None
         return x, residual
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if not self._plan.enabled:
-            assert self.embed_tokens is not None and self.norm is not None
-            x = self.embed_tokens.forward(input_ids)
-            x, residual = self._run_local(x, None)
-            return self.norm.forward(x, residual)[0]
-
+    def _pipeline_chunk(self, input_ids: torch.Tensor, *, normalize: bool) -> torch.Tensor:
+        """Run one pipeline chunk on every rank in identical collective order."""
         rows = input_ids.numel()
         if self._plan.is_first:
             assert self.embed_tokens is not None
@@ -152,8 +149,6 @@ class GlmMoeDsaModel(BaseOP):
             x = torch.empty(rows, self._hidden_size, dtype=dtype, device=input_ids.device)
             residual = torch.empty_like(x)
 
-        # Every rank participates in every boundary collective. The next rank runs
-        # its local block after receiving both halves of the fused-residual stream.
         for src in range(self._plan.world_size - 1):
             cache = get_global_ctx().moe_offload_cache
             phase = "prefill" if get_global_ctx().batch.is_prefill else "decode"
@@ -166,10 +161,82 @@ class GlmMoeDsaModel(BaseOP):
             if self._plan.rank == src + 1:
                 x, residual = self._run_local(x, residual)
 
-        if self._plan.is_last:
+        if self._plan.is_last and normalize:
             assert self.norm is not None
             return self.norm.forward(x, residual)[0]
         return x
+
+    @staticmethod
+    def _slice_prefill_batch(outer, start: int, stop: int):
+        """Build GLM DSA metadata for one slice of a single-request prefill."""
+        from freetoken.attention.dsa import DSAMetadata
+
+        md = outer.attn_metadata
+        if not isinstance(md, DSAMetadata):
+            raise TypeError(
+                "GLM pipeline prefill microbatching requires DSAMetadata, got "
+                f"{type(md).__name__}"
+            )
+        chunk = copy(outer)
+        chunk.input_ids = outer.input_ids[start:stop]
+        chunk.positions = outer.positions[start:stop]
+        chunk.out_loc = None if outer.out_loc is None else outer.out_loc[start:stop]
+        length = stop - start
+        chunk.attn_metadata = DSAMetadata(
+            is_decode=False,
+            last_indices=md.last_indices.new_tensor([length - 1]),
+            qo_indptr_cpu=md.qo_indptr_cpu.new_tensor([0, length]),
+            # The full live length is intentional: causal counts/selection mask
+            # future rows, while later chunks can attend KV written by earlier ones.
+            kv_len_cpu=md.kv_len_cpu,
+        )
+        return chunk
+
+    def _forward_pipeline_microbatched(
+        self, input_ids: torch.Tensor, chunk_tokens: int
+    ) -> torch.Tensor:
+        ctx = get_global_ctx()
+        outer = ctx.batch
+        rows = input_ids.numel()
+        num_chunks = (rows + chunk_tokens - 1) // chunk_tokens
+        base, extra = divmod(rows, num_chunks)
+        chunks = []
+        start = 0
+        for index in range(num_chunks):
+            stop = start + base + (index < extra)
+            chunks.append(self._slice_prefill_batch(outer, start, stop))
+            start = stop
+        output = None
+        for index, chunk in enumerate(chunks):
+            with ctx.replace_batch(chunk):
+                output = self._pipeline_chunk(
+                    chunk.input_ids,
+                    normalize=index == len(chunks) - 1,
+                )
+        assert output is not None
+        # The LM head must select the last row relative to the final chunk, not the
+        # scheduler-owned outer batch. CausalLM.forward consumes this immediately.
+        self._head_batch = chunks[-1] if self._plan.is_last else None
+        return output
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        self._head_batch = None
+        if not self._plan.enabled:
+            assert self.embed_tokens is not None and self.norm is not None
+            x = self.embed_tokens.forward(input_ids)
+            x, residual = self._run_local(x, None)
+            return self.norm.forward(x, residual)[0]
+
+        batch = get_global_ctx().batch
+        chunk_tokens = self._plan.prefill_microbatch_tokens
+        if (
+            chunk_tokens > 0
+            and batch.is_prefill
+            and batch.size == 1
+            and input_ids.numel() > chunk_tokens
+        ):
+            return self._forward_pipeline_microbatched(input_ids, chunk_tokens)
+        return self._pipeline_chunk(input_ids, normalize=True)
 
 
 class GlmMoeDsaForCausalLM(BaseLLMModel):
@@ -213,7 +280,11 @@ class GlmMoeDsaForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         if self.lm_head is None:
             return output.new_empty((get_global_ctx().batch.size, 1))
-        return self.lm_head.forward(output)
+        head_batch = self.model._head_batch
+        if head_batch is None:
+            return self.lm_head.forward(output)
+        with get_global_ctx().replace_batch(head_batch):
+            return self.lm_head.forward(output)
 
 
 __all__ = ["GlmMoeDsaForCausalLM"]

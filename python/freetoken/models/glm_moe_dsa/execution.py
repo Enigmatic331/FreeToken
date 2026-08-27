@@ -15,11 +15,13 @@ from freetoken.distributed import try_get_tp_info
 
 
 _ENABLED = False
+_PREFILL_MICROBATCH_TOKENS = 0
 
 
-def configure_glm_pipeline(enabled: bool) -> None:
-    global _ENABLED
+def configure_glm_pipeline(enabled: bool, prefill_microbatch_tokens: int = 0) -> None:
+    global _ENABLED, _PREFILL_MICROBATCH_TOKENS
     _ENABLED = bool(enabled)
+    _PREFILL_MICROBATCH_TOKENS = int(prefill_microbatch_tokens)
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class GlmPipelinePlan:
     start_layer: int
     stop_layer: int
     num_layers: int
+    prefill_microbatch_tokens: int = 0
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
@@ -100,7 +103,7 @@ def glm_pipeline_plan(num_layers: int, indexer_types: tuple[str, ...]) -> GlmPip
         rank, world_size = info.rank, info.size
     enabled = _ENABLED and world_size > 1
     if not enabled:
-        return GlmPipelinePlan(False, rank, world_size, 0, num_layers, num_layers)
+        return GlmPipelinePlan(False, rank, world_size, 0, num_layers, num_layers, 0)
     cuts = _boundaries(num_layers, world_size, indexer_types)
     return GlmPipelinePlan(
         True,
@@ -109,6 +112,7 @@ def glm_pipeline_plan(num_layers: int, indexer_types: tuple[str, ...]) -> GlmPip
         cuts[rank],
         cuts[rank + 1],
         num_layers,
+        _PREFILL_MICROBATCH_TOKENS,
     )
 
 

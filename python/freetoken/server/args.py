@@ -273,6 +273,15 @@ def parse_args(
             "its layers."
         ),
     )
+    parser.add_argument(
+        "--glm-pipeline-microbatch-tokens",
+        type=int,
+        default=ServerArgs.glm_pipeline_microbatch_tokens,
+        help=(
+            "Split single-request GLM pipeline prefills into stage-overlapped chunks "
+            "of this size. 0 disables it."
+        ),
+    )
 
     parser.add_argument(
         "--max-running-requests",
@@ -690,6 +699,19 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    if kwargs["glm_pipeline_microbatch_tokens"] < 0:
+        parser.error("--glm-pipeline-microbatch-tokens must be >= 0")
+    if kwargs["glm_pipeline_microbatch_tokens"]:
+        if not kwargs["glm_pipeline_parallel"]:
+            parser.error(
+                "--glm-pipeline-microbatch-tokens requires --glm-pipeline-parallel"
+            )
+        if kwargs["max_running_req"] != 1:
+            parser.error(
+                "--glm-pipeline-microbatch-tokens currently requires "
+                "--max-running-requests 1"
+            )
 
     if kwargs["moe_profile_stats"]:
         kwargs["moe_collect_stats"] = True

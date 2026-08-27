@@ -320,7 +320,10 @@ class Engine:
         )
         from freetoken.models.glm_moe_dsa.execution import configure_glm_pipeline
 
-        configure_glm_pipeline(config.glm_pipeline_parallel)
+        configure_glm_pipeline(
+            config.glm_pipeline_parallel,
+            config.glm_pipeline_microbatch_tokens,
+        )
         _adjust_config(config)
         from freetoken.models.glm_moe_dsa.execution import glm_pipeline_plan
 
@@ -1217,6 +1220,9 @@ def _adjust_config(config: EngineConfig):
     dsv4_moe_cache_sizes = getattr(config, "dsv4_moe_cache_sizes", None)
     moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
     glm_pipeline_parallel = getattr(config, "glm_pipeline_parallel", False)
+    glm_pipeline_microbatch_tokens = getattr(
+        config, "glm_pipeline_microbatch_tokens", 0
+    )
     tp_info = getattr(config, "tp_info", None)
 
     if glm_pipeline_parallel:
@@ -1232,6 +1238,15 @@ def _adjust_config(config: EngineConfig):
             # Stage-local checkpoint/expert volumes need not be identical, so one
             # worker may wait at a post-load barrier while another is still reading.
             override("distributed_timeout", 900.0)
+        if glm_pipeline_microbatch_tokens and config.max_running_req != 1:
+            raise ValueError(
+                "--glm-pipeline-microbatch-tokens currently requires "
+                "--max-running-requests 1"
+            )
+    elif glm_pipeline_microbatch_tokens:
+        raise ValueError(
+            "--glm-pipeline-microbatch-tokens requires --glm-pipeline-parallel"
+        )
 
     if moe_cache_sizes is not None:
         if not getattr(model_config, "is_moe", False):
@@ -1339,12 +1354,14 @@ def _adjust_config(config: EngineConfig):
                 model_config, "num_experts", model_config.glm_dsa_args.num_experts
             )
             logger.info(
-                "GLM-5.2 pipeline stage: rank=%d/%d layers=[%d,%d) local_moe_layers=%d",
+                "GLM-5.2 pipeline stage: rank=%d/%d layers=[%d,%d) "
+                "local_moe_layers=%d prefill_microbatch_tokens=%d",
                 plan.rank,
                 plan.world_size,
                 plan.start_layer,
                 plan.stop_layer,
                 model_config.num_moe_layers,
+                plan.prefill_microbatch_tokens,
             )
         else:
             from freetoken.models.glm_moe_dsa.config import ep_partition

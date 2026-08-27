@@ -168,3 +168,52 @@ def test_moe_profile_stats_is_opt_in_and_enables_counters():
     assert default.moe_profile_stats is False
     assert enabled.moe_profile_stats is True
     assert enabled.moe_collect_stats is True
+
+
+def test_glm_pipeline_prefill_microbatch_tokens_parse():
+    config = _Config(
+        {"architectures": ["GlmMoeDsaForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        default, _ = parse_args(["--model", ANON_PATH])
+        enabled, _ = parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--glm-pipeline-parallel",
+                "--glm-pipeline-microbatch-tokens",
+                "4096",
+                "--max-running-requests",
+                "1",
+            ]
+        )
+
+    assert default.glm_pipeline_microbatch_tokens == 0
+    assert enabled.glm_pipeline_microbatch_tokens == 4096
+
+
+def test_glm_pipeline_prefill_microbatch_tokens_rejects_negative():
+    config = _Config(
+        {"architectures": ["GlmMoeDsaForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        with pytest.raises(SystemExit):
+            parse_args(
+                ["--model", ANON_PATH, "--glm-pipeline-microbatch-tokens", "-1"]
+            )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--glm-pipeline-microbatch-tokens", "4096", "--max-running-requests", "1"],
+        ["--glm-pipeline-parallel", "--glm-pipeline-microbatch-tokens", "4096"],
+    ],
+)
+def test_glm_pipeline_prefill_microbatch_tokens_rejects_unsupported_scope(extra):
+    config = _Config(
+        {"architectures": ["GlmMoeDsaForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        with pytest.raises(SystemExit):
+            parse_args(["--model", ANON_PATH, *extra])

@@ -192,6 +192,22 @@ class Context:
         finally:
             self._batch = None
 
+    @contextmanager
+    def replace_batch(self, batch: Batch):
+        """Temporarily replace an active batch with an internal model sub-batch.
+
+        Pipeline-prefill microbatches still belong to one scheduler forward, so they
+        must not enter :meth:`forward_batch` recursively.  This narrower context
+        manager preserves and restores the scheduler-owned outer batch instead.
+        """
+        assert self._batch is not None, "No active batch to replace"
+        outer = self._batch
+        try:
+            self._batch = batch
+            yield
+        finally:
+            self._batch = outer
+
 
 _GLOBAL_CTX: Context | None = None
 

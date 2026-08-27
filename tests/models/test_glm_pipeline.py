@@ -60,6 +60,65 @@ def test_pipeline_plan_is_disabled_before_worker_rank_exists(monkeypatch):
     assert plan.layer_ids == tuple(range(78))
 
 
+def test_pipeline_plan_carries_prefill_microbatch_size(monkeypatch):
+    from freetoken.models.glm_moe_dsa import execution
+
+    monkeypatch.setattr(execution, "_ENABLED", True)
+    monkeypatch.setattr(execution, "_PREFILL_MICROBATCH_TOKENS", 4096)
+    monkeypatch.setattr(
+        execution, "try_get_tp_info", lambda: SimpleNamespace(rank=0, size=2)
+    )
+
+    plan = execution.glm_pipeline_plan(78, _glm_indexers())
+
+    assert plan.enabled
+    assert plan.prefill_microbatch_tokens == 4096
+
+
+def test_single_request_prefill_is_sliced_for_pipeline_overlap(monkeypatch):
+    from freetoken.attention.dsa import DSAMetadata
+    from freetoken.core import Context
+    from freetoken.models.glm_moe_dsa import model as glm_model
+
+    outer = SimpleNamespace(
+        input_ids=torch.arange(10),
+        positions=torch.arange(20, 30),
+        out_loc=torch.arange(100, 110),
+        attn_metadata=DSAMetadata(
+            is_decode=False,
+            last_indices=torch.tensor([9], dtype=torch.int32),
+            qo_indptr_cpu=torch.tensor([0, 10], dtype=torch.int32),
+            kv_len_cpu=torch.tensor([30], dtype=torch.int32),
+        ),
+    )
+    ctx = Context(page_size=1)
+    ctx._batch = outer
+    monkeypatch.setattr(glm_model, "get_global_ctx", lambda: ctx)
+
+    instance = object.__new__(glm_model.GlmMoeDsaModel)
+    instance._plan = SimpleNamespace(is_last=True)
+    calls = []
+
+    def fake_pipeline_chunk(_self, ids, *, normalize):
+        calls.append((ids.tolist(), ctx.batch.positions.tolist(), normalize))
+        return ids[:, None].to(torch.float32)
+
+    monkeypatch.setattr(
+        glm_model.GlmMoeDsaModel, "_pipeline_chunk", fake_pipeline_chunk
+    )
+    output = instance._forward_pipeline_microbatched(outer.input_ids, 4)
+
+    assert calls == [
+        ([0, 1, 2, 3], [20, 21, 22, 23], False),
+        ([4, 5, 6], [24, 25, 26], False),
+        ([7, 8, 9], [27, 28, 29], True),
+    ]
+    assert output[:, 0].tolist() == [7.0, 8.0, 9.0]
+    assert instance._head_batch.attn_metadata.get_last_indices(1).tolist() == [2]
+    assert instance._head_batch.attn_metadata.kv_len_cpu.tolist() == [30]
+    assert ctx.batch is outer
+
+
 def test_stage_local_mla_pool_uses_global_layer_ids():
     from freetoken.kvcache.dsa_pool import MLAKVCache
 

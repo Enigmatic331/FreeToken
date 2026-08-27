@@ -44,6 +44,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
+| `--glm-pipeline-parallel` | off | Use TP workers as contiguous GLM-5.2 layer stages |
+| `--glm-pipeline-microbatch-tokens` | 0 | With GLM pipeline and one running request, balance long prefills into stage-overlapped chunks no larger than this value |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
@@ -71,6 +73,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--moe-collect-stats` | off | At each idle boundary, log graph-safe cache miss/fetch rates and the five worst layers separately on every TP rank; with `--graph 0`, also report exact active-route concentration |
+| `--moe-profile-stats` | off | Add eager CUDA-event stage/copy/expert/wait timings and exact H2D/D2D byte counts; also enables `--moe-collect-stats` |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
 ### API behaviour
