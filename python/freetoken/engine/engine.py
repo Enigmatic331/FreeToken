@@ -1185,6 +1185,7 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
+    "moe_cache_sizes": None,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
@@ -1207,6 +1208,7 @@ def _adjust_config(config: EngineConfig):
     dsv4_backbone_rank = getattr(config, "dsv4_backbone_rank", None)
     dsv4_expert_shards = getattr(config, "dsv4_expert_shards", None)
     dsv4_moe_cache_sizes = getattr(config, "dsv4_moe_cache_sizes", None)
+    moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
     glm_pipeline_parallel = getattr(config, "glm_pipeline_parallel", False)
     tp_info = getattr(config, "tp_info", None)
 
@@ -1223,6 +1225,31 @@ def _adjust_config(config: EngineConfig):
             # Stage-local checkpoint/expert volumes need not be identical, so one
             # worker may wait at a post-load barrier while another is still reading.
             override("distributed_timeout", 900.0)
+
+    if moe_cache_sizes is not None:
+        if not getattr(model_config, "is_moe", False):
+            raise ValueError("--moe-cache-sizes is valid only for MoE models")
+        if tp_info is None or tp_info.size <= 1:
+            raise ValueError("--moe-cache-sizes requires --tensor-parallel-size > 1")
+        if len(moe_cache_sizes) != tp_info.size:
+            raise ValueError(
+                "--moe-cache-sizes needs one value per TP rank: "
+                f"expected {tp_info.size}, got {len(moe_cache_sizes)}"
+            )
+        if dsv4_moe_cache_sizes is not None:
+            raise ValueError(
+                "--moe-cache-sizes cannot be combined with --dsv4-moe-cache-sizes"
+            )
+        cache_size = moe_cache_sizes[tp_info.rank]
+        override("moe_cache_size", cache_size)
+        override("moe_cache_rate", None)
+        override("moe_cache_auto", False)
+        logger.info(
+            "Rank-local MoE cache: rank=%d/%d slots=%d",
+            tp_info.rank,
+            tp_info.size,
+            cache_size,
+        )
 
     for flag, values in (
         ("--dsv4-expert-shards", dsv4_expert_shards),

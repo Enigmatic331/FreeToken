@@ -123,6 +123,28 @@ def test_dsv4_heterogeneous_rank_layout_arguments_parse_as_tuples():
     assert args.moe_cache_auto is False
 
 
+def test_generic_rank_local_moe_cache_sizes_parse_as_tuple():
+    config = _Config(
+        {"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--tensor-parallel-size",
+                "2",
+                "--moe-backend",
+                "offload",
+                "--moe-cache-sizes",
+                "768,832",
+            ]
+        )
+
+    assert args.moe_cache_sizes == (768, 832)
+    assert args.moe_cache_auto is False
+
+
 def test_moe_collect_stats_is_opt_in():
     config = _Config(
         {"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"}

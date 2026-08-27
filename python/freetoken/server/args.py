@@ -538,6 +538,15 @@ def parse_args(
         help="The number of unified MoE expert slots on GPU.",
     )
     moe_cache_group.add_argument(
+        "--moe-cache-sizes",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.moe_cache_sizes,
+        help=(
+            "Comma-separated rank-local unified MoE cache slots. Requires more than "
+            "one TP rank and exactly one value per rank (for example 768,832)."
+        ),
+    )
+    moe_cache_group.add_argument(
         "--moe-cache-rate",
         type=_parse_moe_cache_rate,
         default=ServerArgs.moe_cache_rate,
@@ -703,6 +712,7 @@ def parse_args(
 
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0
+        and kwargs["moe_cache_sizes"] is None
         and not kwargs["moe_cache_auto"]
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
         and kwargs["dsv4_moe_cache_sizes"] is None

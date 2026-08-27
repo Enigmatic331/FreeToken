@@ -235,6 +235,40 @@ def test_adjust_config_applies_rank_local_dsv4_partition_and_cache(monkeypatch):
     assert cfg.moe_cache_auto is False
 
 
+def test_adjust_config_applies_generic_rank_local_moe_cache(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.moe.partition import ExpertPartition
+
+    cfg = _dsv4_adjust_cfg(
+        tp_info=SimpleNamespace(rank=1, size=2),
+        moe_cache_sizes=(768, 832),
+        moe_cache_rate=0.5,
+    )
+    cfg.model_config.dsv4_args.n_routed_experts = 256
+    monkeypatch.setattr(
+        "freetoken.models.deepseek_v4.config.ep_partition",
+        lambda total: ExpertPartition(total, 2, 1),
+    )
+
+    _adjust_config(cfg)
+
+    assert cfg.moe_cache_size == 832
+    assert cfg.moe_cache_rate is None
+    assert cfg.moe_cache_auto is False
+
+
+def test_adjust_config_rejects_wrong_generic_cache_count():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(
+        tp_info=SimpleNamespace(rank=0, size=2),
+        moe_cache_sizes=(768,),
+    )
+
+    with pytest.raises(ValueError, match="one value per TP rank"):
+        _adjust_config(cfg)
+
+
 def test_adjust_config_rejects_rank_local_cache_smaller_than_expert_shard(monkeypatch):
     from freetoken.engine.engine import _adjust_config
     from freetoken.moe.partition import ExpertPartition

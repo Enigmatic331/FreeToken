@@ -29,6 +29,10 @@ class EngineConfig:
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
     moe_cache_size: int = 0
+    # Optional rank-local unified MoE cache capacities. Unlike the legacy
+    # DSV4-specific override below, this applies to any multi-rank MoE topology
+    # (notably GLM pipeline stages with unequal layer/routing pressure).
+    moe_cache_sizes: tuple[int, ...] | None = None
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
