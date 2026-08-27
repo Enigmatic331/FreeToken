@@ -16,12 +16,18 @@ from freetoken.distributed import try_get_tp_info
 
 _ENABLED = False
 _PREFILL_MICROBATCH_TOKENS = 0
+_BOUNDARIES: tuple[int, ...] | None = None
 
 
-def configure_glm_pipeline(enabled: bool, prefill_microbatch_tokens: int = 0) -> None:
-    global _ENABLED, _PREFILL_MICROBATCH_TOKENS
+def configure_glm_pipeline(
+    enabled: bool,
+    prefill_microbatch_tokens: int = 0,
+    boundaries: tuple[int, ...] | None = None,
+) -> None:
+    global _ENABLED, _PREFILL_MICROBATCH_TOKENS, _BOUNDARIES
     _ENABLED = bool(enabled)
     _PREFILL_MICROBATCH_TOKENS = int(prefill_microbatch_tokens)
+    _BOUNDARIES = boundaries
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,24 @@ def _boundaries(num_layers: int, world_size: int, indexer_types: tuple[str, ...]
         i for i, kind in enumerate(indexer_types[:num_layers])
         if i > 0 and kind == "full"
     ]
+    if _BOUNDARIES is not None:
+        if len(_BOUNDARIES) != world_size - 1:
+            raise ValueError(
+                "--glm-pipeline-boundaries needs one cut between each pair of stages: "
+                f"expected {world_size - 1}, got {len(_BOUNDARIES)}"
+            )
+        cuts = [0, *_BOUNDARIES, num_layers]
+        if cuts != sorted(set(cuts)):
+            raise ValueError(
+                "--glm-pipeline-boundaries must be strictly increasing internal layers"
+            )
+        unsafe = [cut for cut in _BOUNDARIES if cut not in full]
+        if unsafe:
+            raise ValueError(
+                "GLM pipeline boundaries must begin full IndexShare layers; "
+                f"unsafe cuts: {unsafe}"
+            )
+        return cuts
     cuts = [0]
     for stage in range(1, world_size):
         ideal = round(stage * num_layers / world_size)

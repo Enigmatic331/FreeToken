@@ -45,6 +45,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--glm-pipeline-parallel` | off | Use TP workers as contiguous GLM-5.2 layer stages |
+| `--glm-pipeline-boundaries` | automatic | Optional internal layer cuts, e.g. `42` for PP2; cuts must begin full IndexShare layers |
 | `--glm-pipeline-microbatch-tokens` | 0 | With GLM pipeline and one running request, balance long prefills into stage-overlapped chunks no larger than this value |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |

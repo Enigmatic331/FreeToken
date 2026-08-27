@@ -29,6 +29,34 @@ def test_pp2_boundary_starts_on_indexshare_leader(monkeypatch):
     assert plan.moe_index(77, first_moe_layer=3) == 39
 
 
+def test_pp2_boundary_override_uses_safe_full_layer(monkeypatch):
+    from freetoken.models.glm_moe_dsa import execution
+
+    monkeypatch.setattr(execution, "_ENABLED", True)
+    monkeypatch.setattr(execution, "_BOUNDARIES", (42,))
+    monkeypatch.setattr(
+        execution, "try_get_tp_info", lambda: SimpleNamespace(rank=1, size=2)
+    )
+
+    plan = execution.glm_pipeline_plan(78, _glm_indexers())
+
+    assert (plan.start_layer, plan.stop_layer) == (42, 78)
+
+
+@pytest.mark.parametrize("cuts", [(38, 42), (39,), (0,)])
+def test_pipeline_boundary_override_rejects_invalid_cuts(monkeypatch, cuts):
+    from freetoken.models.glm_moe_dsa import execution
+
+    monkeypatch.setattr(execution, "_ENABLED", True)
+    monkeypatch.setattr(execution, "_BOUNDARIES", cuts)
+    monkeypatch.setattr(
+        execution, "try_get_tp_info", lambda: SimpleNamespace(rank=0, size=2)
+    )
+
+    with pytest.raises(ValueError):
+        execution.glm_pipeline_plan(78, _glm_indexers())
+
+
 def test_pp3_boundaries_are_safe_and_cover_every_layer(monkeypatch):
     from freetoken.models.glm_moe_dsa import execution
 

@@ -96,6 +96,9 @@ class EngineConfig:
     # GLM-5.2 contiguous pipeline parallelism: TP ranks become layer stages
     # instead of replicated-backbone expert-parallel ranks.
     glm_pipeline_parallel: bool = False
+    # Optional internal layer cuts for hardware/workload-specific pipeline plans.
+    # Length must be TP size - 1; every cut must begin a full IndexShare layer.
+    glm_pipeline_boundaries: tuple[int, ...] | None = None
     # Split a single long GLM pipeline prefill into this many tokens per pipeline
     # microbatch. 0 disables it. The intended first use is one 8k scheduler chunk
     # split into two 4k stage-overlapped chunks without increasing expert traffic

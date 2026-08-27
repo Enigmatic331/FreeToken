@@ -192,6 +192,40 @@ def test_glm_pipeline_prefill_microbatch_tokens_parse():
     assert enabled.glm_pipeline_microbatch_tokens == 4096
 
 
+def test_glm_pipeline_boundaries_parse():
+    config = _Config(
+        {"architectures": ["GlmMoeDsaForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--glm-pipeline-parallel",
+                "--glm-pipeline-boundaries",
+                "26,50",
+            ]
+        )
+
+    assert args.glm_pipeline_boundaries == (26, 50)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--glm-pipeline-boundaries", "42"],
+        ["--glm-pipeline-parallel", "--glm-pipeline-boundaries", "0"],
+    ],
+)
+def test_glm_pipeline_boundaries_reject_invalid_scope(extra):
+    config = _Config(
+        {"architectures": ["GlmMoeDsaForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        with pytest.raises(SystemExit):
+            parse_args(["--model", ANON_PATH, *extra])
+
+
 def test_glm_pipeline_prefill_microbatch_tokens_rejects_negative():
     config = _Config(
         {"architectures": ["GlmMoeDsaForCausalLM"], "torch_dtype": "bfloat16"}

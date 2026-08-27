@@ -274,6 +274,15 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--glm-pipeline-boundaries",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.glm_pipeline_boundaries,
+        help=(
+            "Optional comma-separated internal layer cuts for GLM pipeline stages "
+            "(for example 42 for PP2 or 26,50 for PP3)."
+        ),
+    )
+    parser.add_argument(
         "--glm-pipeline-microbatch-tokens",
         type=int,
         default=ServerArgs.glm_pipeline_microbatch_tokens,
@@ -702,6 +711,11 @@ def parse_args(
 
     if kwargs["glm_pipeline_microbatch_tokens"] < 0:
         parser.error("--glm-pipeline-microbatch-tokens must be >= 0")
+    if kwargs["glm_pipeline_boundaries"] is not None:
+        if not kwargs["glm_pipeline_parallel"]:
+            parser.error("--glm-pipeline-boundaries requires --glm-pipeline-parallel")
+        if any(cut <= 0 for cut in kwargs["glm_pipeline_boundaries"]):
+            parser.error("--glm-pipeline-boundaries values must be > 0")
     if kwargs["glm_pipeline_microbatch_tokens"]:
         if not kwargs["glm_pipeline_parallel"]:
             parser.error(

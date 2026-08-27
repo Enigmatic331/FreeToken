@@ -323,6 +323,7 @@ class Engine:
         configure_glm_pipeline(
             config.glm_pipeline_parallel,
             config.glm_pipeline_microbatch_tokens,
+            config.glm_pipeline_boundaries,
         )
         _adjust_config(config)
         from freetoken.models.glm_moe_dsa.execution import glm_pipeline_plan
@@ -1220,6 +1221,7 @@ def _adjust_config(config: EngineConfig):
     dsv4_moe_cache_sizes = getattr(config, "dsv4_moe_cache_sizes", None)
     moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
     glm_pipeline_parallel = getattr(config, "glm_pipeline_parallel", False)
+    glm_pipeline_boundaries = getattr(config, "glm_pipeline_boundaries", None)
     glm_pipeline_microbatch_tokens = getattr(
         config, "glm_pipeline_microbatch_tokens", 0
     )
@@ -1243,10 +1245,15 @@ def _adjust_config(config: EngineConfig):
                 "--glm-pipeline-microbatch-tokens currently requires "
                 "--max-running-requests 1"
             )
-    elif glm_pipeline_microbatch_tokens:
-        raise ValueError(
-            "--glm-pipeline-microbatch-tokens requires --glm-pipeline-parallel"
-        )
+    else:
+        if glm_pipeline_boundaries is not None:
+            raise ValueError(
+                "--glm-pipeline-boundaries requires --glm-pipeline-parallel"
+            )
+        if glm_pipeline_microbatch_tokens:
+            raise ValueError(
+                "--glm-pipeline-microbatch-tokens requires --glm-pipeline-parallel"
+            )
 
     if moe_cache_sizes is not None:
         if not getattr(model_config, "is_moe", False):
