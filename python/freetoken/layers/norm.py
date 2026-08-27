@@ -5,11 +5,16 @@ import torch
 from .base import BaseOP
 
 
+def _use_flashinfer_norm() -> bool:
+    """Avoid CuTeDSL norm kernels that have no image for pre-Hopper devices."""
+    from freetoken.kernel.backend import is_flashinfer_installed
+
+    return is_flashinfer_installed() and torch.cuda.get_device_capability()[0] >= 9
+
+
 class RMSNorm(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
-        from freetoken.kernel.backend import is_flashinfer_installed
-
-        if is_flashinfer_installed():
+        if _use_flashinfer_norm():
             from flashinfer import rmsnorm
         else:
             from freetoken.kernel.triton.norm import rmsnorm
@@ -149,9 +154,7 @@ class GemmaPlusOneRMSNormFused(BaseOP):
 
 class RMSNormFused(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
-        from freetoken.kernel.backend import is_flashinfer_installed
-
-        if is_flashinfer_installed():
+        if _use_flashinfer_norm():
             from flashinfer import fused_add_rmsnorm, rmsnorm
         else:
             from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm

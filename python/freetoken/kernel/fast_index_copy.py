@@ -140,13 +140,22 @@ def fast_index_copy_jit(
 
 
 @lru_cache(maxsize=None)
-def _jit_fast_index_copy_multi_module(*, num_threads: int, blocks_per_bank: int) -> Module:
+def _jit_fast_index_copy_multi_module(
+    *, num_threads: int, blocks_per_bank: int, device_arch: str
+) -> Module:
     args = make_cpp_args(num_threads, blocks_per_bank)
+    compute_capability = device_arch.removeprefix("sm")
     return load_jit(
         "fast_index_copy_multi",
+        device_arch,
         *args,
         cuda_files=["fast_index_copy.cuh"],
         cuda_wrappers=[("launch", f"&MultiIndexCopyKernel<{args}>::run")],
+        # tvm-ffi's default detection shells out to nvidia-smi and therefore sees
+        # physical GPU 0 even when this worker's current CUDA device is an Ada rank.
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{compute_capability},code=sm_{compute_capability}"
+        ],
     )
 
 
@@ -180,8 +189,11 @@ def fast_index_copy_multi_jit(
     """
     if _skip_fast_index_copy_enabled():
         return
+    major, minor = torch.cuda.get_device_capability(dst_ptrs.device)
     module = _jit_fast_index_copy_multi_module(
-        num_threads=num_threads, blocks_per_bank=blocks_per_bank
+        num_threads=num_threads,
+        blocks_per_bank=blocks_per_bank,
+        device_arch=f"sm{major}{minor}",
     )
     module.launch(
         dst_ptrs, src_ptrs, feat_bytes, dst_strides, src_strides,
