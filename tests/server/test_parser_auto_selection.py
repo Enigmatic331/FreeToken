@@ -155,3 +155,16 @@ def test_moe_collect_stats_is_opt_in():
 
     assert default.moe_collect_stats is False
     assert enabled.moe_collect_stats is True
+
+
+def test_moe_profile_stats_is_opt_in_and_enables_counters():
+    config = _Config(
+        {"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        default, _ = parse_args(["--model", ANON_PATH])
+        enabled, _ = parse_args(["--model", ANON_PATH, "--moe-profile-stats"])
+
+    assert default.moe_profile_stats is False
+    assert enabled.moe_profile_stats is True
+    assert enabled.moe_collect_stats is True

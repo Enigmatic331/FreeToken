@@ -138,8 +138,14 @@ class Scheduler(SchedulerIOMixin):
         # CUDA-graph capture executes each graph once, including graph-safe MoE stat
         # increments. Start the user-visible measurement window after capture so an
         # idle server never reports warm-up traffic as a real request.
-        if config.moe_collect_stats and self.engine.moe_offload_cache is not None:
+        if (config.moe_collect_stats or config.moe_profile_stats) and (
+            self.engine.moe_offload_cache is not None
+        ):
             cache = self.engine.moe_offload_cache
+            # Enable event recording only now, after Engine constructed/captured the
+            # CUDA graphs. Eager GLM pipeline forwards are profiled; existing graphs
+            # remain untouched and retain only their graph-safe LRU counters.
+            cache.profile_timing = config.moe_profile_stats
             cache.reset_stats()
             # The routing histogram uses a host-launched scatter and therefore cannot
             # replay dynamic ids inside a CUDA graph. Eager diagnostic runs opt in
@@ -163,7 +169,9 @@ class Scheduler(SchedulerIOMixin):
         for telemetry would add synchronization to the system being measured.
         """
         cache = self.engine.moe_offload_cache
-        if cache is None or not self.config.moe_collect_stats:
+        if cache is None or not (
+            self.config.moe_collect_stats or self.config.moe_profile_stats
+        ):
             return
         totals = cache.decode_miss_stats()
         if not totals["layer_calls"] and not totals["prefill_rows"]:
@@ -207,6 +215,43 @@ class Scheduler(SchedulerIOMixin):
                 100 * coverage["512"],
                 routing["expert_pairs_for_90pct"],
             )
+        profile = cache.profile_stats()
+        if profile:
+            def ms(metric: str) -> float:
+                return profile.get(metric, {}).get("total_ms", 0.0)
+
+            def observations(metric: str) -> int:
+                return profile.get(metric, {}).get("observations", 0)
+
+            for phase in ("prefill", "decode"):
+                if not any(name.startswith(f"{phase}_") for name in profile):
+                    continue
+                h2d = totals[f"{phase}_h2d_bytes"] / (1 << 30)
+                logger.info(
+                    "MoE profile latest-%s: stage=%.2fms boundary/wait=%.2fms "
+                    "token-sync=%.2fms expert=%.2fms copy=%.2fms copy-wait=%.2fms "
+                    "gather=%.2fms H2D-window=%.2fGiB D2D-window=%.2fGiB observations=%d",
+                    phase,
+                    ms(f"{phase}_stage"),
+                    ms(f"{phase}_boundary"),
+                    ms(f"{phase}_token_sync"),
+                    ms(f"{phase}_expert"),
+                    ms(f"{phase}_copy"),
+                    ms(f"{phase}_wait"),
+                    ms(f"{phase}_gather"),
+                    h2d,
+                    totals["prefill_d2d_bytes"] / (1 << 30) if phase == "prefill" else 0.0,
+                    observations(f"{phase}_stage"),
+                )
+                for metric in (f"{phase}_expert", f"{phase}_copy"):
+                    per_layer = profile.get(metric, {}).get("per_index_ms", {})
+                    if per_layer:
+                        worst = sorted(per_layer.items(), key=lambda item: item[1], reverse=True)[:5]
+                        logger.info(
+                            "MoE profile %s worst layers: %s",
+                            metric,
+                            ",".join(f"L{layer}={value:.2f}ms" for layer, value in worst),
+                        )
         cache.reset_stats()
 
     @torch.inference_mode()

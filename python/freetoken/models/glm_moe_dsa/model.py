@@ -124,8 +124,15 @@ class GlmMoeDsaModel(BaseOP):
     def _run_local(
         self, x: torch.Tensor, residual: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        ctx = get_global_ctx()
+        cache = ctx.moe_offload_cache
+        phase = "prefill" if ctx.batch.is_prefill else "decode"
+        if cache is not None:
+            cache.profile_begin(f"{phase}_stage")
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
+        if cache is not None:
+            cache.profile_end(f"{phase}_stage")
         assert residual is not None
         return x, residual
 
@@ -148,8 +155,14 @@ class GlmMoeDsaModel(BaseOP):
         # Every rank participates in every boundary collective. The next rank runs
         # its local block after receiving both halves of the fused-residual stream.
         for src in range(self._plan.world_size - 1):
+            cache = get_global_ctx().moe_offload_cache
+            phase = "prefill" if get_global_ctx().batch.is_prefill else "decode"
+            if cache is not None:
+                cache.profile_begin(f"{phase}_boundary", src)
             x = self._comm.broadcast(x, src)
             residual = self._comm.broadcast(residual, src)
+            if cache is not None:
+                cache.profile_end(f"{phase}_boundary", src)
             if self._plan.rank == src + 1:
                 x, residual = self._run_local(x, residual)
 

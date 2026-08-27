@@ -268,6 +268,20 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Optional eager-path profiler. CUDA events are recorded without synchronizing
+        # the hot path and read only at the scheduler's idle barrier. One pair is reused
+        # per (metric, layer), so the report describes the latest prefill chunk / decode
+        # step while ``_timing_counts`` says how many observations occurred in the window.
+        # The scheduler enables this only after CUDA graph capture; captured forwards keep
+        # their established graph and eager diagnostic runs gain the event records.
+        self.profile_timing = False
+        self._timing_events: dict[str, dict[int, tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self._timing_active: set[tuple[str, int]] = set()
+        self._timing_counts: dict[tuple[str, int], int] = {}
+        # Exact payload traffic for prefill. Decode H2D bytes are derived at report time
+        # from per-layer fetched rows and each layer's exact (possibly mixed-IQ) strides.
+        self.prefill_h2d_bytes = 0
+        self.prefill_d2d_bytes = 0
 
     def set_bank_sources(
         self,
@@ -505,6 +519,10 @@ class OffloadMoeCache:
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.prefill_h2d_bytes = 0
+        self.prefill_d2d_bytes = 0
+        self._timing_active.clear()
+        self._timing_counts.clear()
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
@@ -669,12 +687,20 @@ class OffloadMoeCache:
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
+            if self.collect_stats:
+                self.prefill_h2d_bytes += self.layer_expert_bytes(layer_id) * self.num_experts
+            self.profile_begin("prefill_copy", layer_id)
             copy()
+            self.profile_end("prefill_copy", layer_id)
         else:
             with torch.cuda.stream(self.prefill_copy_stream):
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+                if self.collect_stats:
+                    self.prefill_h2d_bytes += self.layer_expert_bytes(layer_id) * self.num_experts
+                self.profile_begin("prefill_copy", layer_id, self.prefill_copy_stream)
                 copy()
+                self.profile_end("prefill_copy", layer_id, self.prefill_copy_stream)
                 self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id
@@ -752,6 +778,7 @@ class OffloadMoeCache:
         self.prefill_hit_rows += int(hit_mask.sum())
         self.prefill_total_rows += E
         if self._gather_dst_ptrs is not None:
+            self.profile_begin("prefill_gather", layer_id)
             prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
             # wider grid (~22 GB/s per 1024-thread block on H100).
@@ -766,10 +793,12 @@ class OffloadMoeCache:
                 self._prefill_hit_num,
                 blocks_per_bank=64,
             )
+            self.profile_end("prefill_gather", layer_id)
         miss = np.nonzero(~hit_mask)[0]
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+            self.profile_begin("prefill_copy", layer_id, self.prefill_copy_stream)
             self._invalidate_prefill_buffer(buffer_id)
             if miss.size:
                 run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
@@ -815,7 +844,23 @@ class OffloadMoeCache:
                     torch.tensor(nbytes, dtype=torch.int64),
                     torch.cuda.current_stream(self.device).cuda_stream,
                 )
+            self.profile_end("prefill_copy", layer_id, self.prefill_copy_stream)
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
+        if self.collect_stats:
+            hits = int(hit_mask.sum())
+            misses = int(miss.size)
+            for bank_id, name in enumerate(self.bank_schema):
+                feat = self.bank_feature_bytes[name][layer_id]
+                dst_stride = self._copy_dst_strides_host[bank_id]
+                if feat < _SMALL_BANK_FEAT_BYTES and feat == dst_stride == (
+                    self._copy_src_strides_host[layer_id][bank_id]
+                ):
+                    self.prefill_h2d_bytes += E * feat
+                else:
+                    self.prefill_h2d_bytes += misses * feat
+                    if bank_id in self._gather_bank_ids:
+                        self.prefill_d2d_bytes += hits * dst_stride
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
@@ -828,7 +873,9 @@ class OffloadMoeCache:
         buffer_id = layer_id % 2
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
+            self.profile_begin("prefill_wait", layer_id)
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
+            self.profile_end("prefill_wait", layer_id)
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
     def release_prefill_layer(self, layer_id: int) -> None:
@@ -896,6 +943,62 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
         self.decode_freq.zero_()
+        self.prefill_h2d_bytes = 0
+        self.prefill_d2d_bytes = 0
+        self._timing_active.clear()
+        self._timing_counts.clear()
+
+    def layer_expert_bytes(self, layer_id: int) -> int:
+        """Exact packed payload bytes for one expert row in ``layer_id``."""
+        return sum(
+            self.bank_feature_bytes[name][layer_id]
+            for name in getattr(self, "bank_schema", ())
+        )
+
+    def profile_begin(
+        self, metric: str, index: int = 0, stream: torch.cuda.Stream | None = None
+    ) -> None:
+        """Record an opt-in timing start without synchronizing the measured path."""
+        if not self.profile_timing or self.device.type != "cuda":
+            return
+        per_index = self._timing_events.setdefault(metric, {})
+        pair = per_index.get(index)
+        if pair is None:
+            pair = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            per_index[index] = pair
+        pair[0].record(stream or torch.cuda.current_stream(self.device))
+
+    def profile_end(
+        self, metric: str, index: int = 0, stream: torch.cuda.Stream | None = None
+    ) -> None:
+        """Record an opt-in timing end; the idle reporter performs the only read/sync."""
+        if not self.profile_timing or self.device.type != "cuda":
+            return
+        pair = self._timing_events.get(metric, {}).get(index)
+        if pair is None:
+            raise RuntimeError(f"MoE timing {metric}[{index}] ended without a start")
+        pair[1].record(stream or torch.cuda.current_stream(self.device))
+        key = (metric, index)
+        self._timing_active.add(key)
+        self._timing_counts[key] = self._timing_counts.get(key, 0) + 1
+
+    def profile_stats(self) -> dict[str, dict]:
+        """Latest CUDA-event durations, read once at the scheduler's idle barrier."""
+        if not self.profile_timing or not self._timing_active:
+            return {}
+        torch.cuda.synchronize(self.device)
+        result: dict[str, dict] = {}
+        for metric, index in sorted(self._timing_active):
+            started, ended = self._timing_events[metric][index]
+            ms = float(started.elapsed_time(ended))
+            entry = result.setdefault(
+                metric, {"total_ms": 0.0, "max_ms": 0.0, "per_index_ms": {}, "observations": 0}
+            )
+            entry["total_ms"] += ms
+            entry["max_ms"] = max(entry["max_ms"], ms)
+            entry["per_index_ms"][index] = ms
+            entry["observations"] += self._timing_counts[(metric, index)]
+        return result
 
     def record_decode_routes(
         self,
@@ -951,6 +1054,14 @@ class OffloadMoeCache:
             # capped hybrid path, so reporting it here used to claim zero PCIe fetches
             # even while the LRU was visibly missing.
             fetched = missing
+        if self.decode_target == "hybrid":
+            fetched_by_layer = self.stat_fetched_layer.tolist()
+        else:
+            fetched_by_layer = self.lru_stats[:, Stat.MISS].tolist()
+        decode_h2d_bytes = sum(
+            int(rows) * self.layer_expert_bytes(layer_id)
+            for layer_id, rows in enumerate(fetched_by_layer)
+        )
         return {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
@@ -964,6 +1075,9 @@ class OffloadMoeCache:
             # rows prefetched into the double buffer since the last reset.
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
+            "prefill_h2d_bytes": getattr(self, "prefill_h2d_bytes", 0),
+            "prefill_d2d_bytes": getattr(self, "prefill_d2d_bytes", 0),
+            "decode_h2d_bytes": decode_h2d_bytes,
         }
 
     def decode_miss_stats_per_layer(self) -> dict:

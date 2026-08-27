@@ -587,6 +587,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-profile-stats",
+        action="store_true",
+        default=ServerArgs.moe_profile_stats,
+        help=(
+            "Record opt-in CUDA-event timings for the latest eager prefill chunk and "
+            "decode step, including expert copy/compute and GLM pipeline waits. Also "
+            "enables --moe-collect-stats. Disabled by default."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,
@@ -679,6 +690,9 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    if kwargs["moe_profile_stats"]:
+        kwargs["moe_collect_stats"] = True
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

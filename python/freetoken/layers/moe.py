@@ -310,8 +310,11 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
+        cache.profile_begin("decode_copy", self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        cache.profile_end("decode_copy", self.layer_id)
+        cache.profile_begin("decode_expert", self.layer_id)
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -321,6 +324,8 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        cache.profile_end("decode_expert", self.layer_id)
+        return out
 
     def _decode_hybrid(
         self,
@@ -385,6 +390,7 @@ class OffloadMoELayer(MoELayer):
         assert cache is not None
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
+            cache.profile_begin("prefill_expert", self.layer_id)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -395,11 +401,19 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
+            cache.profile_end("prefill_expert", self.layer_id)
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
+        if cache.collect_stats:
+            cache.prefill_h2d_bytes += (
+                cache.layer_expert_bytes(self.layer_id) * cache.num_experts
+            )
+        cache.profile_begin("prefill_copy", self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        cache.profile_end("prefill_copy", self.layer_id)
+        cache.profile_begin("prefill_expert", self.layer_id)
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -409,6 +423,8 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        cache.profile_end("prefill_expert", self.layer_id)
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

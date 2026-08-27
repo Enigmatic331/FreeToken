@@ -661,7 +661,7 @@ class Engine:
         cache.cpu_layer_ids = cpu_layer_ids
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        cache.collect_stats = config.moe_collect_stats or config.moe_profile_stats
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
@@ -987,9 +987,15 @@ class Engine:
                 next_tokens_gpu, self._dsv4_plan.backbone_rank
             )
         elif self._glm_plan is not None and self._glm_plan.enabled:
+            cache = self.moe_offload_cache
+            phase = "prefill" if batch.is_prefill else "decode"
+            if cache is not None:
+                cache.profile_begin(f"{phase}_token_sync")
             next_tokens_gpu = self._execution_comm.broadcast(
                 next_tokens_gpu, self._glm_plan.final_rank
             )
+            if cache is not None:
+                cache.profile_end(f"{phase}_token_sync")
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -1193,6 +1199,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_profile_stats": False,
     "expert_load": "auto",
 }
 
