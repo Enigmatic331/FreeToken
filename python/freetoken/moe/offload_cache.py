@@ -89,6 +89,14 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
 }
 
+# llama.cpp's grouped IQ MMQ addresses experts in quant-block units. Mixed-IQ
+# layers share a maximum-size byte cache row, so variable-stride banks need a
+# stride divisible by both the accelerated common type's block bytes and the
+# fused-copy path's 16-byte alignment: lcm(50, 16)=400 and lcm(98, 16)=784.
+# This padding does not cross PCIe: copies retain the exact per-layer byte counts
+# in bank_feature_bytes.
+_GGUF_IQ_MMQ_BANK_ALIGNMENT = {"gate_up": 400, "down": 784}
+
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
@@ -346,7 +354,12 @@ class OffloadMoeCache:
                 cache_shape = (self.cache_size, *head.shape[1:])
             else:
                 self._variable_stride_banks.add(name)
-                cache_shape = (self.cache_size, max(features))
+                max_features = max(features)
+                if self.quant_format in ("gguf_glm_iq", "gguf_q2_k_xl"):
+                    assert head.element_size() == 1, (name, head.dtype)
+                    alignment = _GGUF_IQ_MMQ_BANK_ALIGNMENT[name]
+                    max_features = (max_features + alignment - 1) // alignment * alignment
+                cache_shape = (self.cache_size, max_features)
             self.bank_caches[name] = torch.empty(cache_shape, dtype=head.dtype, device=self.device)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()

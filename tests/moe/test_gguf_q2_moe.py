@@ -191,12 +191,16 @@ def test_mixed_q2_layers_share_one_max_stride_offload_cache():
     )
     assert cache.bank_caches["gate_up"].shape == (
         experts,
-        gu_special[0].numel(),
+        (gu_special[0].numel() + 399) // 400 * 400,
     )
     assert cache.bank_caches["down"].shape == (
         experts,
-        down_special[0].numel(),
+        (down_special[0].numel() + 783) // 784 * 784,
     )
+    assert cache.bank_caches["gate_up"].stride(0) % 50 == 0
+    assert cache.bank_caches["down"].stride(0) % 98 == 0
+    assert cache.bank_caches["gate_up"].stride(0) % 16 == 0
+    assert cache.bank_caches["down"].stride(0) % 16 == 0
 
     cache.materialize_layer(1)
     cache.copy_missing()

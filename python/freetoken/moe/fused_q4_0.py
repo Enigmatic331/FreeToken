@@ -31,6 +31,7 @@ def fused_experts_gguf(
     intermediate_size: int | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel.gguf import ggml_moe_a8_vec
+    from freetoken.kernel.llama_iq_mmq import grouped_iq_mmq, supported
 
     act_fn = _ACT.get(activation)
     if act_fn is None:
@@ -45,14 +46,24 @@ def fused_experts_gguf(
     h = hidden_states.shape[1]
     top_k = topk_ids.shape[1]
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
-    gate_up = ggml_moe_a8_vec(
-        hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_type), n2, num_tokens
-    )
+    if supported(gate_up_type, num_tokens):
+        gate_up = grouped_iq_mmq(
+            gate_up_q, hidden_states, topk_ids, int(gate_up_type), n2
+        )
+    else:
+        gate_up = ggml_moe_a8_vec(
+            hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_type), n2, num_tokens
+        )
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(
-        inter, down_q, topk_ids, 1, int(down_type), h, num_tokens * top_k
-    )
+    if supported(down_type, num_tokens * top_k):
+        out = grouped_iq_mmq(
+            down_q, inter, topk_ids.reshape(-1, 1), int(down_type), h
+        )
+    else:
+        out = ggml_moe_a8_vec(
+            inter, down_q, topk_ids, 1, int(down_type), h, num_tokens * top_k
+        )
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )
