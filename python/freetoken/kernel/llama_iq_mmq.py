@@ -12,12 +12,14 @@ import hashlib
 import os
 import pathlib
 import shutil
+import subprocess
 
 import torch
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "llama_iq_mmq" / "llama_iq_mmq.cu"
 _SUPPORTED_TYPES = {18, 19}  # GGML_IQ3_XXS, GGML_IQ1_S
 _MAX_SORT_TOKENS = 4096
+_PINNED_LLAMA_CPP_REVISION = "6fdd0ac8907fd973a42b876357823ad2124cd8ed"
 
 
 def configured() -> bool:
@@ -46,6 +48,24 @@ def _checkout() -> pathlib.Path:
         raise RuntimeError(
             "FREETOKEN_LLAMA_CPP_DIR must point to a built llama.cpp checkout; "
             f"missing: {', '.join(missing)}"
+        )
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "cannot verify the llama.cpp revision; use the pinned setup helper at "
+            "scripts/setup-llama-iq-mmq.sh"
+        ) from exc
+    if revision != _PINNED_LLAMA_CPP_REVISION:
+        raise RuntimeError(
+            f"unsupported llama.cpp revision {revision}; expected "
+            f"{_PINNED_LLAMA_CPP_REVISION}. Run scripts/setup-llama-iq-mmq.sh "
+            "or unset FREETOKEN_LLAMA_CPP_DIR to use FreeToken's MMVQ path."
         )
     return root
 

@@ -24,6 +24,29 @@ def test_llama_iq_mmq_checkout_validation(monkeypatch, tmp_path):
         llama_iq_mmq._checkout()
 
 
+def test_llama_iq_mmq_rejects_unpinned_revision(monkeypatch, tmp_path):
+    from freetoken.kernel import llama_iq_mmq
+
+    required = (
+        tmp_path / "ggml" / "include" / "ggml.h",
+        tmp_path / "ggml" / "src" / "ggml-cuda" / "mmq.cuh",
+        tmp_path / "build" / "bin" / "libggml-cuda.so",
+        tmp_path / "build" / "bin" / "libggml.so",
+        tmp_path / "build" / "bin" / "libggml-base.so",
+    )
+    for path in required:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    class Result:
+        stdout = "deadbeef\n"
+
+    monkeypatch.setattr(llama_iq_mmq.subprocess, "run", lambda *args, **kwargs: Result())
+    monkeypatch.setenv("FREETOKEN_LLAMA_CPP_DIR", str(tmp_path))
+    with pytest.raises(RuntimeError, match="unsupported llama.cpp revision deadbeef"):
+        llama_iq_mmq._checkout()
+
+
 def test_llama_iq_mmq_chunks_route_sort_without_concatenating(monkeypatch):
     from freetoken.kernel import llama_iq_mmq
 

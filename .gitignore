@@ -218,6 +218,9 @@ __marimo__/
 
 # Kernel experiment scratch area: keep ignored, do not commit
 kernels_exp/
+
+# Optional source dependencies prepared by local setup helpers
+.deps/
 refs/
 
 benchmarks/cross_framework
