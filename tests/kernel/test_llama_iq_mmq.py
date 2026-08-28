@@ -45,6 +45,30 @@ def test_llama_iq_mmq_chunks_route_sort_without_concatenating(monkeypatch):
     assert [call[0] for call in calls] == [4096, 4096, 8]
 
 
+def test_single_token_decode_keeps_both_projections_on_mmvq(monkeypatch):
+    from freetoken.moe import fused_q4_0
+
+    calls = []
+
+    def fake_mmvq(x, weight, ids, top_k, quant_type, rows, tokens):
+        calls.append((top_k, quant_type, rows, tokens))
+        return torch.zeros(tokens * top_k, rows, dtype=x.dtype)
+
+    monkeypatch.setattr("freetoken.kernel.gguf.ggml_moe_a8_vec", fake_mmvq)
+    monkeypatch.setitem(fused_q4_0._ACT, "silu", lambda gate_up: gate_up[:, :8])
+    monkeypatch.setenv("FREETOKEN_LLAMA_CPP_DIR", "/tmp/llama.cpp")
+    x = torch.zeros(1, 16, dtype=torch.bfloat16)
+    gate_up = torch.zeros(4, 32, dtype=torch.uint8)
+    down = torch.zeros(4, 32, dtype=torch.uint8)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    weights = torch.tensor([[0.5, 0.5]])
+    fused_q4_0.fused_experts_gguf(
+        x, gate_up, down, weights, ids, "silu",
+        gate_up_type=19, down_type=18, intermediate_size=8,
+    )
+    assert calls == [(2, 19, 16, 1), (1, 18, 16, 2)]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not __import__("os").environ.get("FREETOKEN_LLAMA_CPP_DIR"),
     reason="needs CUDA and a built FREETOKEN_LLAMA_CPP_DIR",

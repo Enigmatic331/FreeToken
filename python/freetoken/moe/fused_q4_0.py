@@ -56,7 +56,7 @@ def fused_experts_gguf(
         )
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    if supported(down_type, num_tokens * top_k):
+    if supported(down_type, num_tokens):
         out = grouped_iq_mmq(
             down_q, inter, topk_ids.reshape(-1, 1), int(down_type), h
         )
