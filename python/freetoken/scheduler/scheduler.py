@@ -223,6 +223,9 @@ class Scheduler(SchedulerIOMixin):
             def observations(metric: str) -> int:
                 return profile.get(metric, {}).get("observations", 0)
 
+            def history(metric: str, key: str) -> float:
+                return profile.get(metric, {}).get(key, 0.0)
+
             for phase in ("prefill", "decode"):
                 if not any(name.startswith(f"{phase}_") for name in profile):
                     continue
@@ -243,6 +246,35 @@ class Scheduler(SchedulerIOMixin):
                     totals["prefill_d2d_bytes"] / (1 << 30) if phase == "prefill" else 0.0,
                     observations(f"{phase}_stage"),
                 )
+                stage_metric = f"{phase}_stage"
+                if history(stage_metric, "sample_count") > 1:
+                    logger.info(
+                        "MoE profile %s stage-window: mean=%.2fms median=%.2fms "
+                        "range=%.2f-%.2fms samples=%d; boundary-mean=%.2fms "
+                        "token-sync-mean=%.2fms",
+                        phase,
+                        history(stage_metric, "mean_ms"),
+                        history(stage_metric, "median_ms"),
+                        history(stage_metric, "min_ms"),
+                        history(stage_metric, "sample_max_ms"),
+                        int(history(stage_metric, "sample_count")),
+                        history(f"{phase}_boundary", "mean_ms"),
+                        history(f"{phase}_token_sync", "mean_ms"),
+                    )
+                    if phase == "prefill":
+                        samples = profile[stage_metric]["samples_ms"]
+                        logger.info(
+                            "MoE profile prefill stage samples: %s",
+                            ",".join(f"{value:.2f}ms" for value in samples),
+                        )
+                        logger.info(
+                            "MoE profile prefill component-window medians: "
+                            "expert=%.2fms copy=%.2fms copy-wait=%.2fms gather=%.2fms",
+                            history("prefill_expert", "median_ms"),
+                            history("prefill_copy", "median_ms"),
+                            history("prefill_wait", "median_ms"),
+                            history("prefill_gather", "median_ms"),
+                        )
                 for metric in (f"{phase}_expert", f"{phase}_copy"):
                     per_layer = profile.get(metric, {}).get("per_index_ms", {})
                     if per_layer:

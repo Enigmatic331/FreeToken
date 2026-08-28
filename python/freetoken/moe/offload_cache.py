@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import statistics
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -27,6 +28,12 @@ _SMALL_BANK_FEAT_BYTES = 256 * 1024
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
+
+_PROFILE_HISTORY_LIMIT = 512
+_PROFILE_HISTORY_SUFFIXES = ("_stage", "_boundary", "_token_sync")
+_PROFILE_HISTORY_METRICS = frozenset(
+    {"prefill_expert", "prefill_copy", "prefill_wait", "prefill_gather"}
+)
 
 # quant_format -> bank names, in registration order: the single place a format's bank
 # layout is declared. The cache machinery (copy_missing, the prefill double buffers,
@@ -269,13 +276,17 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         # Optional eager-path profiler. CUDA events are recorded without synchronizing
-        # the hot path and read only at the scheduler's idle barrier. One pair is reused
-        # per (metric, layer), so the report describes the latest prefill chunk / decode
-        # step while ``_timing_counts`` says how many observations occurred in the window.
+        # the hot path and read only at the scheduler's idle barrier. Per-layer metrics
+        # reuse one pair and remain latest-only. Top-level pipeline metrics retain a
+        # bounded history so a tiny final prefill tail cannot hide representative chunks.
         # The scheduler enables this only after CUDA graph capture; captured forwards keep
         # their established graph and eager diagnostic runs gain the event records.
         self.profile_timing = False
         self._timing_events: dict[str, dict[int, tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self._timing_history: dict[
+            tuple[str, int], list[tuple[torch.cuda.Event, torch.cuda.Event]]
+        ] = {}
+        self._timing_history_cursor: dict[tuple[str, int], int] = {}
         self._timing_active: set[tuple[str, int]] = set()
         self._timing_counts: dict[tuple[str, int], int] = {}
         # Exact payload traffic for prefill. Decode H2D bytes are derived at report time
@@ -523,6 +534,8 @@ class OffloadMoeCache:
         self.prefill_d2d_bytes = 0
         self._timing_active.clear()
         self._timing_counts.clear()
+        self._timing_history.clear()
+        self._timing_history_cursor.clear()
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
@@ -947,6 +960,8 @@ class OffloadMoeCache:
         self.prefill_d2d_bytes = 0
         self._timing_active.clear()
         self._timing_counts.clear()
+        self._timing_history.clear()
+        self._timing_history_cursor.clear()
 
     def layer_expert_bytes(self, layer_id: int) -> int:
         """Exact packed payload bytes for one expert row in ``layer_id``."""
@@ -962,7 +977,23 @@ class OffloadMoeCache:
         if not self.profile_timing or self.device.type != "cuda":
             return
         per_index = self._timing_events.setdefault(metric, {})
-        pair = per_index.get(index)
+        key = (metric, index)
+        pair = None
+        if metric.endswith(_PROFILE_HISTORY_SUFFIXES) or metric in _PROFILE_HISTORY_METRICS:
+            history = self._timing_history.setdefault(key, [])
+            cursor = self._timing_history_cursor.get(key, 0)
+            if len(history) < _PROFILE_HISTORY_LIMIT:
+                pair = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                history.append(pair)
+            else:
+                pair = history[cursor % _PROFILE_HISTORY_LIMIT]
+            self._timing_history_cursor[key] = cursor + 1
+            per_index[index] = pair
+        else:
+            pair = per_index.get(index)
         if pair is None:
             pair = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
             per_index[index] = pair
@@ -983,7 +1014,11 @@ class OffloadMoeCache:
         self._timing_counts[key] = self._timing_counts.get(key, 0) + 1
 
     def profile_stats(self) -> dict[str, dict]:
-        """Latest CUDA-event durations, read once at the scheduler's idle barrier."""
+        """CUDA-event durations, read once at the scheduler's idle barrier.
+
+        ``total_ms`` and ``per_index_ms`` preserve latest-observation semantics.
+        Top-level pipeline entries also summarize their bounded sample window.
+        """
         if not self.profile_timing or not self._timing_active:
             return {}
         torch.cuda.synchronize(self.device)
@@ -992,12 +1027,40 @@ class OffloadMoeCache:
             started, ended = self._timing_events[metric][index]
             ms = float(started.elapsed_time(ended))
             entry = result.setdefault(
-                metric, {"total_ms": 0.0, "max_ms": 0.0, "per_index_ms": {}, "observations": 0}
+                metric,
+                {
+                    "total_ms": 0.0,
+                    "max_ms": 0.0,
+                    "per_index_ms": {},
+                    "observations": 0,
+                    "_per_index_samples_ms": [],
+                },
             )
             entry["total_ms"] += ms
             entry["max_ms"] = max(entry["max_ms"], ms)
             entry["per_index_ms"][index] = ms
             entry["observations"] += self._timing_counts[(metric, index)]
+            pairs = self._timing_history.get((metric, index))
+            if pairs:
+                entry["_per_index_samples_ms"].append([
+                    float(sample_start.elapsed_time(sample_end))
+                    for sample_start, sample_end in pairs
+                ])
+            else:
+                entry["_per_index_samples_ms"].append([ms])
+        for entry in result.values():
+            per_index = entry.pop("_per_index_samples_ms")
+            sample_count = max(map(len, per_index))
+            samples = [
+                sum(values[sample] for values in per_index if sample < len(values))
+                for sample in range(sample_count)
+            ]
+            entry["sample_count"] = len(samples)
+            entry["samples_ms"] = samples
+            entry["mean_ms"] = sum(samples) / len(samples)
+            entry["median_ms"] = float(statistics.median(samples))
+            entry["min_ms"] = min(samples)
+            entry["sample_max_ms"] = max(samples)
         return result
 
     def record_decode_routes(

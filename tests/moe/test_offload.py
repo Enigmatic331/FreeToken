@@ -692,3 +692,72 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
     bf16 = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
     with pytest.raises(ValueError, match="num_experts"):
         bf16.validate_rebuild(3)  # below the num_experts floor
+
+
+def test_profile_stats_retains_stage_history_but_preserves_latest_semantics(monkeypatch):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    class Event:
+        def __init__(self, timestamp: float):
+            self.timestamp = timestamp
+
+        def elapsed_time(self, end: "Event") -> float:
+            return end.timestamp - self.timestamp
+
+    cache = object.__new__(OffloadMoeCache)
+    cache.profile_timing = True
+    cache.device = torch.device("cpu")
+    cache._timing_active = {("prefill_stage", 0), ("prefill_copy", 3)}
+    cache._timing_counts = {("prefill_stage", 0): 3, ("prefill_copy", 3): 7}
+    stage_latest = (Event(30.0), Event(35.0))
+    copy_latest = (Event(20.0), Event(27.0))
+    cache._timing_events = {
+        "prefill_stage": {0: stage_latest},
+        "prefill_copy": {3: copy_latest},
+    }
+    cache._timing_history = {
+        ("prefill_stage", 0): [
+            (Event(0.0), Event(10.0)),
+            (Event(10.0), Event(30.0)),
+            stage_latest,
+        ]
+    }
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+
+    stats = cache.profile_stats()
+
+    stage = stats["prefill_stage"]
+    assert stage["total_ms"] == 5.0
+    assert stage["observations"] == 3
+    assert stage["sample_count"] == 3
+    assert stage["mean_ms"] == pytest.approx(35.0 / 3)
+    assert stage["median_ms"] == 10.0
+    assert (stage["min_ms"], stage["sample_max_ms"]) == (5.0, 20.0)
+
+    copy = stats["prefill_copy"]
+    assert copy["total_ms"] == 7.0
+    assert copy["observations"] == 7
+    assert copy["sample_count"] == 1
+
+
+def test_reset_stats_clears_profile_history_window():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cpu"),
+    )
+    cache._timing_active.add(("prefill_stage", 0))
+    cache._timing_counts[("prefill_stage", 0)] = 1
+    cache._timing_history[("prefill_stage", 0)] = [(object(), object())]
+    cache._timing_history_cursor[("prefill_stage", 0)] = 1
+
+    cache.reset_stats()
+
+    assert not cache._timing_active
+    assert not cache._timing_counts
+    assert not cache._timing_history
+    assert not cache._timing_history_cursor
