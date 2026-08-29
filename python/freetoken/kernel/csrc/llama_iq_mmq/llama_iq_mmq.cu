@@ -116,10 +116,14 @@ static torch::Tensor grouped_iq_mmq(
     const int64_t rows) {
   auto out = torch::empty({x.size(0) * topk_ids.size(1), rows}, x.options());
   switch (type) {
+    case GGML_TYPE_IQ2_XS:
+      return grouped_iq_mmq_impl<GGML_TYPE_IQ2_XS>(weight, x, topk_ids, rows, out);
     case GGML_TYPE_IQ1_S:
       return grouped_iq_mmq_impl<GGML_TYPE_IQ1_S>(weight, x, topk_ids, rows, out);
     case GGML_TYPE_IQ3_XXS:
       return grouped_iq_mmq_impl<GGML_TYPE_IQ3_XXS>(weight, x, topk_ids, rows, out);
+    case GGML_TYPE_IQ4_XS:
+      return grouped_iq_mmq_impl<GGML_TYPE_IQ4_XS>(weight, x, topk_ids, rows, out);
     default:
       TORCH_CHECK(false, "unsupported llama IQ MMQ type ", type);
   }
@@ -133,10 +137,14 @@ static torch::Tensor grouped_iq_mmq_out(
     const int64_t rows,
     torch::Tensor out) {
   switch (type) {
+    case GGML_TYPE_IQ2_XS:
+      return grouped_iq_mmq_impl<GGML_TYPE_IQ2_XS>(weight, x, topk_ids, rows, out);
     case GGML_TYPE_IQ1_S:
       return grouped_iq_mmq_impl<GGML_TYPE_IQ1_S>(weight, x, topk_ids, rows, out);
     case GGML_TYPE_IQ3_XXS:
       return grouped_iq_mmq_impl<GGML_TYPE_IQ3_XXS>(weight, x, topk_ids, rows, out);
+    case GGML_TYPE_IQ4_XS:
+      return grouped_iq_mmq_impl<GGML_TYPE_IQ4_XS>(weight, x, topk_ids, rows, out);
     default:
       TORCH_CHECK(false, "unsupported llama IQ MMQ type ", type);
   }

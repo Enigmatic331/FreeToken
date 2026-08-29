@@ -1,7 +1,9 @@
 # Optional llama.cpp IQ MMQ bridge
 
-FreeToken can use modern llama.cpp grouped IQ matrix-matrix kernels for supported
-GGUF prefill projections. Model loading, expert caching, pipeline parallelism,
+FreeToken can use modern llama.cpp grouped IQ matrix-matrix kernels for IQ1_S,
+IQ2_XS, IQ3_XXS, and IQ4_XS GGUF prefill projections. This covers the common
+and exceptional expert formats in GLM-5.2 UD-IQ1_S and UD-Q2_K_XL. Model
+loading, expert caching, pipeline parallelism,
 attention, KV cache, and serving remain inside FreeToken. Single-token decode
 continues to use FreeToken's MMVQ path.
 

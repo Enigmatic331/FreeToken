@@ -17,7 +17,7 @@ import subprocess
 import torch
 
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "llama_iq_mmq" / "llama_iq_mmq.cu"
-_SUPPORTED_TYPES = {18, 19}  # GGML_IQ3_XXS, GGML_IQ1_S
+_SUPPORTED_TYPES = {17, 18, 19, 23}  # IQ2_XS, IQ3_XXS, IQ1_S, IQ4_XS
 _MAX_SORT_TOKENS = 4096
 _PINNED_LLAMA_CPP_REVISION = "6fdd0ac8907fd973a42b876357823ad2124cd8ed"
 
