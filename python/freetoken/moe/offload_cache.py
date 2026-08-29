@@ -95,8 +95,11 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
 # copy path's 16-byte alignment. This tiny padding remains GPU-local; PCIe copies
 # retain the exact per-layer byte counts in bank_feature_bytes.
 _GGUF_IQ_MMQ_BANK_ALIGNMENT = {
-    # IQ1_S gate/up (50-byte blocks), IQ3_XXS down (98-byte blocks).
-    "gguf_glm_iq": {"gate_up": 400, "down": 784},
+    # IQ1_S gate/up (50-byte blocks); IQ3_XXS/IQ4_XS down (98/136).
+    # UD-IQ1_S contains four exceptional IQ4_XS down layers, and the grouped
+    # bridge accelerates those too.  The down stride must therefore use the same
+    # 13,328-byte lcm as Q2 rather than the original IQ3-only 784-byte lcm.
+    "gguf_glm_iq": {"gate_up": 400, "down": 13328},
     # IQ2_XS/IQ3_XXS gate/up (74/98), IQ3_XXS/IQ4_XS down (98/136).
     "gguf_q2_k_xl": {"gate_up": 29008, "down": 13328},
 }
@@ -354,15 +357,23 @@ class OffloadMoeCache:
                 features.append(source.numel() // self.num_experts)
             self.bank_sources[name] = list(per_layer)
             self.bank_feature_bytes[name] = [n * head.element_size() for n in features]
-            if all(source.shape == head.shape for source in per_layer):
+            same_shape = all(source.shape == head.shape for source in per_layer)
+            max_features = max(features)
+            alignment = _GGUF_IQ_MMQ_BANK_ALIGNMENT.get(self.quant_format, {}).get(name)
+            if alignment is not None:
+                max_features = (max_features + alignment - 1) // alignment * alignment
+            # llama.cpp addresses grouped-IQ experts in quant-block units.  Even a
+            # stage whose local layers all have the same source shape needs a padded
+            # flat cache row when that natural stride is not block aligned.  PP2
+            # normally mixes IQ formats and already took this branch; asymmetric PP3
+            # exposed the uniform-stage case.
+            padded_uniform = alignment is not None and max_features != features[0]
+            if same_shape and not padded_uniform:
                 cache_shape = (self.cache_size, *head.shape[1:])
             else:
                 self._variable_stride_banks.add(name)
-                max_features = max(features)
-                if self.quant_format in ("gguf_glm_iq", "gguf_q2_k_xl"):
+                if alignment is not None:
                     assert head.element_size() == 1, (name, head.dtype)
-                    alignment = _GGUF_IQ_MMQ_BANK_ALIGNMENT[self.quant_format][name]
-                    max_features = (max_features + alignment - 1) // alignment * alignment
                 cache_shape = (self.cache_size, max_features)
             self.bank_caches[name] = torch.empty(cache_shape, dtype=head.dtype, device=self.device)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
@@ -521,6 +532,9 @@ class OffloadMoeCache:
             head = self.bank_sources[name][0]
             if name in self._variable_stride_banks:
                 max_features = max(self.bank_feature_bytes[name]) // head.element_size()
+                alignment = _GGUF_IQ_MMQ_BANK_ALIGNMENT.get(self.quant_format, {}).get(name)
+                if alignment is not None:
+                    max_features = (max_features + alignment - 1) // alignment * alignment
                 shape = (cache_size, max_features)
             else:
                 shape = (cache_size, *head.shape[1:])

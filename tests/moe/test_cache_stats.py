@@ -6,6 +6,31 @@ import torch
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 
+def test_uniform_glm_iq_stage_still_aligns_grouped_mmq_cache_rows():
+    """A PP stage can contain one IQ recipe even when the full model is mixed."""
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=2,
+        cache_size=2,
+        device=torch.device("cpu"),
+        quant_format="gguf_glm_iq",
+    )
+    cache.set_bank_sources(
+        {
+            "gate_up": [torch.empty((2, 3), dtype=torch.uint8) for _ in range(2)],
+            "down": [torch.empty((2, 5), dtype=torch.uint8) for _ in range(2)],
+        }
+    )
+
+    assert cache.bank_caches["gate_up"].shape == (2, 400)
+    assert cache.bank_caches["down"].shape == (2, 13328)
+    assert cache._variable_stride_banks == {"gate_up", "down"}
+
+    cache.rebuild(3)
+    assert cache.bank_caches["gate_up"].shape == (3, 400)
+    assert cache.bank_caches["down"].shape == (3, 13328)
+
+
 def _stats_only_cache(*, target: str, rows: list[list[int]]) -> OffloadMoeCache:
     cache = object.__new__(OffloadMoeCache)
     cache.decode_target = target
