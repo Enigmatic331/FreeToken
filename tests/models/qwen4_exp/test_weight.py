@@ -16,10 +16,42 @@ from safetensors.torch import save_file
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
+    _autoround_qweight,
+    _autoround_scales,
+    _autoround_zeros,
     _ZERO_CENTERED_NORM_SUFFIXES,
     iter_weights,
     load_ple_table,
 )
+
+
+def test_autoround_tensor_normalization():
+    out_features, in_features = 16, 256
+    qweight = torch.arange((in_features // 8) * out_features, dtype=torch.int32).view(
+        in_features // 8, out_features
+    )
+    scales = torch.arange((in_features // 128) * out_features, dtype=torch.float16).view(
+        in_features // 128, out_features
+    )
+    # Stored GPTQ zero is zero_point - 1. Pack output columns 0..7 into each word.
+    stored = torch.arange(8, dtype=torch.int32)
+    word = sum(stored[i] << (4 * i) for i in range(8))
+    qzeros = torch.full((in_features // 128, out_features // 8), word, dtype=torch.int32)
+
+    packed = _autoround_qweight(
+        qweight, out_features=out_features, in_features=in_features
+    )
+    scale = _autoround_scales(
+        scales, out_features=out_features, in_features=in_features
+    )
+    zero = _autoround_zeros(
+        qzeros, out_features=out_features, in_features=in_features
+    )
+    assert packed.shape == (out_features, in_features // 8)
+    assert torch.equal(packed, qweight.T)
+    assert scale.shape == (out_features, in_features // 128)
+    assert torch.equal(scale, scales.T)
+    assert zero[:, 0].tolist() == list(range(1, 9)) * 2
 from freetoken.moe.host_banks import HostBank, read_range_into
 
 H = 32  # hidden_size

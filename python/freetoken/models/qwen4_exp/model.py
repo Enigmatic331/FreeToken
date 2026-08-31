@@ -15,6 +15,7 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -171,7 +172,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         from .weight import load_ple_table
 
-        table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
+        # A body-only checkpoint may deliberately omit its enormous BF16 PLE shard.
+        # The table is architecture data, not body-quant-format-specific, so permit a
+        # separately validated Qwen3.8 checkpoint to provide it.
+        ple_model_path = os.environ.get(
+            "FREETOKEN_QWEN4_PLE_MODEL_PATH", engine_config.model_path
+        )
+        table = load_ple_table(ple_model_path, self._config.qwen4_args)
         self._ple_table = table  # owns the pinned HostBank; keep it alive
         for ple in ple_layers:
             ple.ple_embedding.attach_table(

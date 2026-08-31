@@ -531,6 +531,17 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "autoround_int4":
+            from freetoken.moe.fused_autoround import (
+                fused_experts_autoround,
+                fused_experts_decode_autoround,
+            )
+
+            run = fused_experts_autoround if is_prefill else fused_experts_decode_autoround
+            return run(
+                hidden_states, *views, topk_weights, topk_ids,
+                n, self.activation, self.apply_router_weight_on_input,
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer

@@ -1,10 +1,11 @@
-"""Qwen3.8-Flash-Next (RadixArk NVFP4) checkpoint reader.
+"""Qwen3.8-Flash-Next NVFP4, block-FP8, and AutoRound checkpoint reader.
 
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_FUSIONS``.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
-* :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
+* expert source loaders -- routed NVFP4 or symmetric AutoRound/GPTQ INT4 banks for
+  the offload cache.
 
 Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
 """
@@ -39,6 +40,10 @@ _EXPERT_KEY_RE = re.compile(
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
+_AUTOROUND_EXPERT_KEY_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>qweight|qzeros|scales)$"
+)
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
@@ -319,10 +324,199 @@ def load_nvfp4_expert_sources_parallel(
     )
 
 
+# ======================================================================================
+# Routed AutoRound/GPTQ INT4 experts
+# ======================================================================================
+
+
+def _alloc_autoround_banks(config):
+    from freetoken.moe.host_banks import alloc_layer_banks
+
+    L = int(config.num_layers)
+    E, H, I = config.num_experts, config.hidden_size, config.moe_intermediate_size
+    G = 128
+    if H % G or I % G:
+        raise ValueError(f"AutoRound group-128 requires aligned H/I, got H={H}, I={I}")
+    return alloc_layer_banks({
+        "gate_up_packed": ((E, 2 * I, H // 8), torch.int32),
+        "gate_up_scale": ((E, 2 * I, H // G), torch.float16),
+        "down_packed": ((E, H, I // 8), torch.int32),
+        "down_scale": ((E, H, I // G), torch.float16),
+    }, L)
+
+
+def _autoround_qweight(tensor: torch.Tensor, *, out_features: int,
+                       in_features: int) -> torch.Tensor:
+    """GPTQ input-major int32 packs -> output-major packed rows."""
+    expected = (in_features // 8, out_features)
+    if tuple(tensor.shape) == expected:
+        return tensor.to(torch.int32).T.contiguous()
+    if tuple(tensor.shape) == (out_features, in_features // 8):
+        return tensor.to(torch.int32).contiguous()
+    raise ValueError(
+        f"unexpected AutoRound qweight shape {tuple(tensor.shape)}; expected {expected}"
+    )
+
+
+def _autoround_scales(tensor: torch.Tensor, *, out_features: int,
+                      in_features: int) -> torch.Tensor:
+    groups = in_features // 128
+    if tuple(tensor.shape) == (groups, out_features):
+        return tensor.to(torch.float16).T.contiguous()
+    if tuple(tensor.shape) == (out_features, groups):
+        return tensor.to(torch.float16).contiguous()
+    raise ValueError(
+        f"unexpected AutoRound scales shape {tuple(tensor.shape)} for "
+        f"out={out_features}, in={in_features}"
+    )
+
+
+def _autoround_zeros(tensor: torch.Tensor, *, out_features: int,
+                     in_features: int) -> torch.Tensor:
+    """Unpack GPTQ qzeros once on CPU; GPTQ stores zero_point - 1."""
+    groups = in_features // 128
+    packed = tensor.to(torch.int32)
+    if tuple(packed.shape) == (out_features // 8, groups):
+        packed = packed.T.contiguous()
+    if tuple(packed.shape) != (groups, out_features // 8):
+        raise ValueError(
+            f"unexpected AutoRound qzeros shape {tuple(tensor.shape)} for "
+            f"out={out_features}, in={in_features}"
+        )
+    shifts = torch.arange(8, dtype=torch.int32) * 4
+    zero = ((packed.unsqueeze(-1) >> shifts) & 0xF).reshape(groups, out_features)
+    return ((zero + 1) & 0xF).to(torch.uint8).T.contiguous()
+
+
+def _load_autoround_expert_sources(model_path: str, config, *, parallel: bool,
+                                   workers: int = 8, chunk: int = 8 << 20,
+                                   layer_sink=None) -> dict[str, list[torch.Tensor]]:
+    import collections
+
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    info: dict[str, re.Match[str]] = {}
+    by_shard: dict[str, list[str]] = collections.defaultdict(list)
+    for name, shard in weight_map.items():
+        match = _AUTOROUND_EXPERT_KEY_RE.match(name)
+        if match is not None:
+            info[name] = match
+            by_shard[shard].append(name)
+
+    hb = _alloc_autoround_banks(config)
+    banks = {name: [b.tensor for b in layers] for name, layers in hb.items()}
+    E, H, I = config.num_experts, config.hidden_size, config.moe_intermediate_size
+
+    def place(name: str, tensor: torch.Tensor) -> int:
+        match = info[name]
+        layer, expert = int(match.group("layer")), int(match.group("expert"))
+        proj, kind = match.group("proj"), match.group("kind")
+        out_features = I if proj in {"gate_proj", "up_proj"} else H
+        in_features = H if proj in {"gate_proj", "up_proj"} else I
+        if kind == "qweight":
+            value = _autoround_qweight(
+                tensor, out_features=out_features, in_features=in_features
+            )
+            bank_name = "down_packed" if proj == "down_proj" else "gate_up_packed"
+        elif kind == "scales":
+            value = _autoround_scales(
+                tensor, out_features=out_features, in_features=in_features
+            )
+            bank_name = "down_scale" if proj == "down_proj" else "gate_up_scale"
+        else:
+            value = _autoround_zeros(
+                tensor, out_features=out_features, in_features=in_features
+            )
+            if not bool(torch.all(value == 8)):
+                raise ValueError(
+                    f"{name} is not symmetric zero-point 8 as declared by the checkpoint"
+                )
+            return layer
+        if proj == "gate_proj":
+            banks[bank_name][layer][expert, :I].copy_(value)
+        elif proj == "up_proj":
+            banks[bank_name][layer][expert, I:].copy_(value)
+        else:
+            banks[bank_name][layer][expert].copy_(value)
+        return layer
+
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
+
+    def read(sink) -> int:
+        tracker = LayerCompletionTracker(E * 9, hb, sink)
+        placed = 0
+        if parallel:
+            from freetoken.models.weight import iter_expert_tensors_parallel
+
+            tensors = iter_expert_tensors_parallel(
+                folder, lambda name: name in info, workers=workers, chunk=chunk
+            )
+            for name, tensor in tensors:
+                tracker.note(place(name, tensor))
+                placed += 1
+        else:
+            for shard in tqdm(sorted(by_shard), desc="Loading AutoRound INT4 experts",
+                              disable=not get_tp_info().is_primary()):
+                path = os.path.join(folder, shard)
+                with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                    for name in by_shard[shard]:
+                        tracker.note(place(name, f.get_tensor(name)))
+                        placed += 1
+                drop_page_cache(path)
+        return placed
+
+    if layer_sink is not None:
+        placed = read(layer_sink)
+    else:
+        with PinPipeline() as pins:
+            placed = read(pins)
+    expected = int(config.num_layers) * E * 9
+    if placed != expected:
+        raise ValueError(f"loaded {placed} AutoRound expert tensors, expected {expected}")
+    return banks
+
+
+def load_autoround_expert_sources(model_path: str, config, *, layer_sink=None) -> dict:
+    return _load_autoround_expert_sources(
+        model_path, config, parallel=False, layer_sink=layer_sink
+    )
+
+
+def load_autoround_expert_sources_parallel(
+    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20,
+    layer_sink=None,
+) -> dict:
+    return _load_autoround_expert_sources(
+        model_path, config, parallel=True, workers=workers, chunk=chunk,
+        layer_sink=layer_sink,
+    )
+
+
+def dummy_autoround_expert_sources(config) -> dict:
+    from freetoken.moe.host_banks import pin_banks
+
+    hb = _alloc_autoround_banks(config)
+    for name, layers in hb.items():
+        for bank in layers:
+            if name.endswith("packed"):
+                bank.tensor.random_(0, 2**31)
+            elif name.endswith("scale"):
+                bank.tensor.fill_(0.01)
+            else:
+                bank.tensor.fill_(8)
+    pin_banks(hb)
+    return {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
+
+
 __all__ = [
     "PleTable",
     "iter_weights",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
+    "load_autoround_expert_sources",
+    "load_autoround_expert_sources_parallel",
+    "dummy_autoround_expert_sources",
     "load_ple_table",
 ]

@@ -12,7 +12,10 @@ Contracts shared across modules (do not rename):
 from .config import parse_config
 from .model import Qwen4ExpForCausalLM
 from .weight import (
+    dummy_autoround_expert_sources,
     iter_weights,
+    load_autoround_expert_sources,
+    load_autoround_expert_sources_parallel,
     load_nvfp4_expert_sources,
     load_nvfp4_expert_sources_parallel,
     load_ple_table,
@@ -27,6 +30,9 @@ from freetoken.models.qwen3_5_moe.weight import setup_offload_expert_banks
 __all__ = [
     "Qwen4ExpForCausalLM",
     "iter_weights",
+    "load_autoround_expert_sources",
+    "load_autoround_expert_sources_parallel",
+    "dummy_autoround_expert_sources",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
     "load_ple_table",

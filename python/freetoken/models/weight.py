@@ -342,6 +342,35 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_autoround_moe_expert_sources(
+    model_path: str,
+    model_config,
+    *,
+    dummy: bool = False,
+    parallel: bool = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+    layer_sink=None,
+) -> dict:
+    """Load symmetric AutoRound/GPTQ W4A16 routed-expert source banks."""
+    _config, spec = _spec_for_model_path(model_path)
+    if dummy:
+        builder = _model_override(spec, "dummy_autoround_expert_sources")
+        assert builder is not None, "model defines no dummy_autoround_expert_sources"
+        return builder(model_config)
+    name = (
+        "load_autoround_expert_sources_parallel"
+        if parallel else "load_autoround_expert_sources"
+    )
+    loader = _model_override(spec, name)
+    if loader is None:
+        raise NotImplementedError(f"{spec.module} provides no {name}")
+    kwargs = {"layer_sink": layer_sink}
+    if parallel:
+        kwargs.update(workers=workers, chunk=chunk)
+    return loader(model_path, model_config, **kwargs)
+
+
 def _num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:
@@ -407,6 +436,7 @@ __all__ = [
     "load_weight",
     "load_moe_expert_sources",
     "load_nvfp4_moe_expert_sources",
+    "load_autoround_moe_expert_sources",
     "dummy_moe_expert_sources",
     "dummy_nvfp4_expert_sources",
     "iter_expert_tensors_parallel",

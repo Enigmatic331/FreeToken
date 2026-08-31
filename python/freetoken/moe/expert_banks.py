@@ -252,6 +252,27 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _autoround_int4_banks(model_path, model_config, device, dtype, dummy,
+                          parallel=False, workers=8, chunk=_PARALLEL_CHUNK,
+                          decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if decode_target != "gpu":
+        raise NotImplementedError(
+            "AutoRound INT4 currently supports the GPU offload path only"
+        )
+    from freetoken.models.weight import load_autoround_moe_expert_sources
+
+    sink = None if dummy else layer_sink
+    sources = load_autoround_moe_expert_sources(
+        model_path, model_config, dummy=dummy, parallel=parallel,
+        workers=workers, chunk=chunk, layer_sink=sink,
+    )
+    return ExpertBanks(
+        "autoround_int4",
+        {name: sources[name] for name in _BANK_SCHEMAS["autoround_int4"]},
+        streamed=sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -301,6 +322,7 @@ _PROVIDERS = {
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "autoround_int4": _autoround_int4_banks,
 }
 
 

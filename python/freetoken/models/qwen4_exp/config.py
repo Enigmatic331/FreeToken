@@ -155,7 +155,20 @@ def parse_config(hf_config: Any) -> ModelConfig:
     else:
         algo = str(get("quant_algo") or get("quant_method") or "").lower()
         block = get("weight_block_size")
-        if algo == "fp8" and block:
+        if algo in {"auto-round", "autoround", "auto_round"}:
+            bits = int(get("bits", 0) or 0)
+            group_size = int(get("group_size", 0) or 0)
+            symmetric = bool(get("sym", False))
+            if (bits, group_size, symmetric) != (4, 128, True):
+                raise ValueError(
+                    "Qwen4Exp AutoRound support requires symmetric W4A16 group-128 "
+                    f"experts, got bits={bits}, group_size={group_size}, sym={symmetric}"
+                )
+            # Intel's Qwen3.8 AutoRound checkpoint quantizes routed experts only;
+            # attention/GDN, shared experts, routers, HC, PLE and lm_head stay BF16.
+            expert_quant = "autoround_int4"
+            attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "fp8" and block:
             # Official FP8 build (DeepSeek-V3-style block-fp8): only the routed experts
             # are quantized (fp8-e4m3 weights + per-block weight_scale_inv); attention,
             # GDN, the shared expert, HC, PLE and lm_head stay bf16.

@@ -133,6 +133,31 @@ def test_unquantized_config_parses():
     assert parse_config(hf).expert_quant == "none"
 
 
+def test_autoround_w4a16_config_parses():
+    hf = _hf_config()
+    hf.quantization_config = {
+        "quant_method": "auto-round",
+        "bits": 4,
+        "group_size": 128,
+        "sym": True,
+    }
+    cfg = parse_config(hf)
+    assert cfg.expert_quant == "autoround_int4"
+    assert cfg.attn_quant == cfg.dense_quant == cfg.lm_head_quant == "none"
+
+
+def test_autoround_rejects_unknown_geometry():
+    hf = _hf_config()
+    hf.quantization_config = {
+        "quant_method": "auto-round",
+        "bits": 4,
+        "group_size": 64,
+        "sym": True,
+    }
+    with pytest.raises(ValueError, match="group-128"):
+        parse_config(hf)
+
+
 def test_qwen4_args_payload():
     args = parse_config(_hf_config()).qwen4_args
     assert args.ple_layer_ids == (1,)
