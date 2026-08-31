@@ -148,10 +148,28 @@ class GenSpec:
 # --------------------------------------------------------------------------- #
 # Wire-neutral builders (shared by every protocol's request->GenSpec converter).
 # --------------------------------------------------------------------------- #
-# Default max output (decode) tokens when a request omits one. Overridable per server via
-# --max-output-tokens (the Responses adapter passes that through); clamped to the remaining
-# context by the scheduler regardless.
+# Compatibility fallback for adapters/tests that have no live server config. Real server
+# requests use configured_default_max_tokens(): an explicit --max-output-tokens value wins,
+# otherwise the model's full context is submitted and the scheduler clamps it to the exact
+# remaining context after tokenization. This matches vLLM's omitted-max-token semantics.
 DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
+
+def configured_default_max_tokens(config: Any) -> int:
+    """Resolve an omitted client budget from server config, then context length.
+
+    The scheduler owns the final prompt-aware clamp, so using ``max_seq_len`` here means
+    "generate until EOS or the remaining KV context is exhausted" without duplicating
+    tokenization in the protocol adapter.
+    """
+    configured = getattr(config, "max_output_tokens", None)
+    if configured is not None:
+        return int(configured)
+    try:
+        context_length = int(config.max_seq_len)
+    except (AttributeError, TypeError, ValueError):
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    return context_length if context_length > 0 else DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def resolve_sampling(
@@ -163,6 +181,7 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    default_max_tokens: int | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -172,14 +191,22 @@ def resolve_sampling(
 
     stop_list = [stop] if isinstance(stop, str) else list(stop or [])
     # `is not None`, not truthiness: an explicit max_tokens=0 must not read as "unset" and
-    # silently become the 32k default. The engine cannot serve a zero-token budget either
-    # (the request would never become decodable, so the client would wait forever), so a
-    # non-positive value is a client error.
-    if max_tokens is not None and max_tokens < 1:
-        raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+    # silently become a configured/context default. The engine cannot serve a zero-token
+    # budget either (the request would never become decodable, so the client would wait
+    # forever), so a non-positive value is a client error.
+    resolved_max_tokens = max_tokens
+    if resolved_max_tokens is None:
+        resolved_max_tokens = model_sampling.get("max_tokens")
+    if resolved_max_tokens is None:
+        resolved_max_tokens = default_max_tokens
+    if resolved_max_tokens is None:
+        resolved_max_tokens = DEFAULT_MAX_OUTPUT_TOKENS
+    resolved_max_tokens = int(resolved_max_tokens)
+    if resolved_max_tokens < 1:
+        raise ValueError(f"max_tokens must be at least 1, got {resolved_max_tokens}")
     return SamplingParams(
         ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+        max_tokens=resolved_max_tokens,
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
