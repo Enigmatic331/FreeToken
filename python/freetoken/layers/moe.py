@@ -25,7 +25,14 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 _EP_PACKED_PREFILL_OVERLAP = os.getenv("FREETOKEN_EP_PACKED_OVERLAP", "1") != "0"
+_EP_PACKED_WIRE_DTYPE = os.getenv("FREETOKEN_EP_PACKED_WIRE_DTYPE", "bf16").lower()
+if _EP_PACKED_WIRE_DTYPE not in {"bf16", "fp8"}:
+    raise ValueError(
+        "FREETOKEN_EP_PACKED_WIRE_DTYPE must be either 'bf16' or 'fp8', got "
+        f"{_EP_PACKED_WIRE_DTYPE!r}"
+    )
 _EP_PACKED_RECV_STREAM: torch.cuda.Stream | None = None
+_FP8_E4M3_MAX = 448.0
 
 
 def _ep_packed_recv_stream(device: torch.device) -> torch.cuda.Stream:
@@ -33,6 +40,37 @@ def _ep_packed_recv_stream(device: torch.device) -> torch.cuda.Stream:
     if _EP_PACKED_RECV_STREAM is None:
         _EP_PACKED_RECV_STREAM = torch.cuda.Stream(device=device)
     return _EP_PACKED_RECV_STREAM
+
+
+def _quantize_ep_routes(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return BF16 row scales and an E4M3 payload packed into int32 words."""
+    if packed.shape[-1] % 4 != 0:
+        raise RuntimeError("FP8 route payload must pack evenly into int32 elements")
+    scale = (
+        packed.abs()
+        .amax(dim=-1)
+        .clamp_min(1e-12)
+        .div(_FP8_E4M3_MAX)
+        .to(torch.bfloat16)
+    )
+    normalized = (packed / scale.unsqueeze(-1)).clamp(
+        -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+    )
+    return scale, normalized.to(torch.float8_e4m3fn).view(torch.int32)
+
+
+def _dequantize_ep_routes(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    hidden_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return (
+        packed.view(torch.float8_e4m3fn)
+        .view(scale.numel(), hidden_size)
+        .to(dtype)
+        .mul_(scale.unsqueeze(-1))
+    )
 
 
 class MoELayer(BaseOP):
@@ -628,20 +666,42 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         owned = local_topk_weights.ne(0).reshape(-1)
         remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
         if remote_indices.numel() == 0:
-            self._packed_prefill_pending = (remote_indices, None, None)
+            self._packed_prefill_pending = (remote_indices, None, None, None)
             return
 
-        packed = torch.empty(
-            (remote_indices.numel(), self.hidden_size),
-            dtype=route_dtype,
-            device=local_topk_weights.device,
-        )
         current = torch.cuda.current_stream(local_topk_weights.device)
         recv_stream = _ep_packed_recv_stream(local_topk_weights.device)
         recv_stream.wait_stream(current)
-        with torch.cuda.stream(recv_stream):
-            DistributedCommunicator().recv(packed, 1 - root)
-        self._packed_prefill_pending = (remote_indices, packed, recv_stream)
+        if _EP_PACKED_WIRE_DTYPE == "fp8":
+            elements = remote_indices.numel() * self.hidden_size
+            if elements % 4 != 0:
+                raise RuntimeError("FP8 route payload must pack evenly into int32 elements")
+            scale = torch.empty(
+                remote_indices.numel(),
+                dtype=torch.bfloat16,
+                device=local_topk_weights.device,
+            )
+            packed = torch.empty(
+                elements // 4,
+                dtype=torch.int32,
+                device=local_topk_weights.device,
+            )
+            with torch.cuda.stream(recv_stream):
+                # The native NCCL wrapper has no FP8/uint8 datatype mapping. Four
+                # E4M3 values are therefore carried losslessly as one int32 word.
+                communicator = DistributedCommunicator()
+                communicator.recv(scale, 1 - root)
+                communicator.recv(packed, 1 - root)
+        else:
+            scale = None
+            packed = torch.empty(
+                (remote_indices.numel(), self.hidden_size),
+                dtype=route_dtype,
+                device=local_topk_weights.device,
+            )
+            with torch.cuda.stream(recv_stream):
+                DistributedCommunicator().recv(packed, 1 - root)
+        self._packed_prefill_pending = (remote_indices, packed, scale, recv_stream)
 
     def routed_forward(
         self,
@@ -683,16 +743,28 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             owned_indices = torch.nonzero(owned, as_tuple=False).flatten()
             if owned_indices.numel() != 0:
                 packed = flat_routes.index_select(0, owned_indices).contiguous()
-                communicator.send(packed, root)
+                if _EP_PACKED_WIRE_DTYPE == "fp8":
+                    scale, quantized = _quantize_ep_routes(packed)
+                    communicator.send(scale, root)
+                    communicator.send(quantized, root)
+                else:
+                    communicator.send(packed, root)
             # The expert worker never consumes the combined result.
             return routes
 
         pending = getattr(self, "_packed_prefill_pending", None)
         self._packed_prefill_pending = None
         if pending is not None:
-            remote_indices, packed, recv_stream = pending
+            remote_indices, packed, scale, recv_stream = pending
             if packed is not None:
                 torch.cuda.current_stream(routes.device).wait_stream(recv_stream)
+                if scale is not None:
+                    packed = _dequantize_ep_routes(
+                        packed,
+                        scale,
+                        routes.shape[-1],
+                        routes.dtype,
+                    )
                 flat_routes.index_copy_(0, remote_indices, packed)
         else:
             remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()

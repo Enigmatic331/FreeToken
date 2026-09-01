@@ -6,7 +6,12 @@ import torch
 import freetoken.distributed.info as distributed_info
 import freetoken.kernel as freetoken_kernel
 from freetoken.distributed import DistributedCommunicator, DistributedInfo
-from freetoken.layers.moe import ExpertParallelOffloadMoELayer, OffloadMoELayer
+from freetoken.layers.moe import (
+    ExpertParallelOffloadMoELayer,
+    OffloadMoELayer,
+    _dequantize_ep_routes,
+    _quantize_ep_routes,
+)
 from freetoken.models.qwen3_5_moe.weight import _expert_partition
 from freetoken.models.qwen4_exp import execution
 from freetoken.models.qwen4_exp.execution import Qwen4ExpExecutionPlan
@@ -19,6 +24,22 @@ from freetoken.moe.partition import (
 
 def test_ep_offload_preserves_route_slots_through_collective():
     assert ExpertParallelOffloadMoELayer.return_route_outputs is True
+
+
+def test_ep_fp8_wire_roundtrip_is_row_scaled_and_finite():
+    routes = torch.linspace(-8, 8, 5 * 2560, dtype=torch.float32).view(5, 2560)
+    routes[0].zero_()
+    routes = routes.to(torch.bfloat16)
+
+    scale, packed = _quantize_ep_routes(routes)
+    restored = _dequantize_ep_routes(packed, scale, routes.shape[-1], routes.dtype)
+
+    assert scale.dtype == torch.bfloat16
+    assert packed.dtype == torch.int32
+    assert packed.numel() * packed.element_size() == routes.numel()
+    assert torch.isfinite(restored).all()
+    torch.testing.assert_close(restored[0], routes[0])
+    assert (restored.float() - routes.float()).square().mean().sqrt() < 0.15
 
 
 def test_ep_offload_packs_remote_prefill_routes_in_canonical_order(monkeypatch):
