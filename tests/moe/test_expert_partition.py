@@ -3,6 +3,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import freetoken.distributed.info as distributed_info
+import freetoken.kernel as freetoken_kernel
+from freetoken.distributed import DistributedInfo
 from freetoken.models.deepseek_v4.moe import (
     DSV4OffloadMoELayer,
     localize_expert_routes,
@@ -119,6 +122,55 @@ def test_cache_safe_ids_deduplicate_skipped_routes_onto_a_live_expert():
     cache_ids = DSV4OffloadMoELayer._cache_safe_route_ids(weights, local_ids)
 
     assert cache_ids.tolist() == [[56, 56, 56], [0, 0, 0]]
+
+
+def test_dsv4_packed_prefill_preserves_canonical_route_order(monkeypatch):
+    class FakeCommunicator:
+        packed = None
+
+        def send(self, tensor, dst):
+            assert dst == 0
+            self.packed = tensor.clone()
+            return tensor
+
+        def recv(self, tensor, src):
+            assert src == 1
+            tensor.copy_(self.packed)
+            return tensor
+
+    fake = FakeCommunicator()
+
+    def sum_routes(routes, output):
+        output.copy_(routes.float().sum(dim=1).to(output.dtype))
+
+    monkeypatch.setattr(freetoken_kernel, "moe_sum_reduce_triton", sum_routes)
+    layer = object.__new__(DSV4OffloadMoELayer)
+    layer.packed_prefill_root = 0
+    layer._comm = fake
+
+    full = torch.arange(48, dtype=torch.float32).view(2, 6, 4).to(torch.bfloat16)
+    root_owned = torch.tensor(
+        [[True, False, True, False, True, True], [False, True, False, True, True, False]]
+    )
+    root_routes = torch.where(root_owned.unsqueeze(-1), full, 0)
+    worker_routes = torch.where(~root_owned.unsqueeze(-1), full, 0)
+
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(1, 2))
+    assert layer._maybe_combine_packed_prefill_routes(
+        worker_routes, (~root_owned).float()
+    ) is worker_routes
+    torch.testing.assert_close(
+        fake.packed,
+        full.view(-1, 4).index_select(
+            0, torch.nonzero((~root_owned).reshape(-1), as_tuple=False).flatten()
+        ),
+    )
+
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(0, 2))
+    output = layer._maybe_combine_packed_prefill_routes(
+        root_routes, root_owned.float()
+    )
+    torch.testing.assert_close(output, full.float().sum(dim=1).to(torch.bfloat16))
 
 
 def test_offloaded_ep3_does_not_tensor_partition_expert_width(monkeypatch):

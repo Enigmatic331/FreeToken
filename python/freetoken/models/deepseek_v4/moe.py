@@ -102,6 +102,64 @@ class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
         # copies each BF16 route contribution without first changing its
         # association. The reducer below then reproduces TP1's top-k order.
         self.return_route_outputs = partition.world_size > 1
+        self.packed_prefill_root: int | None = None
+
+    def routed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        if get_global_ctx().batch.is_prefill:
+            routes = self._prefill_routed(hidden_states, topk_weights, topk_ids)
+            return self._maybe_combine_packed_prefill_routes(routes, topk_weights)
+        routes = self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._maybe_all_reduce(routes)
+
+    def _maybe_combine_packed_prefill_routes(
+        self,
+        routes: torch.Tensor,
+        local_topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        root = self.packed_prefill_root
+        if root is None:
+            return self._maybe_all_reduce(routes)
+
+        from freetoken.distributed import get_tp_info
+
+        info = get_tp_info()
+        if info.size != 2:
+            raise RuntimeError("packed DSV4 prefill routes require exactly two EP ranks")
+        if routes.ndim != 3:
+            raise RuntimeError(f"expected per-route outputs, got {tuple(routes.shape)}")
+        if routes.shape[:2] != local_topk_weights.shape:
+            raise RuntimeError(
+                "route output and weight shapes disagree: "
+                f"{tuple(routes.shape[:2])} != {tuple(local_topk_weights.shape)}"
+            )
+
+        flat_routes = routes.view(-1, routes.shape[-1])
+        owned = local_topk_weights.ne(0).reshape(-1)
+        if info.rank != root:
+            owned_indices = torch.nonzero(owned, as_tuple=False).flatten()
+            if owned_indices.numel() != 0:
+                packed = flat_routes.index_select(0, owned_indices).contiguous()
+                self._comm.send(packed, root)
+            return routes
+
+        remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
+        if remote_indices.numel() != 0:
+            packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
+            self._comm.recv(packed, 1 - root)
+            flat_routes.index_copy_(0, remote_indices, packed)
+
+        from freetoken.kernel import moe_sum_reduce_triton
+
+        output = routes.new_empty((routes.shape[0], routes.shape[-1]))
+        moe_sum_reduce_triton(routes, output)
+        return output
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 3:
@@ -171,6 +229,8 @@ class MoE(nn.Module):
             else Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
         )
         self.experts = DSV4OffloadMoELayer(layer_id, args)
+        if self.execution.enabled:
+            self.experts.packed_prefill_root = self.execution.backbone_rank
         self.partition = ep_partition(args.n_routed_experts)
         self.ep_active = self.partition.world_size > 1
 
@@ -218,9 +278,9 @@ class MoE(nn.Module):
     ) -> None:
         """Receive one layer's normalized MoE input and contribute local experts.
 
-        The routed-expert all-reduce inside ``routed_forward`` is deliberately
-        retained: the authority consumes the reconstructed routed output while
-        workers discard it and wait for the next layer's broadcast.
+        Decode retains the fixed-shape exact all-reduce for CUDA-graph safety.
+        Prefill instead sends only this worker's owned route rows to the authority;
+        the worker discards its local return value in either case.
         """
         if not self.execution.is_expert_worker:
             raise RuntimeError("worker_forward is valid only on expert-worker ranks")
