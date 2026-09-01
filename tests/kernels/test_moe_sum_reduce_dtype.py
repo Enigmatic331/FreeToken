@@ -3,6 +3,35 @@ import torch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_moe_align_can_exclude_ep_sentinel_routes():
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
+
+    # Expert ids 0 and 1 are local; id 2 is EP's non-local sentinel.
+    topk_ids = torch.tensor(
+        [[0, 2, 1], [2, 2, 0]], device="cuda", dtype=torch.int32
+    )
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        topk_ids,
+        block_size=4,
+        num_experts=2,
+        include_sentinel=False,
+    )
+    torch.cuda.synchronize()
+
+    num_padded = int(num_tokens_post_pad.item())
+    assert num_padded == 8
+    assert expert_ids[: num_padded // 4].tolist() == [0, 1]
+
+    sentinel = topk_ids.numel()
+    valid_route_ids = [
+        route_id
+        for route_id in sorted_ids[:num_padded].tolist()
+        if route_id != sentinel
+    ]
+    assert sorted(valid_route_ids) == [0, 2, 5]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_moe_sum_reduce_preserves_fp32_output():
     from freetoken.kernel import moe_sum_reduce_triton
 

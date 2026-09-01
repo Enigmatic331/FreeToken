@@ -225,7 +225,7 @@ def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num
 def fused_experts_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
     topk_weights, topk_ids, num_experts, activation="silu", output_dtype=None,
-    return_route_outputs=False,
+    return_route_outputs=False, skip_inactive_routes=False,
 ) -> torch.Tensor:
     """Prefill inline-dequant block-fp8 MoE. ``topk_ids`` index expert rows in [0, num_experts)
     (materialized layer: position == expert id)."""
@@ -243,14 +243,35 @@ def fused_experts_fp8_blockscale(
     cfg = dict(BLOCK_SIZE_M=64 if M > 64 else 16, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128,
                GROUP_SIZE_M=8, num_warps=8 if M > 64 else 4, num_stages=3)
 
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    if skip_inactive_routes:
+        # EP localization uses ``num_experts`` as the sentinel for a route owned
+        # by another rank.  The generic sorter deliberately materializes a
+        # sentinel bin; the EP fast path excludes that bin entirely so each rank
+        # computes only its owned routes.
+        from freetoken.kernel.triton.moe_align import (
+            moe_align_block_size as triton_moe_align_block_size,
+        )
+
+        sorted_ids, expert_ids, ntpp = triton_moe_align_block_size(
+            topk_ids,
+            cfg["BLOCK_SIZE_M"],
+            num_experts,
+            include_sentinel=False,
+        )
+    else:
+        sorted_ids, expert_ids, ntpp = moe_align_block_size(
+            topk_ids, cfg["BLOCK_SIZE_M"], num_experts
+        )
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
     # W8A8: quantize the activation to fp8 per-128-K group before each grouped GEMM so the
     # kernel runs on fp8 tensor cores (compute-bound prefill); both block scales applied in-loop.
     a1_fp8, a1_scale = per_token_group_quant_fp8(hidden_states, 128)
-    ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
+    # The activation kernel still traverses the fixed route tensor.  Clear the
+    # slots omitted from GEMM1 so they remain benign until GEMM2 drops them too.
+    allocate_ic1 = torch.zeros if skip_inactive_routes else torch.empty
+    ic1 = allocate_ic1((M, top_k, two_i), device=dev, dtype=dt)
     _prefill_gemm(a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw, sorted_ids, expert_ids, ntpp,
                   num_valid, top_k, False, cfg)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)

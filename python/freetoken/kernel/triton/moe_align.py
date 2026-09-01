@@ -217,18 +217,23 @@ def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
+    *,
+    include_sentinel: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert topk_ids.dtype == torch.int32
     assert topk_ids.is_contiguous()
     device = topk_ids.device
     numel = topk_ids.numel()
-    effective_E = num_experts + 1  # mirrors fused.py's num_experts+1 convention
+    # Generic fused MoE retains one bin for invalid/padding routes.  Exact EP can
+    # omit that bin: its non-local sentinel is ``num_experts`` and therefore
+    # fails the ``e < effective_E`` test below.
+    effective_E = num_experts + int(include_sentinel)
 
     # Buffer sizes mirror freetoken.moe.fused.moe_align_block_size exactly.
-    if numel < num_experts + 1:
+    if numel < effective_E:
         max_num_tokens_padded = numel * block_size
     else:
-        max_num_tokens_padded = numel + (num_experts + 1) * (block_size - 1)
+        max_num_tokens_padded = numel + effective_E * (block_size - 1)
     max_num_m_blocks = _div_ceil(max_num_tokens_padded, block_size)
 
     sorted_token_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
