@@ -18,6 +18,7 @@ def fused_experts_fp8_block(
     topk_weights, topk_ids, num_experts, activation="silu",
     apply_router_weight_on_input=False, output_dtype=None,
     return_route_outputs=False, skip_inactive_routes=False,
+    compact_inactive_routes=False,
 ):
     """Prefill: W8A8 fused grouped GEMM over the materialized-layer banks
     (``[num_experts, ...]``, position == expert id)."""
@@ -27,7 +28,7 @@ def fused_experts_fp8_block(
     return fused_experts_fp8_blockscale(
         hidden_states, gate_up, gate_up_scale, down, down_scale,
         topk_weights, topk_ids, num_experts, activation, output_dtype,
-        return_route_outputs, skip_inactive_routes,
+        return_route_outputs, skip_inactive_routes, compact_inactive_routes,
     )
 
 

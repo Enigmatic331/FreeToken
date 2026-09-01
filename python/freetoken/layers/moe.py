@@ -28,6 +28,9 @@ _EP_PACKED_PREFILL_OVERLAP = os.getenv("FREETOKEN_EP_PACKED_OVERLAP", "1") != "0
 _EP_SKIP_INACTIVE_PREFILL_ROUTES = (
     os.getenv("FREETOKEN_EP_SKIP_INACTIVE_PREFILL_ROUTES", "0") != "0"
 )
+_EP_COMPACT_INACTIVE_PREFILL_ROUTES = (
+    os.getenv("FREETOKEN_EP_COMPACT_INACTIVE_PREFILL_ROUTES", "0") != "0"
+)
 _EP_PACKED_WIRE_DTYPE = os.getenv("FREETOKEN_EP_PACKED_WIRE_DTYPE", "bf16").lower()
 if _EP_PACKED_WIRE_DTYPE not in {"bf16", "fp8"}:
     raise ValueError(
@@ -572,6 +575,9 @@ class OffloadMoELayer(MoELayer):
                     skip_inactive_routes=getattr(
                         self, "skip_inactive_prefill_routes", False
                     ),
+                    compact_inactive_routes=getattr(
+                        self, "compact_inactive_prefill_routes", False
+                    ),
                 )
             return fused_experts_decode_fp8_block(
                 hidden_states, gate_up, gate_up_scale, down, down_scale,
@@ -650,6 +656,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     # greedy decision near a logit boundary.
     return_route_outputs = True
     skip_inactive_prefill_routes = _EP_SKIP_INACTIVE_PREFILL_ROUTES
+    compact_inactive_prefill_routes = _EP_COMPACT_INACTIVE_PREFILL_ROUTES
 
     def prepare_packed_prefill_receive(
         self,

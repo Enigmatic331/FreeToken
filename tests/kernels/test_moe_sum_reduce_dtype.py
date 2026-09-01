@@ -133,3 +133,84 @@ def test_fp8_moe_can_return_unrounded_fp32_partial(is_prefill):
 
     moe_sum_reduce_triton(route_outputs, reconstructed)
     assert torch.equal(reconstructed, bf16_output)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp8_prefill_compact_ep_routes_match_owned_outputs():
+    from freetoken.kernel.triton.fp8_block_linear import FP8
+    from freetoken.kernel.triton.fp8_blockscale_moe import (
+        fused_experts_fp8_blockscale,
+    )
+
+    torch.manual_seed(29)
+    tokens, experts, hidden_size, intermediate_size, top_k = 17, 4, 256, 128, 4
+    gate_up = torch.randn(
+        experts, 2 * intermediate_size, hidden_size, device="cuda"
+    ).to(FP8)
+    gate_up_scale = (
+        torch.rand(
+            experts,
+            2 * intermediate_size // 128,
+            hidden_size // 128,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        + 0.5
+    )
+    down = torch.randn(
+        experts, hidden_size, intermediate_size, device="cuda"
+    ).to(FP8)
+    down_scale = (
+        torch.rand(
+            experts,
+            hidden_size // 128,
+            intermediate_size // 128,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        + 0.5
+    )
+    hidden = torch.randn(
+        tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    route_ids = torch.randint(
+        0, experts + 1, (tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    route_ids[0] = torch.tensor([0, experts, 1, experts], device="cuda")
+    owned = route_ids < experts
+    route_weights = torch.rand(
+        tokens, top_k, device="cuda", dtype=torch.float32
+    )
+    route_weights.masked_fill_(~owned, 0.0)
+    safe_ids = route_ids.masked_fill(~owned, 0)
+
+    reference = fused_experts_fp8_blockscale(
+        hidden,
+        gate_up,
+        gate_up_scale,
+        down,
+        down_scale,
+        route_weights,
+        safe_ids,
+        experts,
+        return_route_outputs=True,
+    )
+    compact = fused_experts_fp8_blockscale(
+        hidden,
+        gate_up,
+        gate_up_scale,
+        down,
+        down_scale,
+        route_weights,
+        route_ids,
+        experts,
+        return_route_outputs=True,
+        skip_inactive_routes=True,
+        compact_inactive_routes=True,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        compact.reshape(-1, hidden_size)[owned.reshape(-1)],
+        reference.reshape(-1, hidden_size)[owned.reshape(-1)],
+    )

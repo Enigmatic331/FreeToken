@@ -15,7 +15,13 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native_cx, e4m3_u8_to_f32
+from freetoken.kernel.triton.e4m3_compat import (
+    e4m3_act_dtype,
+    e4m3_kernel_view,
+    e4m3_native_cx,
+    e4m3_u8_to_f32,
+    round_e4m3,
+)
 
 _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
@@ -149,6 +155,7 @@ def _prefill_fp8_moe_kernel(
     stride_tw,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr, top_k: tl.constexpr,
+    A_ROW_IS_SORTED: tl.constexpr, C_ROW_IS_SORTED: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     """W8A8: ``a`` is fp8 (per-128-K-group act scale ``a_scale``), ``w`` fp8 (per-128x128
@@ -172,7 +179,7 @@ def _prefill_fp8_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_rows = offs_token // top_k
+    a_rows = offs_token_id if A_ROW_IS_SORTED else offs_token // top_k
     a_ptrs = a_ptr + (a_rows[:, None] * stride_am + offs_k[None, :] * stride_ak)
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     w_base = w_ptr + slot * stride_we + offs_bn[None, :] * stride_wn
@@ -200,12 +207,14 @@ def _prefill_fp8_moe_kernel(
         acc = acc * mw[:, None]
     acc = acc.to(compute_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_rows = offs_token_id if C_ROW_IS_SORTED else offs_token
+    c_ptrs = c_ptr + stride_cm * c_rows[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, acc, mask=token_mask[:, None] & (offs_cn[None, :] < N))
 
 
 def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num_valid,
-                  kernel_top_k, mul_routed_weight, cfg):
+                  kernel_top_k, mul_routed_weight, cfg, *, a_row_is_sorted=False,
+                  c_row_is_sorted=False):
     N, K = w.shape[1], w.shape[2]
     EM = sorted_ids.shape[0]
     w = e4m3_kernel_view(w)
@@ -216,16 +225,118 @@ def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num
         w.stride(0), w.stride(1), w.stride(2),
         s.stride(0), s.stride(1), s.stride(2),
         a_scale.stride(0), a_scale.stride(1),
-        c.stride(1), c.stride(2), tw.stride(0),
+        c.stride(-2), c.stride(-1), tw.stride(0),
         MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=kernel_top_k,
+        A_ROW_IS_SORTED=a_row_is_sorted, C_ROW_IS_SORTED=c_row_is_sorted,
         compute_type=_TL.get(c.dtype, tl.bfloat16), **cfg,
     )
+
+
+@triton.jit
+def _sorted_silu_quant_kernel(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    sorted_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_valid_routes,
+    d,
+    stride_xm,
+    stride_xk,
+    stride_ym,
+    stride_yk,
+    stride_sm,
+    stride_sk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """SwiGLU + BF16 rounding + FP8 quant for valid expert-sorted EP routes."""
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    in_schedule = rows < num_tokens_post_padded
+    route_ids = tl.load(
+        sorted_ids_ptr + rows,
+        mask=in_schedule,
+        other=num_valid_routes,
+    )
+    valid = in_schedule & (route_ids < num_valid_routes)
+    mask = valid[:, None] & (cols[None, :] < d)
+
+    x_row = x_ptr + rows[:, None] * stride_xm
+    gate = tl.load(x_row + cols[None, :] * stride_xk, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    up = tl.load(
+        x_row + (d + cols[None, :]) * stride_xk,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    # Match the accepted activation path's approximate sigmoid, then preserve
+    # its BF16 store before dynamically quantizing the second GEMM input.
+    activated = (gate / (1.0 + tl.exp2(-gate * 1.4426950408889634))) * up
+    activated = activated.to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(activated), axis=1), 1e-10)
+    scale = amax / 448.0
+    quantized = tl.clamp(activated / scale[:, None], -448.0, 448.0)
+    if e4m3_native_cx():
+        quantized = quantized.to(tl.float8e4nv)
+    else:
+        quantized = round_e4m3(quantized)
+
+    tl.store(
+        y_ptr + rows[:, None] * stride_ym + cols[None, :] * stride_yk,
+        quantized,
+        mask=mask,
+    )
+    tl.store(
+        scale_ptr + rows * stride_sm + pid_k * stride_sk,
+        scale,
+        mask=valid,
+    )
+
+
+def _silu_and_quant_sorted_routes(ic1, sorted_ids, ntpp, num_valid_routes):
+    rows, two_i = ic1.shape
+    inter = two_i // 2
+    assert inter % 128 == 0
+    output = torch.empty(
+        (rows, inter), dtype=e4m3_act_dtype(), device=ic1.device
+    )
+    scales = torch.empty(
+        (rows, inter // 128), dtype=torch.float32, device=ic1.device
+    )
+    block_m = 32
+    grid = (triton.cdiv(rows, block_m), inter // 128)
+    _sorted_silu_quant_kernel[grid](
+        ic1,
+        output,
+        scales,
+        sorted_ids,
+        ntpp,
+        num_valid_routes,
+        inter,
+        ic1.stride(0),
+        ic1.stride(1),
+        output.stride(0),
+        output.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_K=128,
+        num_warps=4,
+        num_stages=3,
+    )
+    return output, scales
 
 
 def fused_experts_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
     topk_weights, topk_ids, num_experts, activation="silu", output_dtype=None,
     return_route_outputs=False, skip_inactive_routes=False,
+    compact_inactive_routes=False,
 ) -> torch.Tensor:
     """Prefill inline-dequant block-fp8 MoE. ``topk_ids`` index expert rows in [0, num_experts)
     (materialized layer: position == expert id)."""
@@ -270,16 +381,38 @@ def fused_experts_fp8_blockscale(
     a1_fp8, a1_scale = per_token_group_quant_fp8(hidden_states, 128)
     # The activation kernel still traverses the fixed route tensor.  Clear the
     # slots omitted from GEMM1 so they remain benign until GEMM2 drops them too.
-    allocate_ic1 = torch.zeros if skip_inactive_routes else torch.empty
-    ic1 = allocate_ic1((M, top_k, two_i), device=dev, dtype=dt)
-    _prefill_gemm(a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw, sorted_ids, expert_ids, ntpp,
-                  num_valid, top_k, False, cfg)
-    ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    silu_and_mul(ic1.view(-1, two_i), ic2)
-    a2_fp8, a2_scale = per_token_group_quant_fp8(ic2, 128)
+    if compact_inactive_routes:
+        if not skip_inactive_routes:
+            raise ValueError("compact_inactive_routes requires skip_inactive_routes")
+        # Keep the expert-sorted padded schedule between GEMMs.  Only valid local
+        # routes run SwiGLU/quantization; GEMM2 scatters them back to canonical
+        # top-k slots for the unchanged exact packed-route combine.
+        schedule_rows = sorted_ids.shape[0]
+        ic1 = torch.empty((schedule_rows, two_i), device=dev, dtype=dt)
+        _prefill_gemm(
+            a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw,
+            sorted_ids, expert_ids, ntpp, num_valid, top_k, False, cfg,
+            c_row_is_sorted=True,
+        )
+        a2_fp8, a2_scale = _silu_and_quant_sorted_routes(
+            ic1, sorted_ids, ntpp, num_valid
+        )
+    else:
+        allocate_ic1 = torch.zeros if skip_inactive_routes else torch.empty
+        ic1 = allocate_ic1((M, top_k, two_i), device=dev, dtype=dt)
+        _prefill_gemm(
+            a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw,
+            sorted_ids, expert_ids, ntpp, num_valid, top_k, False, cfg,
+        )
+        ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
+        silu_and_mul(ic1.view(-1, two_i), ic2)
+        a2_fp8, a2_scale = per_token_group_quant_fp8(ic2, 128)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
-    _prefill_gemm(a2_fp8, a2_scale, down, down_scale, ic3, tw, sorted_ids, expert_ids, ntpp,
-                  num_valid, 1, True, cfg)
+    _prefill_gemm(
+        a2_fp8, a2_scale, down, down_scale, ic3, tw,
+        sorted_ids, expert_ids, ntpp, num_valid, 1, True, cfg,
+        a_row_is_sorted=compact_inactive_routes,
+    )
     if return_route_outputs:
         return ic3
     out = torch.empty(
