@@ -131,6 +131,53 @@ def test_sparse_chunk_falls_back_to_gemv():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("is_grouped_prefill", [False, True])
+def test_route_outputs_reconstruct_tp1_sum_in_strict_topk_order(is_grouped_prefill):
+    import freetoken.moe.fused_ds_fp4 as fmod
+    from freetoken.kernel import moe_sum_reduce_triton
+
+    device = "cuda"
+    gup, gus, dp, ds = _banks(device)
+    tokens = 256 if is_grouped_prefill else 43
+    x, slots, w = _routing(tokens, device)
+    if is_grouped_prefill:
+        expected = fmod.routed_experts_fp4_prefill(
+            x, slots.clone(), w, gup, gus, dp, ds, LIMIT, E
+        )
+        routes = fmod.routed_experts_fp4_prefill(
+            x,
+            slots.clone(),
+            w,
+            gup,
+            gus,
+            dp,
+            ds,
+            LIMIT,
+            E,
+            return_route_outputs=True,
+        )
+    else:
+        expected = fmod.routed_experts_fp4(
+            x, slots.clone(), w, gup, gus, dp, ds, LIMIT
+        )
+        routes = fmod.routed_experts_fp4(
+            x,
+            slots.clone(),
+            w,
+            gup,
+            gus,
+            dp,
+            ds,
+            LIMIT,
+            return_route_outputs=True,
+        )
+    assert routes.shape == (tokens, TOP_K, H)
+    reconstructed = torch.empty_like(expected)
+    moe_sum_reduce_triton(routes, reconstructed)
+    assert torch.equal(reconstructed, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_grouped_prefill_ignores_one_past_end_ep_routes():
     import freetoken.moe.fused_ds_fp4 as fmod
 

@@ -97,6 +97,28 @@ class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
             activation="silu",
         )
         self.swiglu_limit = args.swiglu_limit
+        # EP must preserve canonical route slots through communication. Every
+        # route has exactly one owner, so summing the zero-filled route tensor
+        # copies each BF16 route contribution without first changing its
+        # association. The reducer below then reproduces TP1's top-k order.
+        self.return_route_outputs = partition.world_size > 1
+
+    def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.ndim != 3:
+            return super()._maybe_all_reduce(hidden_states)
+        if self.tp_size > 1:
+            hidden_states = self._comm.all_reduce(hidden_states)
+
+        from freetoken.kernel import moe_sum_reduce_triton
+
+        num_tokens, _, hidden_dim = hidden_states.shape
+        output = torch.empty(
+            (num_tokens, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        moe_sum_reduce_triton(hidden_states, output)
+        return output
 
     def _prefill_routed(
         self,
