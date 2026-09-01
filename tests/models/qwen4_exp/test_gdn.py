@@ -161,6 +161,25 @@ def test_chunk_and_recurrent_rules_agree():
     )
 
 
+def test_single_sequence_prefill_tiling_is_bit_exact(monkeypatch):
+    """An aligned tile boundary carries the kernel's recurrent state without changing output."""
+    op, _ = _make_layer(3, seed=23)
+    monkeypatch.delenv("FREETOKEN_GDN_PREFILL_TILE_TOKENS", raising=False)
+    untiled_ctx = _ctx(3)
+    _, untiled_reqs, untiled = _prefill(op, untiled_ctx, [128], seed=29)
+    torch.manual_seed(31)
+    next_hidden = torch.randn(1, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    untiled_decode = _decode(op, untiled_ctx, untiled_reqs, next_hidden)
+
+    monkeypatch.setenv("FREETOKEN_GDN_PREFILL_TILE_TOKENS", "64")
+    tiled_ctx = _ctx(3)
+    _, tiled_reqs, tiled = _prefill(op, tiled_ctx, [128], seed=29)
+    tiled_decode = _decode(op, tiled_ctx, tiled_reqs, next_hidden)
+
+    torch.testing.assert_close(tiled, untiled, rtol=0, atol=0)
+    torch.testing.assert_close(tiled_decode, untiled_decode, rtol=0, atol=0)
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

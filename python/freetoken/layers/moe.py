@@ -31,6 +31,9 @@ _EP_SKIP_INACTIVE_PREFILL_ROUTES = (
 _EP_COMPACT_INACTIVE_PREFILL_ROUTES = (
     os.getenv("FREETOKEN_EP_COMPACT_INACTIVE_PREFILL_ROUTES", "0") != "0"
 )
+_EP_PREFILL_ROUTE_TILE_TOKENS = int(
+    os.getenv("FREETOKEN_EP_PREFILL_ROUTE_TILE_TOKENS", "0")
+)
 _EP_PACKED_WIRE_DTYPE = os.getenv("FREETOKEN_EP_PACKED_WIRE_DTYPE", "bf16").lower()
 if _EP_PACKED_WIRE_DTYPE not in {"bf16", "fp8"}:
     raise ValueError(
@@ -677,6 +680,12 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         if getattr(self, "_packed_prefill_pending", None) is not None:
             raise RuntimeError("packed prefill receive already pending")
 
+        # Post the first bounded tile before root shared-expert compute so the
+        # worker can overlap its first routed-expert tile exactly as before.
+        route_tile = self._prefill_route_tile_tokens(local_topk_weights.shape[0])
+        if route_tile:
+            local_topk_weights = local_topk_weights[:route_tile]
+
         owned = local_topk_weights.ne(0).reshape(-1)
         remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
         if remote_indices.numel() == 0:
@@ -725,6 +734,11 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     ) -> torch.Tensor:
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
+            route_tile = self._prefill_route_tile_tokens(hidden_states.shape[0])
+            if route_tile:
+                return self._prefill_routed_tiled(
+                    hidden_states, topk_weights, topk_ids, route_tile
+                )
             routes = self._prefill_routed(hidden_states, topk_weights, topk_ids)
             return self._maybe_combine_packed_prefill_routes(routes, topk_weights)
         routes = self._decode_routed(hidden_states, topk_weights, topk_ids)
@@ -792,6 +806,79 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         output = routes.new_empty((routes.shape[0], routes.shape[-1]))
         moe_sum_reduce_triton(routes, output)
         return output
+
+    @staticmethod
+    def _prefill_route_tile_tokens(num_tokens: int) -> int:
+        if _EP_PREFILL_ROUTE_TILE_TOKENS <= 0 or num_tokens <= _EP_PREFILL_ROUTE_TILE_TOKENS:
+            return 0
+        return _EP_PREFILL_ROUTE_TILE_TOKENS
+
+    def _prefill_routed_tiled(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        tile_tokens: int,
+    ) -> torch.Tensor:
+        """Bound exact EP route buffers while streaming each expert layer only once.
+
+        Every token's ten route outputs and strict FP32 reducer remain unchanged;
+        only independent token rows are processed in smaller batches. The current
+        layer's FP8 banks stay resident across all tiles, preserving the main 32K
+        chunk benefit without allocating [32K, top_k, hidden] at once.
+        """
+        cache = self.offload_cache
+        assert cache is not None
+        if cache.prefill_overlap:
+            views = self._wait_prefill_overlap(cache)
+        else:
+            cache.materialize_layer(self.layer_id)
+            cache.copy_missing()
+            views = cache.bank_views(self.num_experts)
+
+        info = get_tp_info()
+        root = getattr(self, "packed_prefill_root", None)
+        is_root = root is not None and info.rank == root
+        output = (
+            hidden_states.new_empty((hidden_states.shape[0], hidden_states.shape[1]))
+            if is_root
+            else None
+        )
+        last = None
+        skip_inactive = self.skip_inactive_prefill_routes and root is not None
+        for start in range(0, hidden_states.shape[0], tile_tokens):
+            end = min(start + tile_tokens, hidden_states.shape[0])
+            tile_hidden = hidden_states[start:end]
+            tile_weights = topk_weights[start:end]
+            tile_ids = topk_ids[start:end]
+            if is_root and getattr(self, "_packed_prefill_pending", None) is None:
+                self.prepare_packed_prefill_receive(tile_weights, hidden_states.dtype)
+            route_ids = (
+                tile_ids
+                if skip_inactive
+                else self._cache_safe_route_ids(tile_weights, tile_ids)
+            )
+            routes = self._expert_gemm(
+                cache,
+                tile_hidden,
+                tile_weights,
+                route_ids,
+                views=views,
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+            combined = self._maybe_combine_packed_prefill_routes(routes, tile_weights)
+            if output is not None:
+                output[start:end].copy_(combined)
+            last = combined
+
+        if cache.prefill_overlap:
+            cache.release_prefill_layer(self.layer_id)
+        if output is not None:
+            return output
+        assert last is not None
+        return last
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Qwen's layers are constructed under a TP1 view so its backbone remains

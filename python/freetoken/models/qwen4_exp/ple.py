@@ -682,7 +682,18 @@ class PLELayer(BaseOP):
         states.index_copy_(
             0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
         )
-        return F.silu(out.index_select(1, out_index).transpose(0, 1))
+        # With one packed request there are no inter-request state gaps in the
+        # convolution output: every column is already a requested token. Avoid
+        # an identity ``index_select`` that would duplicate the full 640 MiB
+        # [32K, width] result on Qwen3.8-Flash-Next.
+        selected = (
+            out.transpose(0, 1)
+            if num_reqs == 1
+            else out.index_select(1, out_index).transpose(0, 1)
+        )
+        # ``out`` (single request) or ``index_select`` (packed requests) owns
+        # this temporary, so the activation may safely reuse it.
+        return F.silu(selected, inplace=True)
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
         """Columns of the packed history: this forward's outputs, the state block, the next state block."""

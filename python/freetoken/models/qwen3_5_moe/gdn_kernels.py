@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -30,13 +32,50 @@ def gdn_prefill_chunk_fla(
     transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path."""
     from freetoken.kernel.fla import chunk_gated_delta_rule
 
-    o, _, h = chunk_gated_delta_rule(
-        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-        initial_state=state_source, initial_state_indices=indices.to(torch.int32),
-        cu_seqlens=cu_seqlens.to(torch.int64), head_first=False,
-        use_qk_l2norm_in_kernel=True,
-    )
+    def run(
+        q_tile: torch.Tensor,
+        k_tile: torch.Tensor,
+        v_tile: torch.Tensor,
+        g_tile: torch.Tensor,
+        beta_tile: torch.Tensor,
+        tile_cu_seqlens: torch.Tensor,
+    ):
+        return chunk_gated_delta_rule(
+            q=q_tile, k=k_tile, v=v_tile, g=g_tile, beta=beta_tile, scale=scale,
+            initial_state=state_source, initial_state_indices=indices.to(torch.int32),
+            cu_seqlens=tile_cu_seqlens.to(torch.int64), head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    tile_tokens = int(os.getenv("FREETOKEN_GDN_PREFILL_TILE_TOKENS", "0"))
+    total = q.shape[1]
+    # The server runs one request at a time. For that single packed sequence, the
+    # FLA kernel's in-place final-state writeback is exactly the initial state for
+    # the next 64-token-aligned tile. This bounds h=[B, NT, H, V, K] without
+    # changing the recurrence. Keep ragged/multi-sequence batches on the existing
+    # path until their per-sequence tiling metadata is implemented.
+    tiled = tile_tokens > 0 and total > tile_tokens and cu_seqlens.numel() == 2
+    if tiled:
+        if tile_tokens % 64 != 0:
+            raise ValueError("FREETOKEN_GDN_PREFILL_TILE_TOKENS must be a multiple of 64")
+        outputs = []
+        states = [] if return_h else None
+        for start in range(0, total, tile_tokens):
+            end = min(start + tile_tokens, total)
+            tile_cu_seqlens = cu_seqlens.new_tensor((0, end - start))
+            o_tile, _, h_tile = run(
+                q[:, start:end], k[:, start:end], v[:, start:end],
+                g[:, start:end], beta[:, start:end], tile_cu_seqlens,
+            )
+            outputs.append(o_tile)
+            if states is not None:
+                states.append(h_tile)
+        o = torch.cat(outputs, dim=1)
+        h = torch.cat(states, dim=1) if states is not None else None
+    else:
+        o, _, h = run(q, k, v, g, beta, cu_seqlens)
     if return_h:
+        assert h is not None
         return o[0], h  # h: [1, NT_total, num_v_heads, head_v_dim, head_k_dim]
     return o[0]  # [total, num_v_heads, head_v_dim]
 

@@ -300,6 +300,25 @@ def test_prefill_conv_matches_reference():
     assert torch.allclose(got_states, ref_states, rtol=1e-5, atol=1e-6)
 
 
+def test_single_request_prefill_conv_matches_reference():
+    """The allocation-free single-request selection remains identical to the reference."""
+    torch.manual_seed(121)
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config)
+    sequence = [3, 4, EOS, 5, 6, 8, 9, 2, 4, 5, 6]
+    meta = _meta([sequence], [[EOS, EOS]])
+    x = torch.randn(len(sequence), args.ple_state_width)
+    states = torch.randn(1, args.ple_state_width, args.ple_conv_state_len) * 0.1
+
+    got_states = states.clone()
+    got = layer._short_conv(x, meta, got_states)
+    ref_states = states.clone()
+    ref = short_conv_reference(x, meta, ref_states, layer.conv1d.weight, args.ple_conv_dilation)
+    assert torch.allclose(got, ref, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(got_states, ref_states, rtol=1e-5, atol=1e-6)
+
+
 def test_fresh_slots_read_a_zero_state():
     """A request marked fresh ignores whatever the pool slot still holds."""
     torch.manual_seed(13)
