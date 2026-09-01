@@ -159,6 +159,44 @@ public:
         /*sendcount=*/size_dim,
         /*datatype=*/dtype,
         /*comm=*/m_comm.get(),
+          /*stream=*/stream));
+  }
+
+  auto send(tvm::ffi::TensorView t, int peer) const -> void {
+    using namespace host;
+    RuntimeCheck(t.device().device_type == kDLCUDA,
+                 "Tensor must be on CUDA device");
+    RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
+    RuntimeCheck(peer >= 0 && peer < m_world_size && peer != m_rank,
+                 "Invalid send peer");
+    const auto size_dim = static_cast<size_t>(t.shape().Product());
+    const auto dtype = kNCCLDtypeMap.at(t.dtype());
+    const auto stream = LaunchKernel::resolve_device(t.device());
+    NCCL_CHECK(::ncclSend(
+        /*sendbuff=*/t.data_ptr(),
+        /*count=*/size_dim,
+        /*datatype=*/dtype,
+        /*peer=*/peer,
+        /*comm=*/m_comm.get(),
+        /*stream=*/stream));
+  }
+
+  auto recv(tvm::ffi::TensorView t, int peer) const -> void {
+    using namespace host;
+    RuntimeCheck(t.device().device_type == kDLCUDA,
+                 "Tensor must be on CUDA device");
+    RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
+    RuntimeCheck(peer >= 0 && peer < m_world_size && peer != m_rank,
+                 "Invalid recv peer");
+    const auto size_dim = static_cast<size_t>(t.shape().Product());
+    const auto dtype = kNCCLDtypeMap.at(t.dtype());
+    const auto stream = LaunchKernel::resolve_device(t.device());
+    NCCL_CHECK(::ncclRecv(
+        /*recvbuff=*/t.data_ptr(),
+        /*count=*/size_dim,
+        /*datatype=*/dtype,
+        /*peer=*/peer,
+        /*comm=*/m_comm.get(),
         /*stream=*/stream));
   }
 
@@ -182,6 +220,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def(refl::init<int, int, size_t, NCCLIDList>(), "__init__")
       .def("all_reduce", &NCCLWrapper::all_reduce)
       .def("all_gather", &NCCLWrapper::all_gather)
+      .def("send", &NCCLWrapper::send)
+      .def("recv", &NCCLWrapper::recv)
       .def("get_buffer", &NCCLWrapper::get_buffer);
 }
 

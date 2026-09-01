@@ -23,6 +23,12 @@ class DistributedImpl(ABC):
     @abstractmethod
     def broadcast(self, x: torch.Tensor, src: int) -> torch.Tensor: ...
 
+    @abstractmethod
+    def send(self, x: torch.Tensor, dst: int) -> torch.Tensor: ...
+
+    @abstractmethod
+    def recv(self, x: torch.Tensor, src: int) -> torch.Tensor: ...
+
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
@@ -46,6 +52,14 @@ class TorchDistributedImpl(DistributedImpl):
     def broadcast(self, x: torch.Tensor, src: int) -> torch.Tensor:
         if dist.get_world_size() > 1:
             dist.broadcast(x, src=src)
+        return x
+
+    def send(self, x: torch.Tensor, dst: int) -> torch.Tensor:
+        dist.send(x, dst=dst)
+        return x
+
+    def recv(self, x: torch.Tensor, src: int) -> torch.Tensor:
+        dist.recv(x, src=src)
         return x
 
 
@@ -76,6 +90,14 @@ class PyNCCLDistributedImpl(DistributedImpl):
         self.comm.all_reduce(x, "sum")
         return x
 
+    def send(self, x: torch.Tensor, dst: int) -> torch.Tensor:
+        self.comm.send(x, dst)
+        return x
+
+    def recv(self, x: torch.Tensor, src: int) -> torch.Tensor:
+        self.comm.recv(x, src)
+        return x
+
 
 class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
@@ -88,6 +110,12 @@ class DistributedCommunicator:
 
     def broadcast(self, x: torch.Tensor, src: int) -> torch.Tensor:
         return self.plugins[-1].broadcast(x, src)
+
+    def send(self, x: torch.Tensor, dst: int) -> torch.Tensor:
+        return self.plugins[-1].send(x, dst)
+
+    def recv(self, x: torch.Tensor, src: int) -> torch.Tensor:
+        return self.plugins[-1].recv(x, src)
 
 
 def enable_pynccl_distributed(

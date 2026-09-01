@@ -70,6 +70,7 @@ class Qwen4ExpMoE(Qwen3_5MoE):
                 ),
                 offload_cls=ExpertParallelOffloadMoELayer,
             )
+            self.experts.packed_prefill_root = self.execution.backbone_rank
             return
         if getattr(config, "expert_quant", "none") != "fp8_block":
             super().__init__(config, layer_id=layer_id)

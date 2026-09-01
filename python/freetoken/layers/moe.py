@@ -597,6 +597,62 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     # greedy decision near a logit boundary.
     return_route_outputs = True
 
+    def routed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx = get_global_ctx()
+        if ctx.batch.is_prefill:
+            routes = self._prefill_routed(hidden_states, topk_weights, topk_ids)
+            return self._maybe_combine_packed_prefill_routes(routes, topk_weights)
+        routes = self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._maybe_all_reduce(routes)
+
+    def _maybe_combine_packed_prefill_routes(
+        self,
+        routes: torch.Tensor,
+        local_topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        root = getattr(self, "packed_prefill_root", None)
+        if root is None:
+            return self._maybe_all_reduce(routes)
+
+        info = get_tp_info()
+        if info.size != 2:
+            raise RuntimeError("packed prefill routes currently require exactly two EP ranks")
+        if routes.ndim != 3:
+            raise RuntimeError(f"expected per-route outputs, got shape {tuple(routes.shape)}")
+        if routes.shape[:2] != local_topk_weights.shape:
+            raise RuntimeError(
+                "route output and weight shapes disagree: "
+                f"{tuple(routes.shape[:2])} != {tuple(local_topk_weights.shape)}"
+            )
+
+        communicator = DistributedCommunicator()
+        flat_routes = routes.view(-1, routes.shape[-1])
+        owned = local_topk_weights.ne(0).reshape(-1)
+        if info.rank != root:
+            owned_indices = torch.nonzero(owned, as_tuple=False).flatten()
+            if owned_indices.numel() != 0:
+                packed = flat_routes.index_select(0, owned_indices).contiguous()
+                communicator.send(packed, root)
+            # The expert worker never consumes the combined result.
+            return routes
+
+        remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
+        if remote_indices.numel() != 0:
+            packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
+            communicator.recv(packed, 1 - root)
+            flat_routes.index_copy_(0, remote_indices, packed)
+
+        from freetoken.kernel import moe_sum_reduce_triton
+
+        output = routes.new_empty((routes.shape[0], routes.shape[-1]))
+        moe_sum_reduce_triton(routes, output)
+        return output
+
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Qwen's layers are constructed under a TP1 view so its backbone remains
         # whole; the expert communicator still contains every EP process.
