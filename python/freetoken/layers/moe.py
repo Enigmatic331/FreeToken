@@ -25,6 +25,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 _EP_PACKED_PREFILL_OVERLAP = os.getenv("FREETOKEN_EP_PACKED_OVERLAP", "1") != "0"
+_EP_PACKED_ASYNC_SEND = os.getenv("FREETOKEN_EP_PACKED_ASYNC_SEND", "0") != "0"
 _EP_SKIP_INACTIVE_PREFILL_ROUTES = (
     os.getenv("FREETOKEN_EP_SKIP_INACTIVE_PREFILL_ROUTES", "0") != "0"
 )
@@ -41,6 +42,7 @@ if _EP_PACKED_WIRE_DTYPE not in {"bf16", "fp8"}:
         f"{_EP_PACKED_WIRE_DTYPE!r}"
     )
 _EP_PACKED_RECV_STREAM: torch.cuda.Stream | None = None
+_EP_PACKED_SEND_STREAM: torch.cuda.Stream | None = None
 _FP8_E4M3_MAX = 448.0
 
 
@@ -49,6 +51,13 @@ def _ep_packed_recv_stream(device: torch.device) -> torch.cuda.Stream:
     if _EP_PACKED_RECV_STREAM is None:
         _EP_PACKED_RECV_STREAM = torch.cuda.Stream(device=device)
     return _EP_PACKED_RECV_STREAM
+
+
+def _ep_packed_send_stream(device: torch.device) -> torch.cuda.Stream:
+    global _EP_PACKED_SEND_STREAM
+    if _EP_PACKED_SEND_STREAM is None:
+        _EP_PACKED_SEND_STREAM = torch.cuda.Stream(device=device)
+    return _EP_PACKED_SEND_STREAM
 
 
 def _quantize_ep_routes(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -845,6 +854,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             else None
         )
         last = None
+        async_send_stream = None
         skip_inactive = self.skip_inactive_prefill_routes and root is not None
         for start in range(0, hidden_states.shape[0], tile_tokens):
             end = min(start + tile_tokens, hidden_states.shape[0])
@@ -868,17 +878,66 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
-            combined = self._maybe_combine_packed_prefill_routes(routes, tile_weights)
+            if not is_root and root is not None and _EP_PACKED_ASYNC_SEND:
+                async_send_stream = self._send_packed_prefill_routes_async(
+                    routes, tile_weights
+                )
+                combined = routes
+            else:
+                combined = self._maybe_combine_packed_prefill_routes(
+                    routes, tile_weights
+                )
             if output is not None:
                 output[start:end].copy_(combined)
             last = combined
 
+        if async_send_stream is not None:
+            # Preserve communicator ordering before this rank enters the next
+            # layer's broadcasts, without serializing sends between this layer's
+            # tiles. Root has already consumed the same ordered send queue.
+            torch.cuda.current_stream(hidden_states.device).wait_stream(
+                async_send_stream
+            )
         if cache.prefill_overlap:
             cache.release_prefill_layer(self.layer_id)
         if output is not None:
             return output
         assert last is not None
         return last
+
+    def _send_packed_prefill_routes_async(
+        self,
+        routes: torch.Tensor,
+        local_topk_weights: torch.Tensor,
+    ) -> torch.cuda.Stream:
+        """Queue one worker tile on a side stream so the next tile can compute."""
+        root = getattr(self, "packed_prefill_root", None)
+        info = get_tp_info()
+        if root is None or info.rank == root:
+            raise RuntimeError("async packed send is valid only on an EP worker")
+
+        owned = local_topk_weights.ne(0).reshape(-1)
+        owned_indices = torch.nonzero(owned, as_tuple=False).flatten()
+        send_stream = _ep_packed_send_stream(routes.device)
+        current = torch.cuda.current_stream(routes.device)
+        send_stream.wait_stream(current)
+        if owned_indices.numel() != 0:
+            with torch.cuda.stream(send_stream):
+                packed = routes.view(-1, routes.shape[-1]).index_select(
+                    0, owned_indices
+                ).contiguous()
+                communicator = DistributedCommunicator()
+                if _EP_PACKED_WIRE_DTYPE == "fp8":
+                    scale, quantized = _quantize_ep_routes(packed)
+                    communicator.send(scale, root)
+                    communicator.send(quantized, root)
+                else:
+                    communicator.send(packed, root)
+            # These tensors were created on the compute stream but remain inputs
+            # to the side-stream gather until it is enqueued and completed.
+            routes.record_stream(send_stream)
+            owned_indices.record_stream(send_stream)
+        return send_stream
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Qwen's layers are constructed under a TP1 view so its backbone remains

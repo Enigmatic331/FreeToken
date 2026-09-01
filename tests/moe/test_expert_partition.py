@@ -5,6 +5,7 @@ import torch
 
 import freetoken.distributed.info as distributed_info
 import freetoken.kernel as freetoken_kernel
+import freetoken.layers.moe as moe_module
 from freetoken.distributed import DistributedCommunicator, DistributedInfo
 from freetoken.layers.moe import (
     ExpertParallelOffloadMoELayer,
@@ -93,6 +94,43 @@ def test_ep_offload_packs_remote_prefill_routes_in_canonical_order(monkeypatch):
     torch.testing.assert_close(
         root_output, full_routes.float().sum(dim=1).to(torch.bfloat16)
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ep_worker_async_send_preserves_owned_route_order(monkeypatch):
+    class FakeCommunicator:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, tensor, dst):
+            assert dst == 0
+            self.sent.append(tensor.clone())
+            return tensor
+
+    fake = FakeCommunicator()
+    monkeypatch.setattr(DistributedCommunicator, "plugins", [fake])
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(1, 2))
+    monkeypatch.setattr(moe_module, "_EP_PACKED_WIRE_DTYPE", "bf16")
+    monkeypatch.setattr(moe_module, "_EP_PACKED_SEND_STREAM", None)
+
+    layer = object.__new__(ExpertParallelOffloadMoELayer)
+    layer.packed_prefill_root = 0
+    routes = torch.arange(
+        2 * 6 * 32, device="cuda", dtype=torch.float32
+    ).view(2, 6, 32).to(torch.bfloat16)
+    weights = torch.tensor(
+        [[0.1, 0.0, 0.2, 0.0, 0.3, 0.4], [0.0, 0.5, 0.0, 0.6, 0.7, 0.0]],
+        device="cuda",
+    )
+
+    stream = layer._send_packed_prefill_routes_async(routes, weights)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    owned = weights.ne(0).reshape(-1)
+    expected = routes.view(-1, routes.shape[-1])[owned]
+    assert len(fake.sent) == 1
+    torch.testing.assert_close(fake.sent[0], expected)
 
 
 def test_balanced_partition_and_local_routes():
