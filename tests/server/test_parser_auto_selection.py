@@ -123,6 +123,16 @@ def test_dsv4_heterogeneous_rank_layout_arguments_parse_as_tuples():
     assert args.moe_cache_auto is False
 
 
+def test_absolute_swa_tokens_parse_as_startup_capacity():
+    config = _Config(
+        {"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"}
+    )
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(["--model", ANON_PATH, "--swa-tokens", "16384"])
+
+    assert args.swa_token_override == 16384
+
+
 def test_generic_rank_local_moe_cache_sizes_parse_as_tuple():
     config = _Config(
         {"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"}

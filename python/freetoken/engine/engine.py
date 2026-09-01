@@ -1682,6 +1682,25 @@ def _adjust_config(config: EngineConfig):
             )
         override("num_page_override", config.num_token_override // config.page_size)
 
+    # Resolve the absolute window capacity only now: model-specific adjustment above installs
+    # DSV4's 128-token page. Resolving in the parser would silently request 128x too many pages.
+    swa_tokens = getattr(config, "swa_token_override", None)
+    if swa_tokens is not None:
+        if getattr(config, "swa_num_pages_override", None) is not None:
+            raise ValueError(
+                "--swa-tokens and the internal swa_num_pages_override are mutually exclusive"
+            )
+        if not _supports_swa_ratio(config):
+            raise ValueError("--swa-tokens requires a model with a separate SWA/window pool")
+        if swa_tokens % config.page_size != 0:
+            raise ValueError(
+                f"--swa-tokens {swa_tokens} is not a multiple of the resolved window "
+                f"page size {config.page_size}; nearest valid values: "
+                f"{swa_tokens // config.page_size * config.page_size} or "
+                f"{(swa_tokens // config.page_size + 1) * config.page_size}"
+            )
+        override("swa_num_pages_override", swa_tokens // config.page_size)
+
     # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.
     # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).

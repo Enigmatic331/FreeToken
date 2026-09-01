@@ -410,6 +410,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--swa-tokens",
+        dest="swa_token_override",
+        type=_positive_int,
+        default=ServerArgs.swa_token_override,
+        help=(
+            "Absolute startup capacity of the separate SWA/window pool in tokens; "
+            "must be a multiple of its resolved page size (DSV4: 128). This pins "
+            "the window pool instead of scaling it with total KV capacity."
+        ),
+    )
+
+    parser.add_argument(
         "--page-size",
         type=int,
         default=ServerArgs.page_size,

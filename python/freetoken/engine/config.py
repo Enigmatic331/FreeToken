@@ -80,6 +80,9 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
+    # User-facing startup capacity in TOKENS. Resolve this only after the model-specific page
+    # size is known; DSV4 changes the generic page size from 1 to its 128-token window page.
+    swa_token_override: int | None = None
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True

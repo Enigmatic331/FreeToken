@@ -170,6 +170,9 @@ def _dsv4_adjust_cfg(**over):
         nvfp4_backend = "auto"
         num_page_override = None
         num_token_override = None
+        swa_num_pages_override = None
+        swa_token_override = None
+        cache_type = "naive"
 
         @property
         def model_config(self):
@@ -209,6 +212,31 @@ def test_adjust_config_resolves_num_tokens_for_dsv4():
     _adjust_config(cfg)
     assert cfg.page_size == 128
     assert cfg.num_page_override == 1024
+
+
+def test_adjust_config_resolves_absolute_swa_tokens_after_dsv4_page_size():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(swa_token_override=16384)
+    _adjust_config(cfg)
+    assert cfg.page_size == 128
+    assert cfg.swa_num_pages_override == 128
+
+
+def test_adjust_config_rejects_unaligned_dsv4_swa_tokens():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(swa_token_override=16385)
+    with pytest.raises(ValueError, match="--swa-tokens 16385 is not a multiple"):
+        _adjust_config(cfg)
+
+
+def test_adjust_config_rejects_two_absolute_swa_sources():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(swa_token_override=16384, swa_num_pages_override=128)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _adjust_config(cfg)
 
 
 def test_adjust_config_applies_rank_local_dsv4_partition_and_cache(monkeypatch):
