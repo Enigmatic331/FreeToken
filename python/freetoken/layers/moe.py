@@ -24,6 +24,15 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+_EP_PACKED_PREFILL_OVERLAP = os.getenv("FREETOKEN_EP_PACKED_OVERLAP", "1") != "0"
+_EP_PACKED_RECV_STREAM: torch.cuda.Stream | None = None
+
+
+def _ep_packed_recv_stream(device: torch.device) -> torch.cuda.Stream:
+    global _EP_PACKED_RECV_STREAM
+    if _EP_PACKED_RECV_STREAM is None:
+        _EP_PACKED_RECV_STREAM = torch.cuda.Stream(device=device)
+    return _EP_PACKED_RECV_STREAM
 
 
 class MoELayer(BaseOP):
@@ -597,6 +606,43 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     # greedy decision near a logit boundary.
     return_route_outputs = True
 
+    def prepare_packed_prefill_receive(
+        self,
+        local_topk_weights: torch.Tensor,
+        route_dtype: torch.dtype,
+    ) -> None:
+        root = getattr(self, "packed_prefill_root", None)
+        info = get_tp_info()
+        if (
+            root is None
+            or info.rank != root
+            or not get_global_ctx().batch.is_prefill
+            or not _EP_PACKED_PREFILL_OVERLAP
+        ):
+            return
+        if info.size != 2:
+            raise RuntimeError("packed prefill routes currently require exactly two EP ranks")
+        if getattr(self, "_packed_prefill_pending", None) is not None:
+            raise RuntimeError("packed prefill receive already pending")
+
+        owned = local_topk_weights.ne(0).reshape(-1)
+        remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
+        if remote_indices.numel() == 0:
+            self._packed_prefill_pending = (remote_indices, None, None)
+            return
+
+        packed = torch.empty(
+            (remote_indices.numel(), self.hidden_size),
+            dtype=route_dtype,
+            device=local_topk_weights.device,
+        )
+        current = torch.cuda.current_stream(local_topk_weights.device)
+        recv_stream = _ep_packed_recv_stream(local_topk_weights.device)
+        recv_stream.wait_stream(current)
+        with torch.cuda.stream(recv_stream):
+            DistributedCommunicator().recv(packed, 1 - root)
+        self._packed_prefill_pending = (remote_indices, packed, recv_stream)
+
     def routed_forward(
         self,
         hidden_states: torch.Tensor,
@@ -641,11 +687,19 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             # The expert worker never consumes the combined result.
             return routes
 
-        remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
-        if remote_indices.numel() != 0:
-            packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
-            communicator.recv(packed, 1 - root)
-            flat_routes.index_copy_(0, remote_indices, packed)
+        pending = getattr(self, "_packed_prefill_pending", None)
+        self._packed_prefill_pending = None
+        if pending is not None:
+            remote_indices, packed, recv_stream = pending
+            if packed is not None:
+                torch.cuda.current_stream(routes.device).wait_stream(recv_stream)
+                flat_routes.index_copy_(0, remote_indices, packed)
+        else:
+            remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
+            if remote_indices.numel() != 0:
+                packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
+                communicator.recv(packed, 1 - root)
+                flat_routes.index_copy_(0, remote_indices, packed)
 
         from freetoken.kernel import moe_sum_reduce_triton
 

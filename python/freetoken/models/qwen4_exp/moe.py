@@ -111,12 +111,13 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         topk_ids = self._comm.broadcast(
             topk_ids.to(torch.int32).contiguous(), self.execution.backbone_rank
         )
-        assert self.shared_expert is not None and self.shared_expert_gate is not None
-        shared = self.shared_expert.forward(hidden_states)
-        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
         topk_weights, topk_ids = localize_expert_routes(
             topk_weights, topk_ids, self.partition
         )
+        self.experts.prepare_packed_prefill_receive(topk_weights, hidden_states.dtype)
+        assert self.shared_expert is not None and self.shared_expert_gate is not None
+        shared = self.shared_expert.forward(hidden_states)
+        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
         routed = self.experts.routed_forward(
             hidden_states,
             topk_weights.float().contiguous(),
