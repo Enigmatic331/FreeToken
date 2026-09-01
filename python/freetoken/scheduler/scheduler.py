@@ -32,6 +32,7 @@ from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
+from .token_trace import TokenTraceRecorder
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
@@ -130,6 +131,7 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self.token_trace = TokenTraceRecorder.from_env(config.tp_info.rank)
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -494,6 +496,14 @@ class Scheduler(SchedulerIOMixin):
                     if finished
                     else None
                 )
+                if self.token_trace is not None:
+                    self.token_trace.record(
+                        uid=req.uid,
+                        token_id=next_token,
+                        prompt_tokens=req.max_device_len - req.output_len,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
                 if (
                     next_token == self.toolcall_anchor_id
                     and req.toolcall_anchor_len is None
