@@ -857,7 +857,8 @@ def setup_offload_expert_banks(
         return _PROVIDERS[eq](model_path, model_config, device, dtype, dummy,
                               parallel=parallel, workers=workers, chunk=chunk,
                               decode_target=decode_target, layer_sink=layer_sink)
-    if get_tp_info().size > 1:
+    partition = _expert_partition(model_config)
+    if get_tp_info().size > 1 and partition.world_size == 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.moe.expert_banks import ExpertBanks
 
@@ -880,6 +881,28 @@ def _moe_dims(model_config):
         L, model_config.num_experts, model_config.hidden_size,
         model_config.moe_intermediate_size, model_config.num_layers - L,  # dense prefix
     )
+
+
+def _expert_partition(model_config):
+    """Return the Qwen4 EP shard, or the legacy single-rank expert set."""
+    from freetoken.moe.partition import ExpertPartition
+
+    qwen4_args = getattr(model_config, "qwen4_args", None)
+    if qwen4_args is None:
+        return ExpertPartition(model_config.num_experts)
+    from freetoken.models.qwen4_exp.execution import get_qwen4_exp_execution_plan
+
+    plan = get_qwen4_exp_execution_plan()
+    if not plan.enabled:
+        return ExpertPartition(model_config.num_experts)
+    partition = plan.partition(qwen4_args.num_experts)
+    if partition.local_count != model_config.num_experts:
+        raise ValueError(
+            "Qwen4 EP config/loader disagree: "
+            f"ModelConfig has {model_config.num_experts} local experts, "
+            f"partition has {partition.local_count}"
+        )
+    return partition
 
 
 def _expert_reader(model_path, device):
@@ -911,6 +934,7 @@ def _build_fp8_expert_banks(
 
     B = 128
     L, E, H, I, dense = _moe_dims(config)
+    partition = _expert_partition(config)
 
     # 16B-align the per-expert scale rows (Qwen3.8: down_scale is 20x5 bf16 = 200 B) so the
     # fused multi-bank copy engages; the GEMMs read scales through explicit strides, so the
@@ -950,7 +974,11 @@ def _build_fp8_expert_banks(
         m = _FP8_EXPERT_RE.match(raw_name)
         if m is None:
             return None
-        li, e = int(m["layer"]) - dense, int(m["expert"])
+        global_expert = int(m["expert"])
+        if not partition.owns(global_expert):
+            return None
+        li = int(m["layer"]) - dense
+        e = partition.global_to_local(global_expert)
         proj, kind = m["proj"], m["kind"]
         if kind == "weight":
             (gate_up[li][e, :I] if proj == "gate" else
@@ -970,8 +998,12 @@ def _build_fp8_expert_banks(
         # {gate,up,down} x {weight, weight_scale_inv} per expert -> E*6 writes/layer.
         tracker = LayerCompletionTracker(E * 6, hb, sink) if sink is not None else None
         if parallel:
+            def owned_expert(name: str) -> bool:
+                match = _FP8_EXPERT_RE.match(name)
+                return match is not None and partition.owns(int(match["expert"]))
+
             for raw_name, t in iter_expert_tensors_parallel(
-                model_path, lambda n: _FP8_EXPERT_RE.match(n) is not None, workers=workers, chunk=chunk
+                model_path, owned_expert, workers=workers, chunk=chunk
             ):
                 li = place(raw_name, t)
                 if tracker is not None and li is not None:
@@ -982,7 +1014,7 @@ def _build_fp8_expert_banks(
             try:
                 for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not primary):
                     layer = dense + li
-                    for e in range(E):
+                    for e in partition.global_range:
                         p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
                         for proj in ("gate", "up", "down"):
                             for kind in ("weight", "weight_scale_inv"):

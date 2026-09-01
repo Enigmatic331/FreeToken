@@ -9,7 +9,12 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import (
+    DistributedCommunicator,
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_tp_info,
+)
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
@@ -291,8 +296,13 @@ class Engine:
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from freetoken.gpu_select import bind_assigned_gpu
+        from freetoken.models.qwen4_exp.execution import configure_qwen4_exp_execution
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
+        self._qwen4_plan = configure_qwen4_exp_execution(
+            config.qwen4_exp_backbone_rank,
+            config.qwen4_exp_expert_shards,
+        )
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -314,9 +324,10 @@ class Engine:
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
-        with torch.device("meta"), torch_dtype(config.dtype):
-            self.model = create_model(config.model_config)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+        with self._qwen4_plan.model_tp_context():
+            with torch.device("meta"), torch_dtype(config.dtype):
+                self.model = create_model(config.model_config)
+            self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -334,21 +345,44 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
-            self._init_offload_moe_cache(config)
+            if self._qwen4_plan.enabled:
+                # Qwen's expert tensors are interleaved through nearly every checkpoint
+                # shard. Two rank-local readers therefore issue duplicate 122-GB shard
+                # scans and throttle one another badly on a single NVMe. Let workers load
+                # one at a time, backbone last. The first worker still overlaps its scan
+                # with the backbone rank's one-time 47.7-GB PLE load above.
+                load_order = tuple(
+                    rank
+                    for rank in range(config.tp_info.size)
+                    if rank != self._qwen4_plan.backbone_rank
+                ) + (self._qwen4_plan.backbone_rank,)
+                for load_rank in load_order:
+                    if config.tp_info.rank == load_rank:
+                        logger.info(
+                            "Qwen4Exp EP rank %d loading its expert bank (order=%s)",
+                            load_rank,
+                            load_order,
+                        )
+                        self._init_offload_moe_cache(config)
+                    torch.distributed.barrier(group=self.tp_cpu_group)
+            else:
+                self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
         # ======================= KV cache initialization ========================
-        new_free = self._sync_get_memory()[1]
+        new_free_pair = self._sync_get_memory()
+        new_free = new_free_pair[0] if self._qwen4_plan.enabled else new_free_pair[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
-        )
+        with self._qwen4_plan.model_tp_context():
+            self.ctx.kv_cache = self.kv_cache = create_kv_pool(
+                config, self.num_pages, device=self.device, dtype=self.dtype
+            )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -360,7 +394,7 @@ class Engine:
                 num_slots=_linear_pool_num_slots(config),
                 dtype=self.dtype,
                 device=self.device,
-                tp_size=config.tp_info.size,
+                tp_size=config.model_tp_size,
                 slot_states=config.model_config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
@@ -382,9 +416,16 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention & MoE backend initialization ========================
-        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
-            config.attention_backend, config.model_config
-        )
+        if self._qwen4_plan.is_expert_worker:
+            from freetoken.models.qwen4_exp.execution import (
+                Qwen4ExpExpertWorkerAttentionBackend,
+            )
+
+            self.ctx.attn_backend = self.attn_backend = Qwen4ExpExpertWorkerAttentionBackend()
+        else:
+            self.ctx.attn_backend = self.attn_backend = create_attention_backend(
+                config.attention_backend, config.model_config
+            )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
@@ -417,7 +458,7 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            vocab_size=(1 if self._qwen4_plan.is_expert_worker else config.model_config.vocab_size),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -719,7 +760,10 @@ class Engine:
         )
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
-        if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
+        if (
+            max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024
+            and not self._qwen4_plan.enabled
+        ):
             logger.error(
                 f"Memory across TP ranks are imbalanced:"
                 f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
@@ -910,7 +954,7 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=free_min,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            vocab_size=(1 if self._qwen4_plan.is_expert_worker else config.model_config.vocab_size),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -931,7 +975,16 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self._qwen4_plan.is_expert_worker:
+            next_tokens_gpu = torch.empty(
+                batch.size, dtype=torch.int32, device=self.device
+            )
+        else:
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self._qwen4_plan.enabled:
+            next_tokens_gpu = DistributedCommunicator().broadcast(
+                next_tokens_gpu, self._qwen4_plan.backbone_rank
+            )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -1208,6 +1261,7 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
+    "moe_cache_sizes": None,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
@@ -1226,6 +1280,72 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    qwen4_args = getattr(model_config, "qwen4_args", None)
+    qwen_backbone_rank = getattr(config, "qwen4_exp_backbone_rank", None)
+    qwen_expert_shards = getattr(config, "qwen4_exp_expert_shards", None)
+    moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
+    tp_info = getattr(config, "tp_info", None)
+
+    if qwen_expert_shards is not None and qwen_backbone_rank is None:
+        raise ValueError(
+            "--qwen4-exp-expert-shards requires --qwen4-exp-backbone-rank"
+        )
+    if qwen_backbone_rank is not None:
+        if qwen4_args is None:
+            raise ValueError(
+                "--qwen4-exp-backbone-rank is valid only for Qwen4Exp/Qwen3.8 Flash"
+            )
+        if tp_info is None or tp_info.size <= 1:
+            raise ValueError("Qwen4Exp EP requires --tensor-parallel-size > 1")
+        if not 0 <= qwen_backbone_rank < tp_info.size:
+            raise ValueError(
+                f"--qwen4-exp-backbone-rank {qwen_backbone_rank} is outside "
+                f"[0, {tp_info.size})"
+            )
+        if config.moe_backend not in ("auto", "offload"):
+            raise ValueError("Qwen4Exp EP currently requires --moe-backend offload")
+        from freetoken.models.qwen4_exp.execution import get_qwen4_exp_execution_plan
+
+        partition = get_qwen4_exp_execution_plan().partition(qwen4_args.num_experts)
+        object.__setattr__(model_config, "num_experts", partition.local_count)
+        if config.distributed_timeout == EngineConfig.distributed_timeout:
+            override("distributed_timeout", 900.0)
+        logger.info(
+            "Qwen4Exp EP rank=%d/%d backbone=%s experts=[%d,%d) local=%d",
+            tp_info.rank,
+            tp_info.size,
+            qwen_backbone_rank,
+            partition.global_offset,
+            partition.global_stop,
+            partition.local_count,
+        )
+
+    if moe_cache_sizes is not None:
+        if not getattr(model_config, "is_moe", False):
+            raise ValueError("--moe-cache-sizes is valid only for MoE models")
+        if tp_info is None or tp_info.size <= 1:
+            raise ValueError("--moe-cache-sizes requires --tensor-parallel-size > 1")
+        if len(moe_cache_sizes) != tp_info.size:
+            raise ValueError(
+                "--moe-cache-sizes needs one value per rank: "
+                f"expected {tp_info.size}, got {len(moe_cache_sizes)}"
+            )
+        cache_size = moe_cache_sizes[tp_info.rank]
+        if cache_size < model_config.num_experts:
+            raise ValueError(
+                f"--moe-cache-sizes rank {tp_info.rank} value {cache_size} is "
+                f"smaller than its {model_config.num_experts} local experts"
+            )
+        override("moe_cache_size", cache_size)
+        override("moe_cache_rate", None)
+        override("moe_cache_auto", False)
+        logger.info(
+            "Rank-local MoE cache: rank=%d/%d slots=%d",
+            tp_info.rank,
+            tp_info.size,
+            cache_size,
+        )
+
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)

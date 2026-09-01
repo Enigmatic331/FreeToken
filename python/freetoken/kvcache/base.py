@@ -28,7 +28,11 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        * div_even(
+            spec.num_kv_heads,
+            getattr(config, "model_tp_size", config.tp_info.size),
+            allow_replicate=True,
+        )
         * config.dtype.itemsize
         * spec.num_layers
     )

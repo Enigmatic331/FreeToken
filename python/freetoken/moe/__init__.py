@@ -33,6 +33,9 @@ def is_offload_moe_backend(backend: str) -> bool:
     return backend in OFFLOAD_MOE_BACKENDS
 
 
+from .partition import ExpertPartition, cache_safe_route_ids, localize_expert_routes
+
+
 @SUPPORTED_MOE_BACKENDS.register("fused")
 def create_fused_moe_backend():
     from .fused import FusedMoe
@@ -71,4 +74,7 @@ __all__ = [
     "SUPPORTED_MOE_BACKENDS",
     "OFFLOAD_MOE_BACKENDS",
     "is_offload_moe_backend",
+    "ExpertPartition",
+    "cache_safe_route_ids",
+    "localize_expert_routes",
 ]

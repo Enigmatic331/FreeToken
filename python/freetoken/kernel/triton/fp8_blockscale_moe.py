@@ -98,7 +98,8 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
 
 def fused_experts_decode_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, activation="silu",
+    topk_weights, topk_ids, activation="silu", output_dtype=None,
+    return_route_outputs=False,
 ) -> torch.Tensor:
     """Decode (bs-1) inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert
     banks (resident: expert id; offload: cache slot)."""
@@ -118,7 +119,13 @@ def fused_experts_decode_fp8_blockscale(
     silu_and_mul(ic1.view(-1, two_i), ic2)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _decode_gemm(ic2, down, down_scale, ic3, topk_weights, topk_ids, True, True)
-    out = torch.empty_like(hidden_states)
+    if return_route_outputs:
+        return ic3
+    out = torch.empty(
+        hidden_states.shape,
+        device=hidden_states.device,
+        dtype=output_dtype or hidden_states.dtype,
+    )
     moe_sum_reduce_triton(ic3, out)
     return out
 
@@ -217,7 +224,8 @@ def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num
 
 def fused_experts_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, num_experts, activation="silu",
+    topk_weights, topk_ids, num_experts, activation="silu", output_dtype=None,
+    return_route_outputs=False,
 ) -> torch.Tensor:
     """Prefill inline-dequant block-fp8 MoE. ``topk_ids`` index expert rows in [0, num_experts)
     (materialized layer: position == expert id)."""
@@ -251,7 +259,13 @@ def fused_experts_fp8_blockscale(
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(a2_fp8, a2_scale, down, down_scale, ic3, tw, sorted_ids, expert_ids, ntpp,
                   num_valid, 1, True, cfg)
-    out = torch.empty_like(hidden_states)
+    if return_route_outputs:
+        return ic3
+    out = torch.empty(
+        hidden_states.shape,
+        device=hidden_states.device,
+        dtype=output_dtype or hidden_states.dtype,
+    )
     moe_sum_reduce_triton(ic3, out)
     return out
 

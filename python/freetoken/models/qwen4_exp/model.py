@@ -25,6 +25,7 @@ from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
+from .execution import get_qwen4_exp_execution_plan
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
 
@@ -123,10 +124,42 @@ class Qwen4ExpModel(BaseOP):
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
+class Qwen4ExpExpertWorkerLayer(BaseOP):
+    """Only the rank-local routed experts needed for one decoder layer."""
+
+    def __init__(self, config: ModelConfig, layer_id: int) -> None:
+        self.mlp = Qwen4ExpMoE(config, layer_id)
+
+
+class Qwen4ExpExpertWorkerModel(BaseOP):
+    """Expert shell with no embedding, PLE, attention, GDN, HC, or LM head."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        self.hidden_size = config.hidden_size
+        self.layers = OPList(
+            [Qwen4ExpExpertWorkerLayer(config, layer_id) for layer_id in range(config.num_layers)]
+        )
+
+    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        hidden_shape = (input_ids.numel(), self.hidden_size)
+        for layer in self.layers.op_list:
+            layer.mlp.worker_forward(hidden_shape, input_ids.device)
+        return torch.zeros((batch.size, 1), dtype=torch.float32, device=input_ids.device)
+
+
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
-        self.model = Qwen4ExpModel(config)
+        self._execution = get_qwen4_exp_execution_plan()
+        self.model = (
+            Qwen4ExpExpertWorkerModel(config)
+            if self._execution.is_expert_worker
+            else Qwen4ExpModel(config)
+        )
+        if self._execution.is_expert_worker:
+            self.lm_head = None
+            super().__init__()
+            return
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
 
@@ -145,6 +178,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
+        if self._execution.is_expert_worker:
+            return 0
         ple_layers = self.model.ple_layers
         if not ple_layers:
             return 0
@@ -181,7 +216,16 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
+        if self._execution.is_expert_worker:
+            return self.model.forward(batch.input_ids, batch)
+        assert self.lm_head is not None
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
 
 
-__all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
+__all__ = [
+    "Qwen4ExpDecoderLayer",
+    "Qwen4ExpExpertWorkerModel",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpModel",
+    "build_linear_mixer",
+]

@@ -16,7 +16,8 @@ from __future__ import annotations
 def fused_experts_fp8_block(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
     topk_weights, topk_ids, num_experts, activation="silu",
-    apply_router_weight_on_input=False,
+    apply_router_weight_on_input=False, output_dtype=None,
+    return_route_outputs=False,
 ):
     """Prefill: W8A8 fused grouped GEMM over the materialized-layer banks
     (``[num_experts, ...]``, position == expert id)."""
@@ -25,13 +26,15 @@ def fused_experts_fp8_block(
 
     return fused_experts_fp8_blockscale(
         hidden_states, gate_up, gate_up_scale, down, down_scale,
-        topk_weights, topk_ids, num_experts, activation,
+        topk_weights, topk_ids, num_experts, activation, output_dtype,
+        return_route_outputs,
     )
 
 
 def fused_experts_decode_fp8_block(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
     topk_weights, topk_ids, activation="silu", apply_router_weight_on_input=False,
+    output_dtype=None, return_route_outputs=False,
 ):
     """Decode: W8A16 fused inline-dequant grouped GEMV -- reads the routed experts' fp8 rows
     directly (``topk_ids`` index the banks) and dequantizes in the K-loop. CUDA-graph safe."""
@@ -40,7 +43,7 @@ def fused_experts_decode_fp8_block(
 
     return fused_experts_decode_fp8_blockscale(
         hidden_states, gate_up, gate_up_scale, down, down_scale,
-        topk_weights, topk_ids, activation,
+        topk_weights, topk_ids, activation, output_dtype, return_route_outputs,
     )
 
 

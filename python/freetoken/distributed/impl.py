@@ -20,6 +20,9 @@ class DistributedImpl(ABC):
     @abstractmethod
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    @abstractmethod
+    def broadcast(self, x: torch.Tensor, src: int) -> torch.Tensor: ...
+
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
@@ -40,6 +43,11 @@ class TorchDistributedImpl(DistributedImpl):
         dist.all_gather_into_tensor(out, x)
         return out
 
+    def broadcast(self, x: torch.Tensor, src: int) -> torch.Tensor:
+        if dist.get_world_size() > 1:
+            dist.broadcast(x, src=src)
+        return x
+
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
@@ -59,6 +67,15 @@ class PyNCCLDistributedImpl(DistributedImpl):
         self.comm.all_gather(result, x)
         return result
 
+    def broadcast(self, x: torch.Tensor, src: int) -> torch.Tensor:
+        # Source-only SUM is a graph-capturable broadcast with the current wrapper.
+        from .info import get_tp_info
+
+        if get_tp_info().rank != src:
+            x.zero_()
+        self.comm.all_reduce(x, "sum")
+        return x
+
 
 class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
@@ -68,6 +85,9 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+    def broadcast(self, x: torch.Tensor, src: int) -> torch.Tensor:
+        return self.plugins[-1].broadcast(x, src)
 
 
 def enable_pynccl_distributed(

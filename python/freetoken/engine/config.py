@@ -75,6 +75,12 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
+    # Qwen3.8 heterogeneous EP: one rank owns the complete TP1 backbone and
+    # every rank owns a contiguous routed-expert shard.
+    qwen4_exp_backbone_rank: int | None = None
+    qwen4_exp_expert_shards: tuple[int, ...] | None = None
+    # Optional unified expert-cache slots per distributed rank.
+    moe_cache_sizes: tuple[int, ...] | None = None
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
@@ -100,6 +106,16 @@ class EngineConfig:
     @property
     def max_forward_len(self) -> int:
         return self.max_seq_len
+
+    @property
+    def model_tp_size(self) -> int:
+        """Tensor-parallel width of model tensors and their runtime state.
+
+        Qwen EP keeps a TP1 backbone on the authority while the process group is
+        still world-size EP for collectives. Its KV/GDN geometry must therefore
+        remain unsharded on every rank.
+        """
+        return 1 if self.qwen4_exp_backbone_rank is not None else self.tp_info.size
 
     @property
     def distributed_addr(self) -> str:

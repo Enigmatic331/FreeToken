@@ -157,6 +157,12 @@ def iter_weights(
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
     """
+    from .execution import get_qwen4_exp_execution_plan
+
+    if get_qwen4_exp_execution_plan().is_expert_worker:
+        # Routed banks load through setup_offload_expert_banks; this process owns
+        # no checkpoint-backed dense parameters.
+        return
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:

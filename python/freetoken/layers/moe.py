@@ -517,10 +517,14 @@ class OffloadMoELayer(MoELayer):
                     hidden_states, gate_up, gate_up_scale, down, down_scale,
                     topk_weights, topk_ids, n, self.activation,
                     self.apply_router_weight_on_input,
+                    output_dtype=getattr(self, "routed_output_dtype", None),
+                    return_route_outputs=getattr(self, "return_route_outputs", False),
                 )
             return fused_experts_decode_fp8_block(
                 hidden_states, gate_up, gate_up_scale, down, down_scale,
                 topk_weights, topk_ids, self.activation, self.apply_router_weight_on_input,
+                output_dtype=getattr(self, "routed_output_dtype", None),
+                return_route_outputs=getattr(self, "return_route_outputs", False),
             )
         if fmt == "q4_0":
             # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
@@ -581,6 +585,76 @@ class OffloadMoELayer(MoELayer):
             topk_ids,
             self.activation,
             self.apply_router_weight_on_input,
+        )
+
+
+class ExpertParallelOffloadMoELayer(OffloadMoELayer):
+    """Rank-local expert banks with globally normalized, fixed-shape routes."""
+
+    # Keep route slots separate through the collective, then reproduce TP1's
+    # strict top-k-order FP32 accumulation and single BF16 store. Reducing each
+    # rank to even an FP32 subtotal changes associativity and can still move a
+    # greedy decision near a logit boundary.
+    return_route_outputs = True
+
+    def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Qwen's layers are constructed under a TP1 view so its backbone remains
+        # whole; the expert communicator still contains every EP process.
+        from freetoken.distributed import DistributedCommunicator
+
+        hidden_states = DistributedCommunicator().all_reduce(hidden_states)
+        if hidden_states.ndim != 3:
+            return hidden_states
+
+        from freetoken.kernel import moe_sum_reduce_triton
+
+        num_tokens, _, hidden_dim = hidden_states.shape
+        output = torch.empty(
+            (num_tokens, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        moe_sum_reduce_triton(hidden_states, output)
+        return output
+
+    @staticmethod
+    def _cache_safe_route_ids(
+        topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> torch.Tensor:
+        from freetoken.moe.partition import cache_safe_route_ids
+
+        return cache_safe_route_ids(topk_weights, topk_ids)
+
+    def _decode_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return super()._decode_routed(
+            hidden_states,
+            topk_weights,
+            self._cache_safe_route_ids(topk_weights, topk_ids),
+        )
+
+    def _prefill_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # localize_expert_routes uses ``num_local_experts`` as the sentinel for
+        # routes owned by another EP rank. That sentinel is useful while masking
+        # the corresponding weights, but it is one past the last valid bank row.
+        # Prefill's grouped kernels still sort/read ids whose weight is zero, so
+        # passing the sentinel can index outside the materialized local layer and
+        # corrupt the hidden state. Replace inactive ids with any valid local row,
+        # exactly as the cache-backed decode path already does; their zero weights
+        # keep them mathematically inert.
+        return super()._prefill_routed(
+            hidden_states,
+            topk_weights,
+            self._cache_safe_route_ids(topk_weights, topk_ids),
         )
 
 

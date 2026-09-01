@@ -1,3 +1,11 @@
+import os
+
+# Isolated source worktrees can reuse ABI-matched native extensions built by the
+# installed runtime without copying binaries into source control.
+_native_dir = os.environ.get("FREETOKEN_NATIVE_EXTENSION_DIR")
+if _native_dir and _native_dir not in __path__:
+    __path__.append(_native_dir)
+
 from .index import indexing
 from .fast_index_copy import fast_index_copy_jit, update_copy_flag_jit
 from .moe_impl import (

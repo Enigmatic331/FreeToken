@@ -113,6 +113,19 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _csv_nonnegative_ints(value: str) -> tuple[int, ...]:
+        try:
+            values = tuple(int(part.strip()) for part in value.split(","))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated non-negative integers"
+            ) from exc
+        if not values or any(item < 0 for item in values):
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated non-negative integers"
+            )
+        return values
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -242,6 +255,22 @@ def parse_args(
             "GPU(s) to run on, comma-separated; entry i is TP rank i. Each entry is a GPU "
             "UUID (GPU-xxxx..., as nvidia-smi -L prints) or an nvidia-smi index"
         ),
+    )
+
+    parser.add_argument(
+        "--qwen4-exp-backbone-rank",
+        type=int,
+        default=ServerArgs.qwen4_exp_backbone_rank,
+        help=(
+            "Experimental Qwen3.8 expert parallelism: execute the complete TP1 "
+            "backbone only on this rank; other ranks execute routed experts only."
+        ),
+    )
+    parser.add_argument(
+        "--qwen4-exp-expert-shards",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.qwen4_exp_expert_shards,
+        help="Optional comma-separated whole-expert counts per Qwen EP rank.",
     )
 
     parser.add_argument(
@@ -508,6 +537,12 @@ def parse_args(
         help="The number of unified MoE expert slots on GPU.",
     )
     moe_cache_group.add_argument(
+        "--moe-cache-sizes",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.moe_cache_sizes,
+        help="Comma-separated rank-local unified MoE expert-slot counts.",
+    )
+    moe_cache_group.add_argument(
         "--moe-cache-rate",
         type=_parse_moe_cache_rate,
         default=ServerArgs.moe_cache_rate,
@@ -535,6 +570,16 @@ def parse_args(
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
         help="The unified MoE cache eviction policy.",
+    )
+
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect graph-safe MoE cache hit/miss counters and print one per-rank "
+            "summary whenever the scheduler becomes idle."
+        ),
     )
 
     parser.add_argument(
@@ -675,6 +720,7 @@ def parse_args(
 
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0
+        and kwargs["moe_cache_sizes"] is None
         and not kwargs["moe_cache_auto"]
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
     )

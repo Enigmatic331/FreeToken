@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 
@@ -35,4 +36,24 @@ def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+@contextmanager
+def override_tp_info(rank: int, size: int):
+    """Temporarily expose a TP view used only while constructing/loading a model."""
+    global _TP_INFO
+    previous = _TP_INFO
+    if previous is None:
+        raise RuntimeError("TP info has not been set")
+    _TP_INFO = DistributedInfo(rank, size)
+    try:
+        yield _TP_INFO
+    finally:
+        _TP_INFO = previous
+
+
+__all__ = [
+    "DistributedInfo",
+    "set_tp_info",
+    "get_tp_info",
+    "override_tp_info",
+    "try_get_tp_info",
+]

@@ -20,6 +20,9 @@ class Qwen4ExpArgs:
     """Qwen3.8-Flash-Next geometry beyond the generic ModelConfig fields (ModelConfig.qwen4_args)."""
 
     hidden_size: int
+    # Global routed-expert namespace. ModelConfig.num_experts becomes rank-local
+    # under heterogeneous EP, while the router must continue scoring this count.
+    num_experts: int
     # Hyper-connections: every layer reads/writes hc_count residual streams [T, hc_count*hidden].
     hc_count: int
     hc_lowrank: int
@@ -235,6 +238,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
     qwen4_args = Qwen4ExpArgs(
         hidden_size=text.hidden_size,
+        num_experts=num_experts,
         hc_count=int(text.hc_count),
         hc_lowrank=int(text.hc_lowrank),
         ple_layer_ids=ple_layer_ids,
