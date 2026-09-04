@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -5,6 +6,7 @@ import torch
 
 import freetoken.distributed.info as distributed_info
 import freetoken.kernel as freetoken_kernel
+import freetoken.models.deepseek_v4.moe as dsv4_moe
 from freetoken.distributed import DistributedInfo
 from freetoken.models.deepseek_v4.moe import (
     DSV4OffloadMoELayer,
@@ -170,6 +172,69 @@ def test_dsv4_packed_prefill_preserves_canonical_route_order(monkeypatch):
     output = layer._maybe_combine_packed_prefill_routes(
         root_routes, root_owned.float()
     )
+    torch.testing.assert_close(output, full.float().sum(dim=1).to(torch.bfloat16))
+
+
+def test_dsv4_packed_prefill_posts_receive_before_combine(monkeypatch):
+    class FakeStream:
+        def __init__(self):
+            self.waited_for = []
+
+        def wait_stream(self, stream):
+            self.waited_for.append(stream)
+
+    class FakeCommunicator:
+        def __init__(self, remote):
+            self.remote = remote
+            self.receives = 0
+
+        def recv(self, tensor, src):
+            assert src == 1
+            self.receives += 1
+            tensor.copy_(self.remote)
+            return tensor
+
+    full = torch.arange(48, dtype=torch.float32).view(2, 6, 4).to(torch.bfloat16)
+    root_owned = torch.tensor(
+        [[True, False, True, False, True, True], [False, True, False, True, True, False]]
+    )
+    remote_indices = torch.nonzero(~root_owned.reshape(-1), as_tuple=False).flatten()
+    remote = full.view(-1, 4).index_select(0, remote_indices)
+    root_routes = torch.where(root_owned.unsqueeze(-1), full, 0)
+
+    layer = object.__new__(DSV4OffloadMoELayer)
+    layer.packed_prefill_root = 0
+    layer.hidden_size = 4
+    layer._packed_prefill_pending = None
+    layer._comm = FakeCommunicator(remote)
+
+    current = FakeStream()
+    receive = FakeStream()
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(0, 2))
+    monkeypatch.setattr(
+        "freetoken.core.get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=True)),
+    )
+    monkeypatch.setattr(dsv4_moe, "_EP_PACKED_PREFILL_OVERLAP", True)
+    monkeypatch.setattr(dsv4_moe, "_ep_packed_recv_stream", lambda device: receive)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: current)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    def sum_routes(routes, output):
+        output.copy_(routes.float().sum(dim=1).to(output.dtype))
+
+    monkeypatch.setattr(freetoken_kernel, "moe_sum_reduce_triton", sum_routes)
+
+    layer.prepare_packed_prefill_receive(root_owned.float(), torch.bfloat16)
+    assert layer._comm.receives == 1
+    assert receive.waited_for == [current]
+    assert layer._packed_prefill_pending is not None
+
+    output = layer._maybe_combine_packed_prefill_routes(
+        root_routes, root_owned.float()
+    )
+    assert current.waited_for == [receive]
+    assert layer._packed_prefill_pending is None
     torch.testing.assert_close(output, full.float().sum(dim=1).to(torch.bfloat16))
 
 

@@ -3,6 +3,8 @@ experts (GPU slot-cache / cpu / hybrid decode paths)."""
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -16,6 +18,17 @@ from freetoken.moe.partition import ExpertPartition, localize_expert_routes
 from .args import DeepseekV4Args
 from .execution import get_dsv4_execution_plan
 from .layers import Linear
+
+
+_EP_PACKED_PREFILL_OVERLAP = os.getenv("FREETOKEN_EP_PACKED_OVERLAP", "1") != "0"
+_EP_PACKED_RECV_STREAM: torch.cuda.Stream | None = None
+
+
+def _ep_packed_recv_stream(device: torch.device) -> torch.cuda.Stream:
+    global _EP_PACKED_RECV_STREAM
+    if _EP_PACKED_RECV_STREAM is None:
+        _EP_PACKED_RECV_STREAM = torch.cuda.Stream(device=device)
+    return _EP_PACKED_RECV_STREAM
 
 
 class Gate(nn.Module):
@@ -103,6 +116,53 @@ class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
         # association. The reducer below then reproduces TP1's top-k order.
         self.return_route_outputs = partition.world_size > 1
         self.packed_prefill_root: int | None = None
+        self._packed_prefill_pending = None
+
+    def prepare_packed_prefill_receive(
+        self,
+        local_topk_weights: torch.Tensor,
+        route_dtype: torch.dtype,
+    ) -> None:
+        """Post rank 0's packed receive before local expert work starts.
+
+        The worker still sends the same owned BF16 route rows and rank 0 still
+        inserts them into the same canonical route slots. Only the receive's
+        scheduling changes, so the strict FP32 top-k reduction is untouched.
+        """
+        from freetoken.core import get_global_ctx
+        from freetoken.distributed import get_tp_info
+
+        root = self.packed_prefill_root
+        info = get_tp_info()
+        if (
+            root is None
+            or info.rank != root
+            or not get_global_ctx().batch.is_prefill
+            or not _EP_PACKED_PREFILL_OVERLAP
+        ):
+            return
+        if info.size != 2:
+            raise RuntimeError("packed DSV4 prefill routes require exactly two EP ranks")
+        if self._packed_prefill_pending is not None:
+            raise RuntimeError("packed DSV4 prefill receive already pending")
+
+        owned = local_topk_weights.ne(0).reshape(-1)
+        remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
+        if remote_indices.numel() == 0:
+            self._packed_prefill_pending = (remote_indices, None, None)
+            return
+
+        packed = torch.empty(
+            (remote_indices.numel(), self.hidden_size),
+            dtype=route_dtype,
+            device=local_topk_weights.device,
+        )
+        current = torch.cuda.current_stream(local_topk_weights.device)
+        recv_stream = _ep_packed_recv_stream(local_topk_weights.device)
+        recv_stream.wait_stream(current)
+        with torch.cuda.stream(recv_stream):
+            self._comm.recv(packed, 1 - root)
+        self._packed_prefill_pending = (remote_indices, packed, recv_stream)
 
     def routed_forward(
         self,
@@ -149,11 +209,19 @@ class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
                 self._comm.send(packed, root)
             return routes
 
-        remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
-        if remote_indices.numel() != 0:
-            packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
-            self._comm.recv(packed, 1 - root)
-            flat_routes.index_copy_(0, remote_indices, packed)
+        pending = getattr(self, "_packed_prefill_pending", None)
+        self._packed_prefill_pending = None
+        if pending is not None:
+            remote_indices, packed, recv_stream = pending
+            if packed is not None:
+                torch.cuda.current_stream(routes.device).wait_stream(recv_stream)
+                flat_routes.index_copy_(0, remote_indices, packed)
+        else:
+            remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
+            if remote_indices.numel() != 0:
+                packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
+                self._comm.recv(packed, 1 - root)
+                flat_routes.index_copy_(0, remote_indices, packed)
 
         from freetoken.kernel import moe_sum_reduce_triton
 
@@ -255,17 +323,19 @@ class MoE(nn.Module):
             indices = self._comm.broadcast(
                 indices.to(torch.int32).contiguous(), self.execution.backbone_rank
             )
-        # Shared expert enqueued before routed_forward: hybrid decode blocks on the
-        # CPU pool inside routed_forward, so this GEMM must already be on the stream
-        # to overlap the CPU overflow compute.
-        assert self.shared_experts is not None
-        shared = self.shared_experts(x)
         if self.ep_active:
             # EP: keep only this rank's routes — remap to local bank ids and mark
             # foreign routes with the alignment sentinel. Routes stay normalized
             # globally, so the cross-rank all-reduce reconstructs the full sum.
             # (The shared expert is replicated and added after the reduce.)
             weights, indices = localize_expert_routes(weights, indices, self.partition)
+            self.experts.prepare_packed_prefill_receive(weights, x.dtype)
+        # Shared expert enqueued before routed_forward: hybrid decode blocks on the
+        # CPU pool inside routed_forward, so this GEMM must already be on the stream
+        # to overlap the CPU overflow compute. During prefill, rank 0 has already
+        # posted the packed worker-route receive on its side stream.
+        assert self.shared_experts is not None
+        shared = self.shared_experts(x)
         # routed_forward may mutate the ids in place (offload decode slot remap);
         # indices.to(int32) always copies (int64 source), so no clone needed here.
         routed = self.experts.routed_forward(
