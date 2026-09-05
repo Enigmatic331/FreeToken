@@ -38,6 +38,10 @@ class EngineConfig:
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
+    # Qwen EP block-FP8 only: prefills at or below this token count load just the
+    # routed experts into LRU slots and run the unchanged W8A8 grouped kernel over
+    # those slots. 0 disables the sparse short-prefill path.
+    moe_sparse_prefill_max_tokens: int = 0
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.

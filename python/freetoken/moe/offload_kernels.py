@@ -16,7 +16,13 @@ _HYBRID_FETCH_BY_RECENCY = (
 )
 
 
-def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+def ensure_experts(
+    cache,
+    layer_id: int,
+    expert_ids: torch.Tensor,
+    *,
+    stats: torch.Tensor | None = None,
+) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
     Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
@@ -35,9 +41,83 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        stats=stats,
         id_base=layer_id * cache.num_experts,
     )
+
+
+def ensure_experts_sparse_prefill(
+    cache,
+    layer_id: int,
+    expert_ids: torch.Tensor,
+    *,
+    stats: torch.Tensor | None = None,
+) -> None:
+    """Shape-stable LRU admission for a short prefill, then route-to-slot remap.
+
+    ``lru_ensure`` deduplicates in query space with a ``[K, K]`` block and compiles
+    once per power-of-two route count. A short prefill has at most E distinct local
+    experts but T*top_k route entries, so feeding routes directly can make the first
+    request at a new tail length spend minutes compiling a needlessly large kernel.
+
+    Build an E-wide query containing every active expert and pad inactive positions
+    with a duplicate of the first (always valid) route. LRU sees the same distinct set,
+    its geometry is constant, and a final linear kernel maps the original routes to the
+    slots it assigned. All work remains device-side and ordered on the compute stream.
+    """
+    query = cache.sparse_prefill_query
+    num_routes = expert_ids.numel()
+    assert num_routes > 0, "sparse prefill requires at least one routed token"
+    block_e = triton.next_power_of_2(cache.num_experts)
+    _sparse_prefill_query_kernel[(1,)](
+        expert_ids,
+        query,
+        num_routes,
+        cache.num_experts,
+        BLOCK_E=block_e,
+        num_warps=4,
+    )
+    ensure_experts(cache, layer_id, query, stats=stats)
+    block = 256
+    _remap_sparse_prefill_routes_kernel[(triton.cdiv(num_routes, block),)](
+        expert_ids,
+        cache.slot_for_id,
+        layer_id * cache.num_experts,
+        num_routes,
+        BLOCK=block,
+    )
+
+
+@triton.jit(do_not_specialize=["num_routes"])
+def _sparse_prefill_query_kernel(
+    expert_ids_ptr,
+    query_ptr,
+    num_routes,
+    num_experts: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    expert = tl.arange(0, BLOCK_E)
+    lane = expert < num_experts
+    fallback = tl.load(expert_ids_ptr)
+    active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+    for route in tl.range(num_routes):
+        active = active | (expert == tl.load(expert_ids_ptr + route))
+    tl.store(query_ptr + expert, tl.where(active, expert, fallback), mask=lane)
+
+
+@triton.jit(do_not_specialize=["id_base", "num_routes"])
+def _remap_sparse_prefill_routes_kernel(
+    expert_ids_ptr,
+    slot_for_id_ptr,
+    id_base,
+    num_routes,
+    BLOCK: tl.constexpr,
+):
+    route = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = route < num_routes
+    expert = tl.load(expert_ids_ptr + route, mask=mask, other=0)
+    slot = tl.load(slot_for_id_ptr + id_base + expert, mask=mask)
+    tl.store(expert_ids_ptr + route, slot, mask=mask)
 
 
 def ensure_experts_hybrid(

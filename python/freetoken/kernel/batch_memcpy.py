@@ -28,6 +28,10 @@ def _probe(fn) -> None:
     src = torch.arange(16, dtype=torch.uint8).pin_memory()
     dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
+    # ``zeros`` is enqueued on the current stream. Without this dependency the
+    # independent probe stream can copy first and then lose the race to that memset,
+    # making a working cudaMemcpyBatchAsync binding fail its own probe intermittently.
+    stream.wait_stream(torch.cuda.current_stream())
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),

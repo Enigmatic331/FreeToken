@@ -669,6 +669,7 @@ class Engine:
                 cache_policy=config.moe_cache_policy,
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                sparse_prefill_max_tokens=config.moe_sparse_prefill_max_tokens,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -1284,6 +1285,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_sparse_prefill_max_tokens": 0,
     "expert_load": "auto",
 }
 
@@ -1365,6 +1367,17 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+
+    sparse_prefill_max_tokens = getattr(config, "moe_sparse_prefill_max_tokens", 0)
+    if sparse_prefill_max_tokens and not (
+        config.moe_backend == "offload"
+        and qwen_backbone_rank is not None
+        and expert_quant == "fp8_block"
+    ):
+        raise ValueError(
+            "--moe-sparse-prefill-max-tokens currently requires the offload "
+            "backend with Qwen4Exp EP block-FP8 experts"
+        )
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family

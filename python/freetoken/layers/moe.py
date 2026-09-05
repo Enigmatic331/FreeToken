@@ -985,6 +985,36 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        cache = self.offload_cache
+        assert cache is not None
+        if (
+            cache.sparse_prefill_max_tokens > 0
+            and hidden_states.shape[0] <= cache.sparse_prefill_max_tokens
+            and cache.quant_format == "fp8_block"
+            and not cache.is_unpinned_layer(self.layer_id)
+        ):
+            # Preserve prefill numerics: unlike the W8A16 decode GEMV, the grouped
+            # W8A8 prefill kernel accepts cache-slot ids directly. Make the EP
+            # sentinel safe for LRU bookkeeping, remap expert ids to slots, then
+            # restore an out-of-range sentinel so the existing compact schedule
+            # can omit routes owned by the peer rank.
+            inactive = topk_weights == 0
+            route_ids = self._cache_safe_route_ids(topk_weights, topk_ids).contiguous()
+            cache.ensure_sparse_prefill_experts(self.layer_id, route_ids)
+            cache.copy_missing()
+            if self.skip_inactive_prefill_routes:
+                route_ids.masked_fill_(inactive, cache.cache_size)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                route_ids,
+                views=cache.bank_views(),
+                n=cache.cache_size,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=True,
+            )
+
         # localize_expert_routes uses ``num_local_experts`` as the sentinel for
         # routes owned by another EP rank. That sentinel is useful while masking
         # the corresponding weights, but it is one past the last valid bank row.

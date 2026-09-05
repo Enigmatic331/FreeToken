@@ -214,3 +214,105 @@ def test_fp8_prefill_compact_ep_routes_match_owned_outputs():
         compact.reshape(-1, hidden_size)[owned.reshape(-1)],
         reference.reshape(-1, hidden_size)[owned.reshape(-1)],
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp8_prefill_cache_slot_remap_is_bit_exact_for_owned_routes():
+    from freetoken.kernel.triton.fp8_block_linear import FP8
+    from freetoken.kernel.triton.fp8_blockscale_moe import (
+        fused_experts_fp8_blockscale,
+    )
+
+    torch.manual_seed(31)
+    tokens, experts, slots = 17, 4, 32
+    hidden_size, intermediate_size, top_k = 256, 128, 4
+    gate_up = torch.randn(
+        experts, 2 * intermediate_size, hidden_size, device="cuda"
+    ).to(FP8)
+    gate_up_scale = torch.rand(
+        experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) + 0.5
+    down = torch.randn(
+        experts, hidden_size, intermediate_size, device="cuda"
+    ).to(FP8)
+    down_scale = torch.rand(
+        experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) + 0.5
+    hidden = torch.randn(tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    expert_ids = torch.randint(
+        0, experts + 1, (tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    expert_ids[0] = torch.tensor([0, experts, 3, experts], device="cuda")
+    owned = expert_ids < experts
+    route_weights = torch.rand(tokens, top_k, device="cuda", dtype=torch.float32)
+    route_weights.masked_fill_(~owned, 0.0)
+
+    reference = fused_experts_fp8_blockscale(
+        hidden,
+        gate_up,
+        gate_up_scale,
+        down,
+        down_scale,
+        route_weights,
+        expert_ids,
+        experts,
+        return_route_outputs=True,
+        skip_inactive_routes=True,
+        compact_inactive_routes=True,
+    )
+
+    mapping = torch.tensor([17, 2, 29, 8], device="cuda", dtype=torch.int64)
+    slot_gate_up = torch.empty(
+        slots, 2 * intermediate_size, hidden_size, device="cuda", dtype=FP8
+    )
+    slot_gate_up.view(torch.uint8).index_copy_(
+        0, mapping, gate_up.view(torch.uint8)
+    )
+    slot_gate_up_scale = torch.empty(
+        slots,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    slot_gate_up_scale.index_copy_(0, mapping, gate_up_scale)
+    slot_down = torch.empty(
+        slots, hidden_size, intermediate_size, device="cuda", dtype=FP8
+    )
+    slot_down.view(torch.uint8).index_copy_(0, mapping, down.view(torch.uint8))
+    slot_down_scale = torch.empty(
+        slots,
+        hidden_size // 128,
+        intermediate_size // 128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    slot_down_scale.index_copy_(0, mapping, down_scale)
+    safe_ids = expert_ids.clamp(max=experts - 1).long()
+    slot_ids = mapping[safe_ids].to(torch.int32)
+    slot_ids.masked_fill_(~owned, slots)
+
+    remapped = fused_experts_fp8_blockscale(
+        hidden,
+        slot_gate_up,
+        slot_gate_up_scale,
+        slot_down,
+        slot_down_scale,
+        route_weights,
+        slot_ids,
+        slots,
+        return_route_outputs=True,
+        skip_inactive_routes=True,
+        compact_inactive_routes=True,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(remapped[owned], reference[owned])

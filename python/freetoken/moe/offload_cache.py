@@ -117,6 +117,9 @@ class OffloadMoeCache:
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
+    # Maximum prefill rows eligible for a model-specific sparse slot-cache path.
+    # Zero disables it. Qwen EP block-FP8 is currently the only consumer.
+    sparse_prefill_max_tokens: int = 0
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
@@ -150,6 +153,7 @@ class OffloadMoeCache:
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
+        assert self.sparse_prefill_max_tokens >= 0
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
@@ -183,6 +187,15 @@ class OffloadMoeCache:
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
+        # Shape-stable sparse-prefill admission query. The request's route count varies
+        # with the uncached tail, but flashlib's LRU kernel has a quadratic query-space
+        # dedup block whose compile geometry follows that count. Build one fixed E-wide
+        # query (active ids plus duplicates of a valid id) so short tails compile a
+        # single admission variant instead of a new, increasingly expensive one at
+        # every power-of-two boundary.
+        self.sparse_prefill_query = torch.empty(
+            (self.num_experts,), dtype=torch.int32, device=self.device
+        )
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
         plan_slots = max(self.num_experts, self.cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -222,6 +235,11 @@ class OffloadMoeCache:
         # the kernel, which accumulates in the same launch. The stat_* tensors below stay
         # for the hybrid path, whose kernel is still ours.
         self.lru_stats = torch.zeros(
+            (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
+        )
+        # Same flashlib LRU counters, kept separate so sparse prefill does not
+        # contaminate decode miss-rate telemetry used for cache tuning.
+        self.sparse_prefill_stats = torch.zeros(
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
         self.stat_missing = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -483,6 +501,7 @@ class OffloadMoeCache:
         self.stat_missing_layer.zero_()
         # a rebuild is a cold start for the cache; carrying pre-rebuild hit/miss counts over would skew every post-rebuild stats report
         self.lru_stats.zero_()
+        self.sparse_prefill_stats.zero_()
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
@@ -817,7 +836,19 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        stats = self.lru_stats[layer_id] if self.collect_stats else None
+        ensure_experts(self, layer_id, expert_ids, stats=stats)
+
+    def ensure_sparse_prefill_experts(
+        self, layer_id: int, expert_ids: torch.Tensor
+    ) -> None:
+        """Admit sparse-prefill routes with a fixed-size LRU query and remap in place."""
+        from freetoken.moe.offload_kernels import ensure_experts_sparse_prefill
+
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        stats = self.sparse_prefill_stats[layer_id] if self.collect_stats else None
+        ensure_experts_sparse_prefill(self, layer_id, expert_ids, stats=stats)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -859,6 +890,7 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()
+        self.sparse_prefill_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -913,6 +945,15 @@ class OffloadMoeCache:
             # rows prefetched into the double buffer since the last reset.
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
+        }
+
+    def sparse_prefill_miss_stats(self) -> dict:
+        active, missing, calls = (int(x) for x in self.sparse_prefill_stats.sum(0))
+        return {
+            "layer_calls": calls,
+            "active_per_layer": (active / calls) if calls else 0.0,
+            "missing_per_layer": (missing / calls) if calls else 0.0,
+            "miss_rate": (missing / active) if active else 0.0,
         }
 
     def decode_miss_stats_per_layer(self) -> dict:

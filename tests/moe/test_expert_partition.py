@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -197,6 +197,8 @@ def test_ep_offload_sanitizes_inactive_route_ids_before_kernels(monkeypatch, pat
 
     monkeypatch.setattr(OffloadMoELayer, path, capture)
     layer = object.__new__(ExpertParallelOffloadMoELayer)
+    if path == "_prefill_routed":
+        layer.offload_cache = SimpleNamespace(sparse_prefill_max_tokens=0)
     hidden = torch.zeros((2, 4), dtype=torch.bfloat16)
     weights = torch.tensor([[0.2, 0.0, 0.3], [0.0, 0.0, 0.0]])
     # 256 is the one-past-the-end sentinel for a 256-expert local bank.
@@ -210,3 +212,93 @@ def test_ep_offload_sanitizes_inactive_route_ids_before_kernels(monkeypatch, pat
         captured["ids"],
         torch.tensor([[7, 7, 9], [0, 0, 0]], dtype=torch.int32),
     )
+
+
+def test_ep_fp8_short_prefill_uses_sparse_slot_cache_and_restores_sentinel():
+    calls = {}
+
+    class FakeCache:
+        sparse_prefill_max_tokens = 4
+        quant_format = "fp8_block"
+        cache_size = 32
+
+        @staticmethod
+        def is_unpinned_layer(layer_id):
+            calls["unpinned_layer"] = layer_id
+            return False
+
+        @staticmethod
+        def ensure_sparse_prefill_experts(layer_id, ids):
+            calls["ensure"] = (layer_id, ids.clone())
+            ids.add_(10)
+
+        @staticmethod
+        def copy_missing():
+            calls["copied"] = True
+
+        @staticmethod
+        def bank_views():
+            return ("slot-banks",)
+
+        @staticmethod
+        def alphas_for_slots(layer_id):
+            calls["alpha_layer"] = layer_id
+            return None
+
+    def fake_expert_gemm(
+        self, cache, hidden, weights, ids, *, views, n, alphas, is_prefill
+    ):
+        calls["gemm"] = {
+            "cache": cache,
+            "ids": ids.clone(),
+            "views": views,
+            "n": n,
+            "alphas": alphas,
+            "is_prefill": is_prefill,
+        }
+        return hidden
+
+    layer = object.__new__(ExpertParallelOffloadMoELayer)
+    layer.layer_id = 3
+    layer.offload_cache = FakeCache()
+    layer.skip_inactive_prefill_routes = True
+    layer._expert_gemm = MethodType(fake_expert_gemm, layer)
+    hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
+    weights = torch.tensor([[0.2, 0.0, 0.3], [0.0, 0.4, 0.0]])
+    ids = torch.tensor([[1, 4, 2], [4, 3, 4]], dtype=torch.int32)
+
+    output = layer._prefill_routed(hidden, weights, ids)
+
+    assert output is hidden
+    assert calls["unpinned_layer"] == 3
+    assert calls["ensure"][0] == 3
+    assert torch.equal(calls["ensure"][1], torch.tensor([[1, 1, 2], [3, 3, 3]]))
+    assert calls["copied"] is True
+    assert calls["gemm"]["cache"] is layer.offload_cache
+    assert calls["gemm"]["views"] == ("slot-banks",)
+    assert calls["gemm"]["n"] == 32
+    assert calls["gemm"]["is_prefill"] is True
+    assert torch.equal(
+        calls["gemm"]["ids"],
+        torch.tensor([[11, 32, 12], [32, 13, 32]], dtype=torch.int32),
+    )
+
+
+def test_ep_sparse_prefill_threshold_falls_back_to_whole_layer(monkeypatch):
+    captured = {}
+
+    def capture(_self, hidden_states, topk_weights, topk_ids):
+        captured["ids"] = topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr(OffloadMoELayer, "_prefill_routed", capture)
+    layer = object.__new__(ExpertParallelOffloadMoELayer)
+    layer.offload_cache = SimpleNamespace(sparse_prefill_max_tokens=4)
+    hidden = torch.zeros((5, 8), dtype=torch.bfloat16)
+    weights = torch.tensor([[0.2, 0.0]]).expand(5, -1).clone()
+    ids = torch.tensor([[1, 4]], dtype=torch.int32).expand(5, -1).clone()
+
+    output = layer._prefill_routed(hidden, weights, ids)
+
+    assert output is hidden
+    assert torch.equal(captured["ids"], torch.ones_like(ids))

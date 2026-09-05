@@ -113,6 +113,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _nonnegative_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
     def _csv_nonnegative_ints(value: str) -> tuple[int, ...]:
         try:
             values = tuple(int(part.strip()) for part in value.split(","))
@@ -667,6 +676,17 @@ def parse_args(
             "the double buffer and stream only the misses over PCIe "
             "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
             "--moe-cache-size > 2 * num_experts."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-sparse-prefill-max-tokens",
+        type=_nonnegative_int,
+        default=ServerArgs.moe_sparse_prefill_max_tokens,
+        help=(
+            "For Qwen EP block-FP8 offload, prefills no larger than this many "
+            "tokens load only routed experts into the LRU cache and retain the "
+            "W8A8 grouped-prefill kernel. 0 (default) disables the path."
         ),
     )
 

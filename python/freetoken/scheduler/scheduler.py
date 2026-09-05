@@ -155,7 +155,12 @@ class Scheduler(SchedulerIOMixin):
         if cache is None or not self.config.moe_collect_stats:
             return
         totals = cache.decode_miss_stats()
-        if not totals["layer_calls"] and not totals["prefill_rows"]:
+        sparse = cache.sparse_prefill_miss_stats()
+        if (
+            not totals["layer_calls"]
+            and not totals["prefill_rows"]
+            and not sparse["layer_calls"]
+        ):
             return
         layers = cache.decode_miss_stats_per_layer()["per_layer"]
         active_layers = [layer for layer in layers if layer["steps"]]
@@ -170,6 +175,7 @@ class Scheduler(SchedulerIOMixin):
         logger.info(
             "MoE cache stats: active/layer=%.2f missing/layer=%.2f miss=%.2f%% "
             "fetched/layer=%.2f fetch/miss=%.2f%% prefill-hit=%d/%d (%.2f%%) "
+            "sparse-prefill active/layer=%.2f missing/layer=%.2f miss=%.2f%% "
             "worst-layers=%s",
             totals["active_per_layer"],
             totals["missing_per_layer"],
@@ -179,6 +185,9 @@ class Scheduler(SchedulerIOMixin):
             totals["prefill_hit_rows"],
             totals["prefill_rows"],
             100 * prefill_hit_rate,
+            sparse["active_per_layer"],
+            sparse["missing_per_layer"],
+            100 * sparse["miss_rate"],
             worst_text,
         )
         cache.reset_stats()

@@ -601,6 +601,43 @@ def test_nvfp4_materialize_keeps_bookkeeping_consistent_across_requests():
     assert [fingerprint(s) for s in ids3.tolist()] == [E + 1, E + 2]
 
 
+def test_sparse_prefill_admission_is_shape_stable_and_remaps_every_route():
+    from flashlib.kernels.slot_cache import Stat
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the sparse-prefill admission kernel")
+
+    L, E, S = 2, 8, 12
+    cache = OffloadMoeCache(
+        num_layers=L,
+        num_experts=E,
+        cache_size=S,
+        device=torch.device("cuda"),
+    )
+    cache.collect_stats = True
+
+    for layer_id, raw in (
+        (0, [2, 5, 2, 7]),
+        (1, [1, 6, 3, 1, 6, 4, 3, 1, 4]),
+    ):
+        routes = torch.tensor(raw, dtype=torch.int32, device="cuda")
+        cache.ensure_sparse_prefill_experts(layer_id, routes)
+        torch.cuda.synchronize()
+
+        owners = cache.id_of_slot[routes.long()].cpu()
+        expected = torch.tensor(raw, dtype=torch.int32) + layer_id * E
+        assert torch.equal(owners, expected)
+
+    stats = cache.sparse_prefill_stats.cpu()
+    assert stats[0, Stat.ACTIVE] == 3
+    assert stats[0, Stat.MISS] == 3
+    assert stats[0, Stat.CALLS] == 1
+    assert stats[1, Stat.ACTIVE] == 4
+    assert stats[1, Stat.MISS] == 4
+    assert stats[1, Stat.CALLS] == 1
+
+
 def test_offload_cache_rebuild_resizes_and_preserves_sources():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
