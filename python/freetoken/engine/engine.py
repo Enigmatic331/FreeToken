@@ -170,6 +170,13 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     validate_attn_backend(config.attention_backend, allow_auto=False)
 
     model_config = config.model_config
+    if config.vision_device is not None:
+        if getattr(model_config, "qwen4_args", None) is None:
+            raise ValueError("--vision-device currently supports Qwen3.8/Qwen4Exp checkpoints")
+        if not model_config.is_multimodal:
+            raise ValueError(
+                "--vision-device was set, but this checkpoint has no compatible vision_config"
+            )
     backend_parts = [p.strip() for p in config.attention_backend.split(",")]
     for part in backend_parts:
         info = attention_backend_info(part)
@@ -292,6 +299,10 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        if config.vision_device is not None:
+            # parse_config is lazy/cached on EngineConfig and controls both model
+            # construction and checkpoint filtering through this opt-in.
+            os.environ["FREETOKEN_LOAD_VISION"] = "1"
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
@@ -327,6 +338,10 @@ class Engine:
         with self._qwen4_plan.model_tp_context():
             with torch.device("meta"), torch_dtype(config.dtype):
                 self.model = create_model(config.model_config)
+            if hasattr(self.model, "set_vision_device") and config.vision_device is not None:
+                spec = config.vision_device
+                vision_device = torch.device(f"cuda:{spec}" if spec.isdecimal() else spec)
+                self.model.set_vision_device(vision_device)
             self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free

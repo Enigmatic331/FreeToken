@@ -47,8 +47,12 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerBase, *, enable_multimodal: bool = False
+    ) -> None:
         self.tokenizer = tokenizer
+        self.enable_multimodal = enable_multimodal
+        self._multimodal_processor = None
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
@@ -56,22 +60,40 @@ class TokenizeManager:
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
-        # TODO: batch tokenization
+        return [result.input_ids for result in self.tokenize_inputs(msgs)]
+
+    def tokenize_inputs(self, msgs: List[TokenizeMsg]) -> list[Any]:
+        from freetoken.multimodal.qwen_vl import (
+            QwenVLProcessor,
+            TokenizedMultimodalPrompt,
+            image_sources,
+        )
+
+        results: list[TokenizedMultimodalPrompt] = []
         for msg in msgs:
             prompt = self.render_prompt(msg)
-            # A jinja chat template owns every special token (HF's apply_chat_template
-            # tokenizes with add_special_tokens=False for the same reason): tokenizers
-            # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
-            # the template already rendered one. Raw-string prompts and the dsv4
-            # encoder path keep the default.
+            sources = image_sources(msg.text)
+            if sources:
+                if not self.enable_multimodal:
+                    raise ValueError(
+                        "image inputs are disabled; start the server with --vision-device"
+                    )
+                if self._multimodal_processor is None:
+                    model_path = getattr(self.tokenizer, "name_or_path", None) or getattr(
+                        self.tokenizer, "_name_or_path", None
+                    )
+                    if not model_path:
+                        raise ValueError("tokenizer does not expose its checkpoint path")
+                    self._multimodal_processor = QwenVLProcessor(str(model_path))
+                results.append(self._multimodal_processor.process(prompt, msg.text))
+                continue
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
+            input_ids = self.tokenizer.encode(
+                prompt, return_tensors="pt", add_special_tokens=not templated
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            results.append(
+                TokenizedMultimodalPrompt(input_ids=input_ids.view(-1).to(torch.int32))
+            )
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
@@ -81,6 +103,13 @@ class TokenizeManager:
         validation, count_tokens) must quantize identically."""
         if not isinstance(msg.text, list):
             return msg.text
+        if not self.enable_multimodal:
+            from freetoken.multimodal.qwen_vl import image_sources
+
+            if image_sources(msg.text):
+                raise ValueError(
+                    "image inputs are disabled; start the server with --vision-device"
+                )
         return self._render(
             msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
         )

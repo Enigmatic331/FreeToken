@@ -84,18 +84,22 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
+) -> tuple[List[TokenizeMsg], List[Any], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
     """
     ok_msgs: List[TokenizeMsg] = []
-    ok_tensors: List[torch.Tensor] = []
+    ok_inputs: List[Any] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            if hasattr(tokenize_manager, "tokenize_inputs"):
+                encoded = tokenize_manager.tokenize_inputs([msg])[0]
+                tokens = encoded.input_ids
+            else:  # Small test doubles and third-party managers implementing the old seam.
+                encoded = tokens = tokenize_manager.tokenize([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -120,8 +124,8 @@ def _tokenize_requests(
             )
             continue
         ok_msgs.append(msg)
-        ok_tensors.append(tokens)
-    return ok_msgs, ok_tensors, errors
+        ok_inputs.append(encoded)
+    return ok_msgs, ok_inputs, errors
 
 
 @torch.inference_mode()
@@ -135,6 +139,7 @@ def tokenize_worker(
     local_bs: int,
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
+    enable_multimodal: bool = False,
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
@@ -147,7 +152,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, enable_multimodal=enable_multimodal)
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -245,7 +250,7 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, errors = _tokenize_requests(
+                ok_msgs, ok_inputs, errors = _tokenize_requests(
                     tokenize_manager, tokenize_msg, logger
                 )
                 if errors:
@@ -253,10 +258,29 @@ def tokenize_worker(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
                 if ok_msgs:
-                    backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
-                    ]
+                    backend = []
+                    for msg, encoded in zip(ok_msgs, ok_inputs, strict=True):
+                        if isinstance(encoded, torch.Tensor):
+                            backend.append(
+                                UserMsg(
+                                    uid=msg.uid,
+                                    input_ids=encoded,
+                                    sampling_params=msg.sampling_params,
+                                )
+                            )
+                        else:
+                            backend.append(
+                                UserMsg(
+                                    uid=msg.uid,
+                                    input_ids=encoded.input_ids,
+                                    sampling_params=msg.sampling_params,
+                                    pixel_values=encoded.pixel_values,
+                                    image_grid_thw=encoded.image_grid_thw,
+                                    rope_positions=encoded.rope_positions,
+                                    mrope_position_delta=encoded.mrope_position_delta,
+                                    is_multimodal=encoded.is_multimodal,
+                                )
+                            )
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(

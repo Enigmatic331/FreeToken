@@ -19,16 +19,26 @@ import triton.language as tl
 def _compress_qsa_groups_kernel(
     raw_keys_ptr,
     ring_ptr,
+    raw_rope_ptr,
+    rope_ring_ptr,
     ring_slots_ptr,
     token_to_req_ptr,
     query_start_loc_ptr,
     logical_positions_ptr,
     pooled_ptr,
     first_positions_ptr,
+    first_rope_ptr,
     stride_raw_row,
     stride_ring_slot,
     stride_ring_row,
     stride_pooled_row,
+    stride_raw_rope_row,
+    stride_raw_rope_axis,
+    stride_rope_ring_slot,
+    stride_rope_ring_row,
+    stride_rope_ring_axis,
+    stride_first_rope_row,
+    stride_first_rope_axis,
     num_rows,
     num_ring_slots,
     num_requests,
@@ -36,6 +46,7 @@ def _compress_qsa_groups_kernel(
     COMPRESS_RATIO: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    HAS_MROPE: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
@@ -101,6 +112,38 @@ def _compress_qsa_groups_kernel(
         tl.where(valid_row, first_position, 0),
         mask=row < num_rows,
     )
+    if HAS_MROPE:
+        axes = tl.arange(0, 4)
+        valid_axis = axes < 3
+        first_uses_raw = first_position >= chunk_start_position
+        first_raw_row = query_row_start + first_position - chunk_start_position
+        raw_rope = tl.load(
+            raw_rope_ptr
+            + first_raw_row * stride_raw_rope_row
+            + axes * stride_raw_rope_axis,
+            mask=valid_axis
+            & valid_row
+            & first_uses_raw
+            & (first_raw_row >= query_row_start)
+            & (first_raw_row < query_row_end),
+            other=0,
+        )
+        ring_rope = tl.load(
+            rope_ring_ptr
+            + tl.maximum(ring_slot, 0).to(tl.int64) * stride_rope_ring_slot
+            + (first_position % RING_CAPACITY) * stride_rope_ring_row
+            + axes * stride_rope_ring_axis,
+            mask=valid_axis & valid_row & ~first_uses_raw & valid_ring_slot,
+            other=0,
+        )
+        first_rope = tl.where(first_uses_raw, raw_rope, ring_rope)
+        tl.store(
+            first_rope_ptr
+            + row * stride_first_rope_row
+            + axes * stride_first_rope_axis,
+            first_rope,
+            mask=(row < num_rows) & valid_axis,
+        )
 
 
 @triton.jit
@@ -114,6 +157,8 @@ def _index_norm_rope_kernel(
     stride_x_row,
     stride_out_row,
     stride_cos_sin_row,
+    stride_positions_row,
+    stride_positions_axis,
     num_rows,
     eps,
     HEADS: tl.constexpr,
@@ -122,6 +167,9 @@ def _index_norm_rope_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_DEST_ROWS: tl.constexpr,
+    HAS_MROPE: tl.constexpr,
+    SECTION_H: tl.constexpr,
+    SECTION_W: tl.constexpr,
 ) -> None:
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     live = rows < num_rows
@@ -146,8 +194,26 @@ def _index_norm_rope_kernel(
     y = x * rrms[:, None] * weight[None, :]
     y_partner = x_partner * rrms[:, None] * weight_partner[None, :]
 
-    position = tl.load(positions_ptr + rows // HEADS, mask=live, other=0).to(tl.int64)
-    cos_base = cos_sin_ptr + position[:, None] * stride_cos_sin_row
+    token_rows = rows // HEADS
+    if HAS_MROPE:
+        axis = tl.zeros((BLOCK_D,), dtype=tl.int32)
+        axis = tl.where((pair % 3 == 1) & (pair < SECTION_H * 3), 1, axis)
+        axis = tl.where((pair % 3 == 2) & (pair < SECTION_W * 3), 2, axis)
+        position = tl.load(
+            positions_ptr
+            + token_rows[:, None].to(tl.int64) * stride_positions_row
+            + axis[None, :] * stride_positions_axis,
+            mask=live[:, None] & in_rotary[None, :],
+            other=0,
+        ).to(tl.int64)
+    else:
+        scalar_position = tl.load(
+            positions_ptr + token_rows * stride_positions_row,
+            mask=live,
+            other=0,
+        ).to(tl.int64)
+        position = scalar_position[:, None]
+    cos_base = cos_sin_ptr + position * stride_cos_sin_row
     rotary_mask = live[:, None] & in_rotary[None, :]
     cos = tl.load(cos_base + pair[None, :], mask=rotary_mask, other=1.0)
     sin = tl.load(cos_base + ROTARY_HALF + pair[None, :], mask=rotary_mask, other=0.0)
@@ -212,6 +278,9 @@ def qsa_compress_groups(
     compress_ratio: int,
     pooled: torch.Tensor,
     first_positions: torch.Tensor,
+    rope_positions: torch.Tensor | None = None,
+    rope_ring: torch.Tensor | None = None,
+    first_rope_positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool each row's closing group from the pending ring and this step's raw rows."""
 
@@ -223,21 +292,44 @@ def qsa_compress_groups(
         raise ValueError("QSA ring capacity must cover a whole group")
     if raw_keys.stride(1) != 1 or ring.stride(2) != 1 or pooled.stride(1) != 1:
         raise ValueError("QSA compression needs unit-stride key rows")
+    has_mrope = rope_positions is not None
+    if has_mrope:
+        if rope_ring is None or first_rope_positions is None:
+            raise ValueError("QSA MRoPE compression needs ring and output coordinates")
+        if (
+            rope_positions.shape != (rows, 3)
+            or rope_ring.shape != (ring.shape[0], ring.shape[1], 3)
+            or first_rope_positions.shape != (rows, 3)
+        ):
+            raise ValueError("QSA MRoPE coordinates have incompatible shapes")
+    raw_rope = rope_positions if rope_positions is not None else logical_positions
+    saved_rope = rope_ring if rope_ring is not None else ring
+    first_rope = first_rope_positions if first_rope_positions is not None else first_positions
     if not rows:
         return pooled, first_positions
     _compress_qsa_groups_kernel[(rows,)](
         raw_keys,
         ring,
+        raw_rope,
+        saved_rope,
         ring_slots,
         token_to_req,
         query_start_loc,
         logical_positions,
         pooled,
         first_positions,
+        first_rope,
         raw_keys.stride(0),
         ring.stride(0),
         ring.stride(1),
         pooled.stride(0),
+        raw_rope.stride(0),
+        raw_rope.stride(1) if raw_rope.ndim > 1 else 0,
+        saved_rope.stride(0),
+        saved_rope.stride(1) if saved_rope.ndim > 1 else 0,
+        saved_rope.stride(2) if saved_rope.ndim > 2 else 0,
+        first_rope.stride(0),
+        first_rope.stride(1) if first_rope.ndim > 1 else 0,
         rows,
         ring.shape[0],
         query_start_loc.shape[0] - 1,
@@ -245,6 +337,7 @@ def qsa_compress_groups(
         COMPRESS_RATIO=compress_ratio,
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        HAS_MROPE=has_mrope,
         num_warps=4,
     )
     return pooled, first_positions
@@ -259,6 +352,7 @@ def qsa_index_norm_rope(
     out: torch.Tensor,
     heads: int = 1,
     dest_rows: torch.Tensor | None = None,
+    mrope_section: tuple[int, int, int] | None = None,
 ) -> torch.Tensor:
     """Zero-centered RMSNorm then partial NeoX rope on [rows, head_dim] indexer rows."""
 
@@ -270,6 +364,13 @@ def qsa_index_norm_rope(
         raise ValueError("QSA indexer norm+rope needs unit-stride rows")
     if rows % heads:
         raise ValueError("QSA indexer rows must be a whole number of head groups")
+    has_mrope = positions.ndim == 2
+    if has_mrope:
+        if positions.shape[1] != 3 or mrope_section is None:
+            raise ValueError("QSA MRoPE positions need [tokens, 3] and three sections")
+        if len(mrope_section) != 3 or sum(mrope_section) != rotary_dim // 2:
+            raise ValueError("QSA MRoPE sections must sum to rotary_dim/2")
+    sections = mrope_section or (0, 0, 0)
     if not rows:
         return out
     block_r = 8 if head_dim >= 128 else 16
@@ -283,6 +384,8 @@ def qsa_index_norm_rope(
         x.stride(0),
         out.stride(0),
         cos_sin_cache.stride(0),
+        positions.stride(0),
+        positions.stride(1) if positions.ndim > 1 else 0,
         rows,
         eps,
         HEADS=heads,
@@ -291,6 +394,9 @@ def qsa_index_norm_rope(
         BLOCK_R=block_r,
         BLOCK_D=triton.next_power_of_2(head_dim),
         HAS_DEST_ROWS=dest_rows is not None,
+        HAS_MROPE=has_mrope,
+        SECTION_H=sections[1],
+        SECTION_W=sections[2],
         num_warps=4,
     )
     return out

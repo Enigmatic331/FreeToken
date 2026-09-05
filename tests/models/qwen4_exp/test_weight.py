@@ -17,6 +17,7 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
+    _rename,
     iter_weights,
     load_ple_table,
 )
@@ -207,6 +208,14 @@ def test_mtp_visual_experts_and_table_never_loaded(loaded):
         assert ".mlp.experts." not in name
         assert "ngram_embedding" not in name
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale"))
+
+
+def test_visual_weights_are_mapped_only_when_vision_is_enabled(monkeypatch):
+    raw = "model.visual.blocks.0.attn.qkv.weight"
+    monkeypatch.delenv("FREETOKEN_LOAD_VISION", raising=False)
+    assert _rename(raw) is None
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    assert _rename(raw) == "visual.blocks.0.attn.qkv.weight"
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):

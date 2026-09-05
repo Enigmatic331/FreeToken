@@ -188,9 +188,12 @@ def resolve_sampling(
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    """Normalize message dicts for the checkpoint chat template.
+
+    Text-only part lists stay flattened for compatibility with templates that expect a
+    string. Lists containing images retain their ordered text/image structure, using the
+    Qwen-VL ``image_url`` spelling understood by ``apply_chat_template``.
+    """
     return [_render_message(m) for m in messages]
 
 
@@ -198,7 +201,7 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        m["content"] = _normalize_content_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -230,15 +233,27 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> str:
-    texts: list[str] = []
+def _normalize_content_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    has_image = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
-        if ptype == "text":
-            texts.append((part.get("text") if isinstance(part, dict) else None) or "")
-        else:
-            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
-    return "".join(texts)
+        if ptype in ("text", "input_text", "output_text"):
+            normalized.append({"type": "text", "text": part.get("text") or ""})
+            continue
+        if ptype in ("image", "image_url", "input_image"):
+            source = part.get("image_url", part.get("image"))
+            if isinstance(source, dict):
+                source = source.get("url", source.get("data"))
+            if not source:
+                raise ValueError("image content part is missing image_url")
+            normalized.append({"type": "image_url", "image_url": source})
+            has_image = True
+            continue
+        raise ValueError(f"Unsupported content part type: {ptype}")
+    if not has_image:
+        return "".join(part["text"] for part in normalized)
+    return normalized
 
 
 def split_tool_lists(

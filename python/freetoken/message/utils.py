@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, Type
 
-import numpy as np
 import torch
 
 
@@ -32,10 +31,13 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        tensor = self.detach().cpu().contiguous()
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
-        serialized["dtype"] = str(self.dtype)
+        # View as bytes instead of routing through NumPy's dtype table: NumPy has
+        # no native bfloat16, and multimodal payloads are naturally N-dimensional.
+        serialized["buffer"] = tensor.view(torch.uint8).numpy().tobytes()
+        serialized["dtype"] = str(tensor.dtype)
+        serialized["shape"] = list(tensor.shape)
         return serialized
 
     # normal type
@@ -64,14 +66,16 @@ def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
-        np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        dtype = getattr(torch, dtype_str)
+        # bytearray owns writable storage, avoiding both NumPy's read-only warning
+        # and an extra dtype-specific conversion.
+        tensor = torch.frombuffer(bytearray(buffer), dtype=dtype)
+        shape = data.get("shape")
+        return tensor.reshape(shape) if shape is not None else tensor
 
     cls = cls_map.get(type_name)
     if cls is None:

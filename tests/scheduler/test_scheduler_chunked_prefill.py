@@ -150,3 +150,36 @@ def test_batched_prefill_carries_each_new_prompt_admission():
     batch = pm.schedule_next_batch(16)
     assert batch is not None
     assert batch.prompt_admissions == [(1, 3, 0), (2, 5, 0)]
+
+
+def test_multimodal_prompt_waits_for_a_single_full_prefill_budget():
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.prefill import ChunkedReq
+    from freetoken.scheduler.utils import PendingReq
+
+    _cm, tm, _dm, pm = _build_managers(num_pages=64)
+    prompt_len = 10
+    soft_tokens = torch.zeros(2, 4)
+    pm.pending_list = [
+        PendingReq(
+            uid=UID,
+            input_ids=torch.arange(prompt_len, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=2),
+            mm_embeds=soft_tokens,
+            prompt_rope_positions=torch.arange(prompt_len, dtype=torch.int32)
+            .view(-1, 1)
+            .expand(-1, 3),
+            is_multimodal=True,
+        )
+    ]
+
+    # A partially consumed batch budget must not create a multimodal ChunkedReq.
+    assert pm.schedule_next_batch(prompt_len - 1) is None
+    assert pm.runnable
+    assert tm.available_size == MAX_RUNNING
+
+    batch = pm.schedule_next_batch(prompt_len)
+    assert batch is not None
+    assert len(batch.reqs) == 1
+    assert batch.reqs[0].mm_embeds is soft_tokens
+    assert not isinstance(batch.reqs[0], ChunkedReq)

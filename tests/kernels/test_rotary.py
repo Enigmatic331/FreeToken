@@ -1,4 +1,54 @@
+import pytest
 import torch
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_qwen_interleaved_mrope_matches_torch_reference():
+    from freetoken.layers.rotary import get_rope
+
+    get_rope.cache_clear()
+    section = (11, 11, 10)
+    rope = get_rope(
+        head_dim=64,
+        rotary_dim=64,
+        max_position=128,
+        base=1_000_000.0,
+        mrope_section=section,
+        mrope_interleaved=True,
+    )
+    positions = torch.tensor(
+        [[3, 3, 3], [8, 9, 10], [17, 4, 12], [31, 30, 29]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q = torch.randn(4, 2 * 64, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(4, 64, dtype=torch.bfloat16, device="cuda")
+    q_ref, k_ref = q.float().clone(), k.float().clone()
+
+    pair = torch.arange(32, device="cuda")
+    axis = torch.zeros(32, dtype=torch.long, device="cuda")
+    axis[(pair % 3 == 1) & (pair < section[1] * 3)] = 1
+    axis[(pair % 3 == 2) & (pair < section[2] * 3)] = 2
+    selected = positions.long()[:, axis]
+    cache = rope._cos_sin_cache.to("cuda")
+    cos = cache[selected, pair]
+    sin = cache[selected, 32 + pair]
+
+    def reference(x: torch.Tensor, heads: int) -> torch.Tensor:
+        x = x.view(4, heads, 64)
+        left, right = x[..., :32], x[..., 32:]
+        return torch.cat(
+            (left * cos[:, None] - right * sin[:, None],
+             right * cos[:, None] + left * sin[:, None]),
+            dim=-1,
+        ).reshape(4, -1)
+
+    q_ref = reference(q_ref, 2)
+    k_ref = reference(k_ref, 1)
+    rope.forward(positions, q, k)
+
+    torch.testing.assert_close(q.float(), q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(k.float(), k_ref, rtol=2e-2, atol=2e-2)
 
 
 def test_yarn_rope_scales_cos_sin_by_attention_factor():

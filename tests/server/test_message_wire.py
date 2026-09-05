@@ -7,6 +7,8 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import torch
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
@@ -19,8 +21,10 @@ from freetoken.message import (
     PromptAdmittedMsg,
     TokenizeMsg,
     UserReply,
+    UserMsg,
 )
 from freetoken.core import SamplingParams
+from freetoken.scheduler.io import _without_vision_pixels
 
 
 def test_cache_rebuild_msg_roundtrip():
@@ -122,3 +126,56 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_multimodal_tensors_round_trip_with_shape_and_bfloat16():
+    pixels = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    rope = torch.arange(18, dtype=torch.int32).reshape(6, 3)
+    soft_tokens = torch.arange(20, dtype=torch.float32).to(torch.bfloat16).reshape(4, 5)
+    msg = UserMsg(
+        uid=9,
+        input_ids=torch.arange(6, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=2),
+        mm_embeds=soft_tokens,
+        pixel_values=pixels,
+        image_grid_thw=torch.tensor([[1, 2, 3]], dtype=torch.int32),
+        rope_positions=rope,
+        mrope_position_delta=-3,
+        is_multimodal=True,
+    )
+
+    out = BaseBackendMsg.decoder(msg.encoder())
+
+    assert isinstance(out, UserMsg)
+    assert out.is_multimodal and out.mrope_position_delta == -3
+    for actual, expected in (
+        (out.input_ids, msg.input_ids),
+        (out.mm_embeds, soft_tokens),
+        (out.pixel_values, pixels),
+        (out.image_grid_thw, msg.image_grid_thw),
+        (out.rope_positions, rope),
+    ):
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual, expected)
+
+
+def test_ep_worker_copy_drops_pixels_but_keeps_mrope_metadata():
+    msg = UserMsg(
+        uid=10,
+        input_ids=torch.arange(4, dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        pixel_values=torch.ones(2, 3),
+        image_grid_thw=torch.tensor([[1, 2, 2]], dtype=torch.int32),
+        rope_positions=torch.arange(12, dtype=torch.int32).reshape(4, 3),
+        mrope_position_delta=-1,
+        is_multimodal=True,
+    )
+
+    worker, changed = _without_vision_pixels(msg)
+
+    assert changed and isinstance(worker, UserMsg)
+    assert worker.pixel_values is None and worker.image_grid_thw is None
+    assert torch.equal(worker.input_ids, msg.input_ids)
+    assert torch.equal(worker.rope_positions, msg.rope_positions)
+    assert worker.is_multimodal and worker.mrope_position_delta == -1

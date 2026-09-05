@@ -182,7 +182,9 @@ def test_kv_cost_prices_ring_and_scratch_as_fixed():
     assert per_page == spec_kv_bytes_per_token(spec, config) * 64
     assert page_tokens == 64 and min_reserve == 0
     row = 32 * 4 * 2
-    assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1)
+    ring_capacity = QSAKVCache.ring_capacity_for(4)
+    rope_ring = 4 * ring_capacity * 3 * torch.int32.itemsize
+    assert fixed == 4 * row * (ring_capacity + 1) + rope_ring
 
 
 def test_unit_bytes_matches_the_cost_model():

@@ -527,6 +527,72 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+            if msg.is_multimodal and input_len > self.prefill_budget:
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error=(
+                                f"multimodal prompt is too long: {input_len} tokens exceeds "
+                                f"the single-prefill limit of {self.prefill_budget}; shrink "
+                                "the image/prompt or increase --max-prefill-length"
+                            ),
+                            code="context_length_exceeded",
+                        )
+                    ]
+                )
+                return
+            if msg.is_multimodal:
+                vision_error: Exception | None = None
+                if self.config.tp_info.is_primary() and msg.mm_embeds is None:
+                    try:
+                        if (
+                            msg.pixel_values is None
+                            or msg.image_grid_thw is None
+                            or msg.rope_positions is None
+                        ):
+                            raise ValueError(
+                                "multimodal request is missing pixels, image grid, or MRoPE metadata"
+                            )
+                        msg.mm_embeds = self.engine.model.encode_images(
+                            msg.pixel_values, msg.image_grid_thw
+                        )
+                        image_token_id = self.config.model_config.image_token_id
+                        slots = int((msg.input_ids == image_token_id).sum().item())
+                        if msg.rope_positions.shape != (msg.input_ids.numel(), 3):
+                            raise ValueError("MRoPE coordinates do not match the tokenized prompt")
+                        if slots != msg.mm_embeds.shape[0]:
+                            raise ValueError(
+                                f"image-token slots ({slots}) do not match vision features "
+                                f"({msg.mm_embeds.shape[0]})"
+                            )
+                        msg.pixel_values = None
+                        msg.image_grid_thw = None
+                    except Exception as exc:  # noqa: BLE001 -- isolate a bad image/request
+                        vision_error = exc
+                if self.config.tp_info.size > 1:
+                    ok = torch.tensor(
+                        int(vision_error is None), dtype=torch.int32, device="cpu"
+                    )
+                    self.tp_cpu_group.broadcast(ok, root=0).wait()
+                    vision_ok = bool(ok.item())
+                else:
+                    vision_ok = vision_error is None
+                if not vision_ok:
+                    if self.config.tp_info.is_primary():
+                        logger.warning_rank0(
+                            "vision encoding failed for request %d: %r", msg.uid, vision_error
+                        )
+                        self.send_result(
+                            [
+                                ErrorReplyMsg(
+                                    uid=msg.uid,
+                                    error=f"could not encode image input: {vision_error}",
+                                    code="invalid_value",
+                                )
+                            ]
+                        )
+                    return
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
                 logger.warning_rank0(
@@ -818,6 +884,8 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        if any(req.is_multimodal for req in batch.padded_reqs):
+            batch.rope_positions = _make_rope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -925,6 +993,30 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _make_rope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """Build ragged Qwen MRoPE coordinates in the same token order as input_ids."""
+    needed_size = sum(r.extend_len for r in batch.padded_reqs)
+    positions_host = torch.empty((needed_size, 3), dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        dst = positions_host[offset : offset + length]
+        logical = torch.arange(req.cached_len, req.device_len, dtype=torch.int32)
+        dst.copy_(logical[:, None].expand(-1, 3))
+        prompt = req.prompt_rope_positions
+        if prompt is not None:
+            prompt_end = min(req.device_len, prompt.shape[0])
+            if req.cached_len < prompt_end:
+                n_prompt = prompt_end - req.cached_len
+                dst[:n_prompt].copy_(prompt[req.cached_len:prompt_end])
+            decode_start = max(req.cached_len, prompt.shape[0])
+            if decode_start < req.device_len:
+                start = decode_start - req.cached_len
+                dst[start:].add_(req.mrope_position_delta)
+        offset += length
+    return positions_host.to(device, non_blocking=True)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

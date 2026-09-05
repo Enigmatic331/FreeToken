@@ -88,6 +88,7 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    rope_positions:   torch.Tensor | None = None  # [T] or [T,3], actual RoPE coordinates
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -128,6 +129,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         group = self._qsa_group(config)
         self._idx_slot = {lid: i for i, lid in enumerate(group.layer_ids)}
         self.rotary_config = group.rotary_config
+        self.mrope_section = tuple(args.mrope_section)
+        self.mrope_interleaved = bool(args.mrope_interleaved)
         self._index_cos_sin: torch.Tensor | None = None
 
         self._block_topk_kernel = _resolve_block_topk()
@@ -296,6 +299,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        rope_positions = getattr(batch, "rope_positions", None)
+        md.rope_positions = rope_positions if rope_positions is not None else batch.positions
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -327,6 +332,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
         ring = self.kvcache.pending_ring(slot)
         pooled = self._scratch("pooled", rows, self.index_head_dim, dtype=self.dtype)
         first = self._scratch("first_pos", rows, dtype=torch.int32)
+        rope_positions = md.rope_positions
+        assert rope_positions is not None
+        first_rope = (
+            self._scratch("first_rope", rows, 3, dtype=torch.int32)
+            if rope_positions.ndim == 2
+            else None
+        )
         qsa_compress_groups(
             index.k,
             ring,
@@ -337,19 +349,29 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self.ratio,
             pooled,
             first,
+            rope_positions=rope_positions if rope_positions.ndim == 2 else None,
+            rope_ring=(
+                self.kvcache.pending_rope_ring if rope_positions.ndim == 2 else None
+            ),
+            first_rope_positions=first_rope,
         )
         qsa_index_norm_rope(
             pooled,
-            first,
+            first_rope if first_rope is not None else first,
             self._index_rope_cache(),
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
             dest_rows=md.cmp_rows,
+            mrope_section=(
+                self.mrope_section if first_rope is not None else None
+            ),
         )
         # After the compression read: the ring rows this forward overwrites are exactly the
         # ones a straddling group just consumed.
         qsa_store_rows(ring, md.ring_rows, index.k)
+        if rope_positions.ndim == 2:
+            qsa_store_rows(self.kvcache.pending_rope_ring, md.ring_rows, rope_positions)
 
     def _select(self, index, md: QSASparseMetadata, slot: int) -> torch.Tensor:
         """Score complete visible blocks, take the top-k, expand them to token indices."""
@@ -361,17 +383,22 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         rows = index.q.shape[0]
         positions = md.positions
+        rope_positions = md.rope_positions
+        assert rope_positions is not None
         q_index = self._scratch(
             "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
         )
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
+            rope_positions,
             self._index_rope_cache(),
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),
             heads=self.index_heads,
+            mrope_section=(
+                self.mrope_section if rope_positions.ndim == 2 else None
+            ),
         )
         cmp_pages = self._cmp_pages(slot)
         columns = md.block_table.shape[1] * self.cmp_page_size
@@ -480,6 +507,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "first_pos": empty(max_bs, dtype=torch.int32),
             "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
         }
+        if self.mrope_section and self.mrope_interleaved:
+            self._graph["first_rope"] = empty(max_bs, 3, dtype=torch.int32)
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
 

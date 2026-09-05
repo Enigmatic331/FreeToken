@@ -154,8 +154,8 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
     if not messages:
-        # Non-empty on the wire but nothing survived conversion (e.g. image-only blocks on
-        # this text-only server) — a client error, not a tokenizer fault.
+        # Non-empty on the wire but no supported content survived conversion — a client
+        # error, not a tokenizer fault.
         return _anthropic_error_response(
             400, "invalid_request_error", "messages: no tokenizable content"
         )
@@ -214,8 +214,21 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
-                continue
+                source = block.source or {}
+                source_type = source.get("type")
+                if source_type == "base64":
+                    media_type = source.get("media_type") or "image/png"
+                    data = source.get("data")
+                    if not data:
+                        raise ValueError("image source is missing base64 data")
+                    image_url = f"data:{media_type};base64,{data}"
+                elif source_type == "url":
+                    image_url = source.get("url")
+                    if not image_url:
+                        raise ValueError("image source is missing url")
+                else:
+                    raise ValueError(f"unsupported image source type: {source_type}")
+                content_parts.append({"type": "image_url", "image_url": image_url})
             elif block.type == "tool_use":
                 tool_calls.append(
                     {
@@ -255,7 +268,7 @@ def convert_anthropic_prompt(
             else:
                 openai_msg["content"] = content_parts
         elif not tool_calls and not thinking_parts:
-            # Nothing usable in this message (e.g. image-only) — skip it.
+            # Nothing usable in this message — skip it.
             continue
         other.append(openai_msg)
 

@@ -6,7 +6,8 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``).
+``model.visual.*`` is loaded only when vision was explicitly enabled.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.config import vision_load_enabled
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
@@ -100,8 +102,16 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
+    if raw_name.startswith("model.visual."):
+        return (
+            "visual." + raw_name[len("model.visual.") :]
+            if vision_load_enabled()
+            else None
+        )
+    if raw_name.startswith("visual."):
+        return raw_name if vision_load_enabled() else None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):

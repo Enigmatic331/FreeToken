@@ -24,17 +24,23 @@ class GraphCaptureBuffer:
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
+    rope_positions: torch.Tensor
+    use_mrope: bool
     logits: torch.Tensor
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls, bs: int, vocab_size: int, device: torch.device, *, use_mrope: bool = False
+    ) -> GraphCaptureBuffer:
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
+            rope_positions=torch.zeros((bs, 3), dtype=torch.int32, device=device),
+            use_mrope=use_mrope,
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
@@ -48,6 +54,8 @@ class GraphCaptureBuffer:
         batch.input_ids = self.input_ids[_slice]
         batch.out_loc = self.out_loc[_slice]
         batch.positions = self.positions[_slice]
+        if self.use_mrope:
+            batch.rope_positions = self.rope_positions[_slice]
         batch.linear_table_idx = self.table_idx[_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
@@ -61,6 +69,11 @@ class GraphCaptureBuffer:
         if batch.out_loc is not None:
             self.out_loc[_slice] = batch.out_loc
         self.positions[_slice] = batch.positions
+        if self.use_mrope:
+            if batch.rope_positions is None:
+                self.rope_positions[_slice] = batch.positions[:, None]
+            else:
+                self.rope_positions[_slice] = batch.rope_positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
 
@@ -145,7 +158,15 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+        qwen_args = getattr(getattr(model, "_config", None), "qwen4_args", None)
+        use_mrope = bool(
+            qwen_args
+            and qwen_args.mrope_section
+            and qwen_args.mrope_interleaved
+        )
+        self.buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs, vocab_size, self.device, use_mrope=use_mrope
+        )
         self._reset_moe_offload_cache()
 
         pbar = tqdm(

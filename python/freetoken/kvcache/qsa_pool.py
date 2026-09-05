@@ -128,6 +128,15 @@ class QSAKVCache(MHAKVCache):
             dtype=self._index_dtype,
             device=self._device,
         )
+        # Shared across QSA layers: coordinates are layer-invariant. Unlike raw index
+        # keys, one compact int32 T/H/W ring is sufficient for every layer.
+        self._pending_rope_ring = torch.zeros(
+            self._num_req_slots,
+            self._ring_capacity,
+            3,
+            dtype=torch.int32,
+            device=self._device,
+        )
 
     def rebuild(self, num_pages: int) -> None:
         # Free the index tiers BEFORE the K/V realloc (super().rebuild frees + syncs +
@@ -137,6 +146,7 @@ class QSAKVCache(MHAKVCache):
         # cannot drop a live request's pending members.
         self._cmp_k_buffer = None
         self._pending_ring = None
+        self._pending_rope_ring = None
         super().rebuild(num_pages)
         self._zero_kv_slabs()
         try:
@@ -155,6 +165,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots = config.max_running_req + 1
         per_token = 0
         fixed = 0
+        qsa_ring_capacity = 0
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
@@ -163,6 +174,10 @@ class QSAKVCache(MHAKVCache):
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
                 fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                qsa_ring_capacity = max(
+                    qsa_ring_capacity, cls.ring_capacity_for(spec.index_ratio)
+                )
+        fixed += num_req_slots * qsa_ring_capacity * 3 * torch.int32.itemsize
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
@@ -185,6 +200,11 @@ class QSAKVCache(MHAKVCache):
     def pending_ring(self, slot: int) -> torch.Tensor:
         """One sparse layer's pending ring: ``[num_req_slots, ring_capacity, index_head_dim]``."""
         return self._pending_ring[:, slot]
+
+    @property
+    def pending_rope_ring(self) -> torch.Tensor:
+        """Layer-shared ``[request slots, ring capacity, T/H/W]`` positions."""
+        return self._pending_rope_ring
 
     @property
     def cmp_scratch_base(self) -> int:

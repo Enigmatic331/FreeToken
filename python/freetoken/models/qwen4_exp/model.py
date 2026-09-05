@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next decoder stack (text-only).
+"""Qwen3.8-Flash-Next decoder stack.
 
 The residual state is ``R [T, hc_count*hidden]`` end to end: the embedding is repeated over the
 ``hc_count`` streams, every layer mixes them down to one ``[T, hidden]`` block input and injects
@@ -90,6 +90,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig) -> None:
         self.hc_count = config.qwen4_args.hc_count
+        self._image_token_id = config.image_token_id
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -106,8 +107,25 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
+    def _merge_multimodal(
+        self, input_ids: torch.Tensor, hidden: torch.Tensor, batch: Batch
+    ) -> torch.Tensor:
+        embeds = getattr(batch, "mm_embeds", None)
+        if embeds is None or self._image_token_id is None:
+            return hidden
+        mask = input_ids == self._image_token_id
+        slots = int(mask.sum().item())
+        if slots != embeds.shape[0]:
+            raise ValueError(
+                f"image-token slots ({slots}) != vision features ({embeds.shape[0]})"
+            )
+        return hidden.masked_scatter(mask.unsqueeze(-1), embeds.to(hidden.dtype))
+
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        # Preserve input_ids for PLE. Visual features replace only the decoder input
+        # embeddings, before the hyper-connection streams are replicated.
+        hidden = self.embed_tokens.forward(input_ids)
+        hidden = self._merge_multimodal(input_ids, hidden, batch).repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -160,6 +178,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.lm_head = None
             super().__init__()
             return
+        if config.is_multimodal:
+            from .vision import QwenVLVisualEncoder
+
+            self.visual = QwenVLVisualEncoder(config.vision_config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
 
@@ -175,6 +197,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+
+    def set_vision_device(self, device: torch.device) -> None:
+        if hasattr(self, "visual"):
+            self.visual.set_target_device(device)
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        if not hasattr(self, "visual"):
+            raise RuntimeError("Qwen vision tower is not loaded")
+        features = self.visual.forward(pixel_values, image_grid_thw)
+        return features.to(self.model.embed_tokens.weight.device)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""

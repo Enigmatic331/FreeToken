@@ -41,6 +41,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
+| `--vision-device` | off | Enable Qwen3.8 image input and place its Qwen3-VL encoder on this CUDA device (for example `0` or `cuda:2`) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -62,6 +63,24 @@ GPU 1: NVIDIA GeForce RTX 5090 (UUID: GPU-9e8d7c6b-5a49-4f13-8207-c1b0a4e6d3f5)
 ft serve --model ... --gpu 1             # by nvidia-smi index -- the 5090
 ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefix is enough)
 ```
+
+### Qwen3.8 image input
+
+Pass `--vision-device` to load the checkpoint's Qwen3-VL tower. It can share the
+decoder GPU or use a separate card:
+
+```bash
+ft serve --model ... --gpu 0,1 --tp-size 2 \
+  --qwen4-exp-backbone-rank 0 --vision-device 2
+```
+
+OpenAI chat `image_url`, Responses `input_image`, and Anthropic URL/base64 image
+blocks are accepted. HTTP(S) and base64 data URLs are supported; each encoded
+image is limited to 64 MiB. Multiple images are allowed, but video and precomputed
+embedding inputs are not exposed by the online API yet. Multimodal prompts must
+fit within one `--max-prefill-length` chunk, and are intentionally excluded from
+cross-request prefix-cache reuse because identical image-placeholder token IDs can
+represent different pixels.
 
 ### KV cache & memory
 
@@ -172,4 +191,3 @@ profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then 
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
-

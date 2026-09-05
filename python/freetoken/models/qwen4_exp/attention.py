@@ -134,6 +134,8 @@ class Qwen4ExpAttention(BaseOP):
             max_position=rotary.max_position,
             base=rotary.base,
             rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
+            mrope_section=config.qwen4_args.mrope_section,
+            mrope_interleaved=config.qwen4_args.mrope_interleaved,
         )
         self.indexer = Qwen4ExpIndexer(config, layer_id)
 
@@ -147,8 +149,11 @@ class Qwen4ExpAttention(BaseOP):
         v = v.contiguous()
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
+        rope_positions = getattr(batch, "rope_positions", None)
         q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            rope_positions if rope_positions is not None else batch.positions,
+            q.view(-1, self.qo_attn_dim),
+            k.view(-1, self.kv_attn_dim),
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(

@@ -274,6 +274,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--vision-device",
+        type=str,
+        default=ServerArgs.vision_device,
+        help=(
+            "Load the multimodal vision encoder on this CUDA device (for example 2 or "
+            "cuda:2). The device may be outside --gpu and is used only by the backbone rank."
+        ),
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",

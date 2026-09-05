@@ -34,9 +34,16 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
-    # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
-    # the in-process offline path; remains None for the (serialized) online path.
+    # Optional precomputed multimodal soft-token embeddings. The offline API can submit
+    # these directly; online image requests populate them on the scheduler backbone rank.
     mm_embeds: torch.Tensor | None = None
+    # Online multimodal requests arrive as CPU processor output. Only rank 0 sees
+    # pixel_values; non-primary EP ranks receive the small metadata-only copy.
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    rope_positions: torch.Tensor | None = None  # CPU [prompt_tokens, 3]
+    mrope_position_delta: int = 0
+    is_multimodal: bool = False
 
 
 @dataclass

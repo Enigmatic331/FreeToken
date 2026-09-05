@@ -12,6 +12,7 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    vision_load_enabled,
 )
 
 
@@ -43,6 +44,10 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    # Qwen-VL text rotary layout. Empty keeps the old text-only/standard-RoPE path
+    # for toy configs and checkpoints that do not advertise multimodal positions.
+    mrope_section: Tuple[int, ...] = ()
+    mrope_interleaved: bool = False
 
     @property
     def index_topk_blocks(self) -> int:
@@ -255,7 +260,13 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mrope_section=tuple(int(x) for x in (rope_params.get("mrope_section") or ())),
+        mrope_interleaved=bool(rope_params.get("mrope_interleaved", False)),
     )
+
+    vision_config = getattr(hf_config, "vision_config", None)
+    if not vision_load_enabled():
+        vision_config = None
 
     return ModelConfig(
         num_layers=text.num_hidden_layers,
@@ -282,7 +293,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=None,  # served text-only
+        vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,

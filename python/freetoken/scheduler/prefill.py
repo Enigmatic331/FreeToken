@@ -122,6 +122,7 @@ class PrefillAdder:
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
+        reserved_swa_before = self.reserved_swa
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
         if self.cache_manager.swa_paged:
@@ -164,6 +165,12 @@ class PrefillAdder:
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
+        if is_chunked and pending_req.is_multimodal:
+            # Image soft tokens and their MRoPE coordinates must enter the decoder in one
+            # forward. Leave this request pending until it gets a fresh token budget; the
+            # scheduler rejects prompts that cannot fit even that full budget.
+            self.reserved_swa = reserved_swa_before
+            return None
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
@@ -171,11 +178,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -185,6 +187,9 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            prompt_rope_positions=pending_req.prompt_rope_positions,
+            mrope_position_delta=pending_req.mrope_position_delta,
+            is_multimodal=pending_req.is_multimodal,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -245,7 +250,15 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                prompt_rope_positions=req.rope_positions,
+                mrope_position_delta=req.mrope_position_delta,
+                is_multimodal=req.is_multimodal,
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:

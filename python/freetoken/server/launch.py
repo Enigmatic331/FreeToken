@@ -62,6 +62,9 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     # published (not bound) here: the engine binds it after the allocator setup
     from freetoken.gpu_select import set_assigned_gpu
 
+    if args.vision_device is not None:
+        os.environ["FREETOKEN_LOAD_VISION"] = "1"
+
     # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
     targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
     set_assigned_gpu(targets[args.tp_info.rank])
@@ -186,6 +189,7 @@ def launch_server(
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
                 "ack_queue": ack_queue,
+                "enable_multimodal": server_args.vision_device is not None,
             },
             daemon=False,
             name="freetoken-detokenizer-0",
@@ -205,6 +209,7 @@ def launch_server(
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
                     "ack_queue": ack_queue,
+                    "enable_multimodal": server_args.vision_device is not None,
                 },
                 daemon=False,
                 name=f"freetoken-tokenizer-{i}",

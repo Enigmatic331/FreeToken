@@ -143,6 +143,17 @@ def test_qwen4_args_payload():
     assert args.ple_conv_state_len == 9
     assert args.ple_state_width == 10240
     assert args.ngram_boundary_token_id == 248044
+    assert args.mrope_section == (11, 11, 10)
+    assert args.mrope_interleaved is True
+
+
+def test_vision_config_is_opt_in(monkeypatch):
+    hf = _hf_config()
+    hf.vision_config = SimpleNamespace(hidden_size=1152)
+    monkeypatch.delenv("FREETOKEN_LOAD_VISION", raising=False)
+    assert parse_config(hf).vision_config is None
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    assert parse_config(hf).vision_config is hf.vision_config
 
 
 def test_ple_on_full_attention_layer_rejected():

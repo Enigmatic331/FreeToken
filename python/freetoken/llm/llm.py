@@ -78,6 +78,7 @@ class LLM(Scheduler):
                     input_ids=input_ids,
                     sampling_params=sampling_params,
                     mm_embeds=self.mm_embeds_map.get(uid),
+                    is_multimodal=uid in self.mm_embeds_map,
                 )
             )
             self.status_map[uid] = RequestStatus(

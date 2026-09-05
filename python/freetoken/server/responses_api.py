@@ -260,7 +260,10 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         role = item.get("role", "user")
         if role == "developer":
             role = "system"
-        return [{"role": role, "content": _input_text(item.get("content"))}]
+        content = _input_content(item.get("content"))
+        if role == "system" and isinstance(content, list):
+            raise ValueError("image inputs are only supported in user messages")
+        return [{"role": role, "content": content}]
     if itype == "function_call":
         return [
             {
@@ -328,19 +331,32 @@ def _merge_assistant_run(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return merged
 
 
-def _input_text(content: Any) -> str:
+def _input_content(content: Any) -> str | list[dict[str, Any]]:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    parts: list[str] = []
+    parts: list[dict[str, Any]] = []
+    has_image = False
     for part in content:
         if isinstance(part, dict):
             if part.get("type") in ("input_text", "output_text", "text") or "text" in part:
-                parts.append(part.get("text") or "")
+                parts.append({"type": "text", "text": part.get("text") or ""})
+            elif part.get("type") in ("input_image", "image_url", "image"):
+                source = part.get("image_url", part.get("image"))
+                if isinstance(source, dict):
+                    source = source.get("url", source.get("data"))
+                if not source:
+                    raise ValueError("input_image requires image_url; file_id is not supported")
+                parts.append({"type": "image_url", "image_url": source})
+                has_image = True
+            else:
+                raise ValueError(f"Unsupported input content part type: {part.get('type')}")
         else:
-            parts.append(str(part))
-    return "".join(parts)
+            parts.append({"type": "text", "text": str(part)})
+    if not has_image:
+        return "".join(part["text"] for part in parts)
+    return parts
 
 
 def _stringify(value: Any) -> str:

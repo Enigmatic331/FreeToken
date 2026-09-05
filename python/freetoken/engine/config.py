@@ -79,6 +79,9 @@ class EngineConfig:
     # every rank owns a contiguous routed-expert shard.
     qwen4_exp_backbone_rank: int | None = None
     qwen4_exp_expert_shards: tuple[int, ...] | None = None
+    # Optional auxiliary CUDA device for a multimodal encoder. Supplying it opts
+    # into loading vision weights; it need not be one of the model TP/EP devices.
+    vision_device: str | None = None
     # Optional unified expert-cache slots per distributed rank.
     moe_cache_sizes: tuple[int, ...] | None = None
     max_seq_len_override: int | None = None

@@ -232,6 +232,87 @@ def test_compression_reads_both_sources(ring_capacity: int):
             )
 
 
+@requires_cuda
+def test_compression_preserves_first_token_mrope_coordinates_across_ring_boundary():
+    from freetoken.kernel.triton.qsa import qsa_compress_groups
+
+    device = torch.device("cuda")
+    dim, capacity = 8, 4
+    raw = torch.randn(1, dim, dtype=torch.bfloat16, device=device)
+    ring = torch.randn(1, capacity, dim, dtype=torch.bfloat16, device=device)
+    logical = torch.tensor([4], dtype=torch.int32, device=device)
+    raw_rope = torch.tensor([[20, 21, 22]], dtype=torch.int32, device=device)
+    rope_ring = torch.zeros(1, capacity, 3, dtype=torch.int32, device=device)
+    rope_ring[0, 1] = torch.tensor([7, 8, 9], device=device)
+    pooled = torch.empty_like(raw)
+    first = torch.empty(1, dtype=torch.int32, device=device)
+    first_rope = torch.empty(1, 3, dtype=torch.int32, device=device)
+
+    qsa_compress_groups(
+        raw,
+        ring,
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0, 1], dtype=torch.int32, device=device),
+        logical,
+        4,
+        pooled,
+        first,
+        rope_positions=raw_rope,
+        rope_ring=rope_ring,
+        first_rope_positions=first_rope,
+    )
+
+    assert int(first[0]) == 1
+    assert torch.equal(first_rope[0], torch.tensor([7, 8, 9], device=device))
+
+
+@requires_cuda
+def test_qsa_norm_mrope_matches_torch_reference():
+    from freetoken.kernel.triton.qsa import qsa_index_norm_rope
+
+    device = torch.device("cuda")
+    tokens, heads, dim, rotary_dim = 3, 4, 128, 64
+    section = (11, 11, 10)
+    x = torch.randn(tokens * heads, dim, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(dim, dtype=torch.bfloat16, device=device) * 0.1
+    positions = torch.tensor(
+        [[2, 2, 2], [7, 8, 9], [20, 4, 15]], dtype=torch.int32, device=device
+    )
+    inv = 1.0 / (
+        1_000_000.0 ** (torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim)
+    )
+    freqs = torch.outer(torch.arange(128, device=device).float(), inv)
+    cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+    out = torch.empty_like(x)
+    qsa_index_norm_rope(
+        x,
+        positions,
+        cache,
+        weight,
+        1e-6,
+        out,
+        heads=heads,
+        mrope_section=section,
+    )
+
+    y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+    y = y * (1.0 + weight.float())
+    pair = torch.arange(rotary_dim // 2, device=device)
+    axis = torch.zeros_like(pair)
+    axis[(pair % 3 == 1) & (pair < section[1] * 3)] = 1
+    axis[(pair % 3 == 2) & (pair < section[2] * 3)] = 2
+    token_positions = positions.long()[:, axis].repeat_interleave(heads, dim=0)
+    cos = cache[token_positions, pair]
+    sin = cache[token_positions, rotary_dim // 2 + pair]
+    left, right = y[:, : rotary_dim // 2], y[:, rotary_dim // 2 : rotary_dim]
+    expected = y.clone()
+    expected[:, : rotary_dim // 2] = left * cos - right * sin
+    expected[:, rotary_dim // 2 : rotary_dim] = right * cos + left * sin
+
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
 # --------------------------------------------------------------------------------------
 # Block top-k (kernel/triton/qsa/topk.py)
 # --------------------------------------------------------------------------------------

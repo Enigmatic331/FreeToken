@@ -39,4 +39,5 @@ for them; other checkpoints of the same architectures work too.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
-- Multimodal checkpoints are served text-only.
+- Qwen3.8 multimodal checkpoints support image input when launched with
+  `--vision-device`; video input is not exposed by the online API yet.

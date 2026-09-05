@@ -1,15 +1,42 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Final, List
 
 import torch
-from freetoken.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg
+from freetoken.message import (
+    BaseBackendMsg,
+    BaseTokenizerMsg,
+    BatchBackendMsg,
+    BatchTokenizerMsg,
+    UserMsg,
+)
 from freetoken.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
 
 if TYPE_CHECKING:
     from .config import SchedulerConfig
 
 logger = init_logger(__name__)
+
+
+def _without_vision_pixels(msg: BaseBackendMsg) -> tuple[BaseBackendMsg, bool]:
+    """Return the small EP-worker copy of a scheduler message.
+
+    Only the backbone rank runs the visual tower. Broadcasting patch tensors to expert
+    ranks wastes CPU copies and ZMQ bandwidth, while token ids and MRoPE coordinates must
+    remain identical on every rank so scheduling stays lock-step.
+    """
+    if isinstance(msg, UserMsg) and msg.pixel_values is not None:
+        return replace(msg, pixel_values=None, image_grid_thw=None), True
+    if isinstance(msg, BatchBackendMsg):
+        changed = False
+        data: list[BaseBackendMsg] = []
+        for item in msg.data:
+            stripped, item_changed = _without_vision_pixels(item)
+            data.append(stripped)
+            changed |= item_changed
+        return (replace(msg, data=data), True) if changed else (msg, False)
+    return msg, False
 
 
 class SchedulerIOMixin:
@@ -90,8 +117,13 @@ class SchedulerIOMixin:
         if blocking:
             self.run_when_idle()
             raw = self._recv_from_tokenizer.get_raw()
-            self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(self._recv_from_tokenizer.decode(raw))
+            msg = self._recv_from_tokenizer.decode(raw)
+            worker_msg, changed = _without_vision_pixels(msg)
+            if changed:
+                self._send_into_ranks.put(worker_msg)
+            else:
+                self._send_into_ranks.put_raw(raw)
+            pending_msgs.append(msg)
 
         pending_raw_msgs: List[bytes] = []
         while not self._recv_from_tokenizer.empty():
@@ -102,8 +134,13 @@ class SchedulerIOMixin:
         self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
 
         for raw in pending_raw_msgs:
-            self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(self._recv_from_tokenizer.decode(raw))
+            msg = self._recv_from_tokenizer.decode(raw)
+            worker_msg, changed = _without_vision_pixels(msg)
+            if changed:
+                self._send_into_ranks.put(worker_msg)
+            else:
+                self._send_into_ranks.put_raw(raw)
+            pending_msgs.append(msg)
         return pending_msgs
 
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> List[BaseBackendMsg]:
