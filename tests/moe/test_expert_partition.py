@@ -238,6 +238,247 @@ def test_dsv4_packed_prefill_posts_receive_before_combine(monkeypatch):
     torch.testing.assert_close(output, full.float().sum(dim=1).to(torch.bfloat16))
 
 
+def test_dsv4_tiled_prefill_preserves_rows_and_single_layer_materialization(
+    monkeypatch,
+):
+    class FakeCache:
+        prefill_overlap = False
+        collect_stats = False
+
+        def __init__(self):
+            self.materialized = []
+            self.copies = 0
+            self.profile = []
+
+        def materialize_layer(self, layer_id):
+            self.materialized.append(layer_id)
+
+        def copy_missing(self):
+            self.copies += 1
+
+        def bank_views(self, num_experts):
+            assert num_experts == 128
+            return ("views",)
+
+        def alphas_for_layer(self, layer_id):
+            assert layer_id == 7
+            return None
+
+        def profile_begin(self, name, layer_id):
+            self.profile.append(("begin", name, layer_id))
+
+        def profile_end(self, name, layer_id):
+            self.profile.append(("end", name, layer_id))
+
+    layer = object.__new__(DSV4OffloadMoELayer)
+    layer.layer_id = 7
+    layer.num_experts = 128
+    layer.packed_prefill_root = 0
+    layer._packed_prefill_pending = None
+    layer.offload_cache = FakeCache()
+
+    receive_sizes = []
+
+    def prepare(weights, route_dtype):
+        assert route_dtype == torch.bfloat16
+        receive_sizes.append(weights.shape[0])
+        layer._packed_prefill_pending = object()
+
+    def expert_gemm(cache, hidden, weights, ids, **kwargs):
+        assert cache is layer.offload_cache
+        assert kwargs["views"] == ("views",)
+        assert kwargs["n"] == 128
+        assert kwargs["is_prefill"] is True
+        return hidden.unsqueeze(1).expand(-1, 6, -1).contiguous()
+
+    def combine(routes, weights):
+        assert routes.shape[:2] == weights.shape
+        layer._packed_prefill_pending = None
+        return routes.float().sum(dim=1).to(routes.dtype)
+
+    layer.prepare_packed_prefill_receive = prepare
+    layer._expert_gemm = expert_gemm
+    layer._maybe_combine_packed_prefill_routes = combine
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(0, 2))
+
+    hidden = torch.arange(5 * 4, dtype=torch.float32).view(5, 4).to(torch.bfloat16)
+    weights = torch.ones((5, 6), dtype=torch.float32)
+    ids = torch.zeros((5, 6), dtype=torch.int32)
+    output = layer._prefill_routed_tiled(hidden, weights, ids, tile_tokens=2)
+
+    torch.testing.assert_close(output, hidden * 6)
+    assert receive_sizes == [2, 2, 1]
+    assert layer.offload_cache.materialized == [7]
+    assert layer.offload_cache.copies == 1
+    assert layer.offload_cache.profile == [
+        ("begin", "prefill_copy", 7),
+        ("end", "prefill_copy", 7),
+        ("begin", "prefill_expert", 7),
+        ("end", "prefill_expert", 7),
+    ]
+
+
+def test_dsv4_prefill_receive_bounds_the_first_route_tile(monkeypatch):
+    class FakeStream:
+        def wait_stream(self, stream):
+            self.waited_for = stream
+
+    class FakeCommunicator:
+        def __init__(self):
+            self.received_shapes = []
+
+        def recv(self, tensor, src):
+            assert src == 1
+            self.received_shapes.append(tuple(tensor.shape))
+            tensor.zero_()
+            return tensor
+
+    layer = object.__new__(DSV4OffloadMoELayer)
+    layer.packed_prefill_root = 0
+    layer.hidden_size = 4
+    layer._packed_prefill_pending = None
+    layer._comm = FakeCommunicator()
+    root_owned = torch.tensor(
+        [
+            [True, False, True, False, True, True],
+            [False, True, False, True, True, False],
+            [False, False, False, True, True, True],
+            [True, True, False, False, False, True],
+            [True, False, True, False, True, False],
+        ]
+    )
+
+    current = FakeStream()
+    receive = FakeStream()
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(0, 2))
+    monkeypatch.setattr(
+        "freetoken.core.get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=True)),
+    )
+    monkeypatch.setattr(dsv4_moe, "_EP_PACKED_PREFILL_OVERLAP", True)
+    monkeypatch.setattr(dsv4_moe, "_EP_PREFILL_ROUTE_TILE_TOKENS", 2)
+    monkeypatch.setattr(dsv4_moe, "_ep_packed_recv_stream", lambda device: receive)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: current)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    layer.prepare_packed_prefill_receive(root_owned.float(), torch.bfloat16)
+
+    first_tile_remote = int((~root_owned[:2]).sum().item())
+    remote_indices, packed, pending_stream = layer._packed_prefill_pending
+    assert layer._comm.received_shapes == [(first_tile_remote, 4)]
+    assert remote_indices.max().item() < 2 * root_owned.shape[1]
+    assert tuple(packed.shape) == (first_tile_remote, 4)
+    assert pending_stream is receive
+
+
+def test_dsv4_worker_async_send_preserves_owned_route_order(monkeypatch):
+    class FakeStream:
+        def __init__(self):
+            self.waited_for = []
+
+        def wait_stream(self, stream):
+            self.waited_for.append(stream)
+
+    class FakeCommunicator:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, tensor, dst):
+            assert dst == 0
+            self.sent.append(tensor.clone())
+            return tensor
+
+    layer = object.__new__(DSV4OffloadMoELayer)
+    layer.packed_prefill_root = 0
+    layer._comm = FakeCommunicator()
+    routes = torch.arange(2 * 6 * 4, dtype=torch.float32).view(2, 6, 4).to(
+        torch.bfloat16
+    )
+    weights = torch.tensor(
+        [[0.1, 0.0, 0.2, 0.0, 0.3, 0.4], [0.0, 0.5, 0.0, 0.6, 0.7, 0.0]]
+    )
+
+    current = FakeStream()
+    send = FakeStream()
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(1, 2))
+    monkeypatch.setattr(dsv4_moe, "_ep_packed_send_stream", lambda device: send)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: current)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    returned = layer._send_packed_prefill_routes_async(routes, weights)
+
+    expected = routes.view(-1, routes.shape[-1])[weights.ne(0).reshape(-1)]
+    assert returned is send
+    assert send.waited_for == [current]
+    assert len(layer._comm.sent) == 1
+    torch.testing.assert_close(layer._comm.sent[0], expected)
+
+
+def test_dsv4_tiled_worker_queues_every_send_then_joins_once(monkeypatch):
+    class FakeCache:
+        prefill_overlap = False
+        collect_stats = False
+
+        def materialize_layer(self, layer_id):
+            self.materialized = layer_id
+
+        def copy_missing(self):
+            pass
+
+        def bank_views(self, num_experts):
+            return (num_experts,)
+
+        def alphas_for_layer(self, layer_id):
+            return None
+
+        def profile_begin(self, name, layer_id):
+            pass
+
+        def profile_end(self, name, layer_id):
+            pass
+
+    class FakeStream:
+        def __init__(self):
+            self.waited_for = []
+
+        def wait_stream(self, stream):
+            self.waited_for.append(stream)
+
+    layer = object.__new__(DSV4OffloadMoELayer)
+    layer.layer_id = 9
+    layer.num_experts = 128
+    layer.packed_prefill_root = 0
+    layer._packed_prefill_pending = None
+    layer.offload_cache = FakeCache()
+    send = FakeStream()
+    current = FakeStream()
+    send_sizes = []
+
+    def expert_gemm(cache, hidden, weights, ids, **kwargs):
+        return hidden.unsqueeze(1).expand(-1, 6, -1).contiguous()
+
+    def send_async(routes, weights):
+        assert routes.shape[:2] == weights.shape
+        send_sizes.append(routes.shape[0])
+        return send
+
+    layer._expert_gemm = expert_gemm
+    layer._send_packed_prefill_routes_async = send_async
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(1, 2))
+    monkeypatch.setattr(dsv4_moe, "_EP_PACKED_ASYNC_SEND", True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: current)
+
+    hidden = torch.arange(5 * 4, dtype=torch.float32).view(5, 4).to(torch.bfloat16)
+    weights = torch.ones((5, 6), dtype=torch.float32)
+    ids = torch.zeros((5, 6), dtype=torch.int32)
+    last = layer._prefill_routed_tiled(hidden, weights, ids, tile_tokens=2)
+
+    assert send_sizes == [2, 2, 1]
+    assert current.waited_for == [send]
+    assert layer.offload_cache.materialized == 9
+    assert tuple(last.shape) == (1, 6, 4)
+
+
 def test_offloaded_ep3_does_not_tensor_partition_expert_width(monkeypatch):
     import freetoken.layers.moe as moe_layers
 

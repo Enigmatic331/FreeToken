@@ -21,7 +21,12 @@ from .layers import Linear
 
 
 _EP_PACKED_PREFILL_OVERLAP = os.getenv("FREETOKEN_EP_PACKED_OVERLAP", "1") != "0"
+_EP_PACKED_ASYNC_SEND = os.getenv("FREETOKEN_EP_PACKED_ASYNC_SEND", "0") != "0"
+_EP_PREFILL_ROUTE_TILE_TOKENS = int(
+    os.getenv("FREETOKEN_EP_PREFILL_ROUTE_TILE_TOKENS", "0")
+)
 _EP_PACKED_RECV_STREAM: torch.cuda.Stream | None = None
+_EP_PACKED_SEND_STREAM: torch.cuda.Stream | None = None
 
 
 def _ep_packed_recv_stream(device: torch.device) -> torch.cuda.Stream:
@@ -29,6 +34,13 @@ def _ep_packed_recv_stream(device: torch.device) -> torch.cuda.Stream:
     if _EP_PACKED_RECV_STREAM is None:
         _EP_PACKED_RECV_STREAM = torch.cuda.Stream(device=device)
     return _EP_PACKED_RECV_STREAM
+
+
+def _ep_packed_send_stream(device: torch.device) -> torch.cuda.Stream:
+    global _EP_PACKED_SEND_STREAM
+    if _EP_PACKED_SEND_STREAM is None:
+        _EP_PACKED_SEND_STREAM = torch.cuda.Stream(device=device)
+    return _EP_PACKED_SEND_STREAM
 
 
 class Gate(nn.Module):
@@ -146,6 +158,13 @@ class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
         if self._packed_prefill_pending is not None:
             raise RuntimeError("packed DSV4 prefill receive already pending")
 
+        # A larger scheduler chunk may keep expert banks resident while route
+        # outputs stay bounded. Post only the first route tile here, before the
+        # shared expert; later tiles are posted in _prefill_routed_tiled.
+        route_tile = self._prefill_route_tile_tokens(local_topk_weights.shape[0])
+        if route_tile:
+            local_topk_weights = local_topk_weights[:route_tile]
+
         owned = local_topk_weights.ne(0).reshape(-1)
         remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
         if remote_indices.numel() == 0:
@@ -173,6 +192,11 @@ class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
         from freetoken.core import get_global_ctx
 
         if get_global_ctx().batch.is_prefill:
+            route_tile = self._prefill_route_tile_tokens(hidden_states.shape[0])
+            if self.packed_prefill_root is not None and route_tile:
+                return self._prefill_routed_tiled(
+                    hidden_states, topk_weights, topk_ids, route_tile
+                )
             routes = self._prefill_routed(hidden_states, topk_weights, topk_ids)
             return self._maybe_combine_packed_prefill_routes(routes, topk_weights)
         routes = self._decode_routed(hidden_states, topk_weights, topk_ids)
@@ -228,6 +252,131 @@ class DSV4OffloadMoELayer(ExpertParallelOffloadMoELayer):
         output = routes.new_empty((routes.shape[0], routes.shape[-1]))
         moe_sum_reduce_triton(routes, output)
         return output
+
+    @staticmethod
+    def _prefill_route_tile_tokens(num_tokens: int) -> int:
+        if (
+            _EP_PREFILL_ROUTE_TILE_TOKENS <= 0
+            or num_tokens <= _EP_PREFILL_ROUTE_TILE_TOKENS
+        ):
+            return 0
+        return _EP_PREFILL_ROUTE_TILE_TOKENS
+
+    def _send_packed_prefill_routes_async(
+        self,
+        routes: torch.Tensor,
+        local_topk_weights: torch.Tensor,
+    ) -> torch.cuda.Stream:
+        """Queue one worker route tile so its next expert tile may compute."""
+        from freetoken.distributed import get_tp_info
+
+        root = self.packed_prefill_root
+        info = get_tp_info()
+        if root is None or info.rank == root:
+            raise RuntimeError("async packed DSV4 send is valid only on an EP worker")
+
+        owned = local_topk_weights.ne(0).reshape(-1)
+        owned_indices = torch.nonzero(owned, as_tuple=False).flatten()
+        send_stream = _ep_packed_send_stream(routes.device)
+        current = torch.cuda.current_stream(routes.device)
+        send_stream.wait_stream(current)
+        if owned_indices.numel() != 0:
+            with torch.cuda.stream(send_stream):
+                packed = routes.view(-1, routes.shape[-1]).index_select(
+                    0, owned_indices
+                ).contiguous()
+                self._comm.send(packed, root)
+            # The routes and indices originate on the compute stream but remain
+            # inputs to the side-stream gather until its ordered send completes.
+            if routes.is_cuda:
+                routes.record_stream(send_stream)
+                owned_indices.record_stream(send_stream)
+        return send_stream
+
+    def _prefill_routed_tiled(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        tile_tokens: int,
+    ) -> torch.Tensor:
+        """Bound exact route tensors while materializing each expert layer once.
+
+        Token rows are independent. Every row retains its six canonical route
+        slots and the same strict FP32 reducer; only the scheduling and lifetime
+        of independent row ranges change.
+        """
+        from freetoken.distributed import get_tp_info
+
+        cache = self.offload_cache
+        assert cache is not None
+        if cache.prefill_overlap:
+            views = self._wait_prefill_overlap(cache)
+        else:
+            cache.materialize_layer(self.layer_id)
+            if cache.collect_stats:
+                cache.prefill_h2d_bytes += (
+                    cache.layer_expert_bytes(self.layer_id) * cache.num_experts
+                )
+            cache.profile_begin("prefill_copy", self.layer_id)
+            cache.copy_missing()
+            cache.profile_end("prefill_copy", self.layer_id)
+            views = cache.bank_views(self.num_experts)
+
+        info = get_tp_info()
+        root = self.packed_prefill_root
+        is_root = root is not None and info.rank == root
+        output = (
+            hidden_states.new_empty((hidden_states.shape[0], hidden_states.shape[1]))
+            if is_root
+            else None
+        )
+        last = None
+        async_send_stream = None
+        cache.profile_begin("prefill_expert", self.layer_id)
+        for start in range(0, hidden_states.shape[0], tile_tokens):
+            end = min(start + tile_tokens, hidden_states.shape[0])
+            tile_hidden = hidden_states[start:end]
+            tile_weights = topk_weights[start:end]
+            tile_ids = topk_ids[start:end]
+            if is_root and self._packed_prefill_pending is None:
+                self.prepare_packed_prefill_receive(tile_weights, hidden_states.dtype)
+            routes = self._expert_gemm(
+                cache,
+                tile_hidden,
+                tile_weights,
+                tile_ids,
+                views=views,
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+            if not is_root and root is not None and _EP_PACKED_ASYNC_SEND:
+                async_send_stream = self._send_packed_prefill_routes_async(
+                    routes, tile_weights
+                )
+                combined = routes
+            else:
+                combined = self._maybe_combine_packed_prefill_routes(
+                    routes, tile_weights
+                )
+            if output is not None:
+                output[start:end].copy_(combined)
+            last = combined
+        cache.profile_end("prefill_expert", self.layer_id)
+
+        if async_send_stream is not None:
+            # Restore communicator ordering before the next layer broadcasts;
+            # root has consumed the same ordered tile queue by this point.
+            torch.cuda.current_stream(hidden_states.device).wait_stream(
+                async_send_stream
+            )
+        if cache.prefill_overlap:
+            cache.release_prefill_layer(self.layer_id)
+        if output is not None:
+            return output
+        assert last is not None
+        return last
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 3:
