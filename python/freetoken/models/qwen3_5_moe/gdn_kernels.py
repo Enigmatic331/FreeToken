@@ -17,6 +17,7 @@ def gdn_prefill_chunk_fla(
     cu_seqlens: torch.Tensor,    # [num_seqs+1] int64
     scale: float,
     return_h: bool = False,
+    h_rows: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Chunked gated-delta-rule prefill via the vendored fla kernel. GQA is handled
     in-kernel (q/k at num_k_heads), q/k l2norm is done in-kernel, and the per-sequence
@@ -25,11 +26,18 @@ def gdn_prefill_chunk_fla(
     Fresh sequences must have their ``state_source`` slot pre-zeroed by the caller.
     Returns ``o`` of shape ``[total, num_v_heads, head_v_dim]`` (bf16).
 
-    When ``return_h=True`` also returns the per-chunk hidden-state buffer ``h`` of shape
-    ``[1, NT_total, num_v_heads, head_v_dim, head_k_dim]`` (bf16). ``h[0, boh_i + c]`` is the
-    recurrent state after ``c*64`` tokens of packed sequence ``i`` (chunk granularity 64), where
-    ``boh_i = prepare_chunk_offsets(cu_seqlens, 64)[i]``. Note the last two dims are ``[V, K]`` --
-    transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path."""
+    When ``return_h=True`` also returns the per-chunk hidden-state buffer ``h``. If ``h_rows``
+    is supplied, only those global chunk rows are returned, in the same order; otherwise the
+    full ``[1, NT_total, num_v_heads, head_v_dim, head_k_dim]`` buffer is returned. Global row
+    ``boh_i + c`` is the recurrent state after ``c*64`` tokens of packed sequence ``i`` (chunk
+    granularity 64), where ``boh_i = prepare_chunk_offsets(cu_seqlens, 64)[i]``. The last two
+    dims are ``[V, K]`` -- transposed vs ``state_source``'s ``[K, V]``. The row-select form keeps
+    tiled hybrid-radix prefills memory-bounded instead of retaining and re-concatenating every
+    tile's checkpoint slab."""
+    if h_rows is not None and not return_h:
+        raise ValueError("h_rows requires return_h=True")
+    if h_rows is not None and tuple(sorted(h_rows)) != h_rows:
+        raise ValueError("h_rows must be sorted")
     from freetoken.kernel.fla import chunk_gated_delta_rule
 
     def run(
@@ -58,8 +66,12 @@ def gdn_prefill_chunk_fla(
     if tiled:
         if tile_tokens % 64 != 0:
             raise ValueError("FREETOKEN_GDN_PREFILL_TILE_TOKENS must be a multiple of 64")
-        outputs = []
+        # Write each tile into its final output slab immediately. Accumulating o_tile tensors
+        # and torch.cat'ing them doubled the output peak; doing the same for h was worse (about
+        # 492 MiB per 20k-token Qwen3.8 prefill) and caused rank-0 OOMs after tool continuations.
+        o = torch.empty_like(v)
         states = [] if return_h else None
+        h_row_offset = 0
         for start in range(0, total, tile_tokens):
             end = min(start + tile_tokens, total)
             tile_cu_seqlens = cu_seqlens.new_tensor((0, end - start))
@@ -67,16 +79,34 @@ def gdn_prefill_chunk_fla(
                 q[:, start:end], k[:, start:end], v[:, start:end],
                 g[:, start:end], beta[:, start:end], tile_cu_seqlens,
             )
-            outputs.append(o_tile)
+            o[:, start:end].copy_(o_tile)
             if states is not None:
-                states.append(h_tile)
-        o = torch.cat(outputs, dim=1)
-        h = torch.cat(states, dim=1) if states is not None else None
+                if h_rows is None:
+                    states.append(h_tile)
+                else:
+                    tile_rows = [
+                        row - h_row_offset
+                        for row in h_rows
+                        if h_row_offset <= row < h_row_offset + h_tile.shape[1]
+                    ]
+                    if tile_rows:
+                        states.append(h_tile[:, tile_rows])
+                h_row_offset += h_tile.shape[1]
+        if states is None:
+            h = None
+        else:
+            if h_rows is not None and sum(part.shape[1] for part in states) != len(h_rows):
+                raise IndexError(f"h_rows {h_rows} are outside the {h_row_offset} chunk rows")
+            if not states:
+                raise ValueError("return_h=True requires at least one h row")
+            h = states[0] if len(states) == 1 else torch.cat(states, dim=1)
     else:
         o, _, h = run(q, k, v, g, beta, cu_seqlens)
+        if return_h and h_rows is not None:
+            h = h[:, list(h_rows)]
     if return_h:
         assert h is not None
-        return o[0], h  # h: [1, NT_total, num_v_heads, head_v_dim, head_k_dim]
+        return o[0], h
     return o[0]  # [total, num_v_heads, head_v_dim]
 
 

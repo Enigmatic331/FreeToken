@@ -180,6 +180,54 @@ def test_single_sequence_prefill_tiling_is_bit_exact(monkeypatch):
     torch.testing.assert_close(tiled_decode, untiled_decode, rtol=0, atol=0)
 
 
+def test_tiled_track_snapshot_matches_prefill_stopped_at_boundary(monkeypatch):
+    """The row-select path keeps the exact hybrid-radix GDN checkpoint across a tile edge."""
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+    op, _ = _make_layer(3, seed=37)
+    torch.manual_seed(41)
+    hidden = torch.randn(CHUNK_SIZE + 6, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FREETOKEN_GDN_PREFILL_TILE_TOKENS", str(CHUNK_SIZE))
+    tracked_ctx = _ctx(3)
+    tracked = Req(
+        input_ids=torch.zeros(len(hidden), dtype=torch.int32), table_idx=1, cached_len=0,
+        output_len=1, uid=1, sampling_params=SamplingParams(), cache_handle=None,
+    )
+    tracked.linear_slot_idx = 1
+    tracked.mamba_ping_pong = (5, 6)
+    tracked_batch = Batch(reqs=[tracked], phase="prefill")
+    tracked_batch.padded_reqs = [tracked]
+    with tracked_ctx.forward_batch(tracked_batch):
+        tracked_out = op.forward(hidden)
+
+    assert tracked_batch.fla_metadata.track_h_rows == (1,)
+    assert tracked.mamba_last_track_seqlen == CHUNK_SIZE
+    tracked_rec = tracked_ctx.linear_state_pool.recurrent_states[0][5].clone()
+    tracked_conv = tracked_ctx.linear_state_pool.conv_states[0][5].clone()
+
+    stopped_ctx = _ctx(3)
+    stopped = Req(
+        input_ids=torch.zeros(CHUNK_SIZE, dtype=torch.int32), table_idx=1, cached_len=0,
+        output_len=1, uid=2, sampling_params=SamplingParams(), cache_handle=None,
+    )
+    stopped_batch = Batch(reqs=[stopped], phase="prefill")
+    stopped_batch.padded_reqs = [stopped]
+    with stopped_ctx.forward_batch(stopped_batch):
+        stopped_out = op.forward(hidden[:CHUNK_SIZE])
+
+    torch.testing.assert_close(tracked_out[:CHUNK_SIZE], stopped_out, rtol=0, atol=0)
+    # The kernel's checkpoint h is bf16 while the live recurrent pool is fp32, so the
+    # checkpoint comparison includes one intentional bf16 round-trip.
+    torch.testing.assert_close(
+        tracked_rec, stopped_ctx.linear_state_pool.recurrent_states[0][1],
+        rtol=5e-3, atol=5e-4,
+    )
+    torch.testing.assert_close(
+        tracked_conv, stopped_ctx.linear_state_pool.conv_states[0][1], rtol=0, atol=0
+    )
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

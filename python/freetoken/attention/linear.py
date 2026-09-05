@@ -40,6 +40,9 @@ class FLAMetadata:
     # left None by build_fla_metadata so the existing path is unchanged.
     track_dst: torch.Tensor | None = None        # [nt] int64 dst pool slot per tracked req
     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
+    # CPU mirror of track_h_row. The tiled GDN prefill uses this to retain only the requested
+    # checkpoint rows without a device-to-host synchronization in every GDN layer.
+    track_h_rows: tuple[int, ...] | None = None
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
@@ -96,7 +99,10 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
     ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
     tracks (non-hybrid, or all extends < CHUNK+1)."""
-    empty = dict(track_dst=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
+    empty = dict(
+        track_dst=None, track_h_row=None, track_h_rows=None,
+        track_conv_src=None, track_boundary_row=None,
+    )
     if not any(r.mamba_ping_pong is not None for r in reqs):
         return empty
     from freetoken.core import get_global_ctx
@@ -132,6 +138,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     return dict(
         track_dst=to(dst, dtype=torch.int64),
         track_h_row=to(h_row, dtype=torch.int64),
+        track_h_rows=tuple(h_row),
         track_conv_src=to(conv_src, dtype=torch.int64),
         track_boundary_row=to(boundary_rows, dtype=torch.int64),
     )

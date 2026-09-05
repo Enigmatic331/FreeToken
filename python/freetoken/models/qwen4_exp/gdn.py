@@ -143,11 +143,12 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                               h: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
-        SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
+        SSM: ``recurrent_states[li, dst] = h[0]`` -- ``h`` contains only the selected track
+        rows, in ``track_dst`` order. This is a DIRECT copy (each row is [V,K], the
         state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
         Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        rec.index_copy_(0, fla.track_dst, h[0].to(rec.dtype))
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
@@ -216,7 +217,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 q, k, v, g, beta,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
+                return_h=track, h_rows=fla.track_h_rows,
             )
             if track:
                 core_out, h = result
