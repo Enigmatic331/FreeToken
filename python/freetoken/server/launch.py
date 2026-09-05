@@ -5,7 +5,7 @@ import multiprocessing as mp
 import os
 import sys
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from freetoken.distributed import DistributedInfo
 from freetoken.utils import init_logger
@@ -26,6 +26,27 @@ def _report_startup_error(ack_queue: mp.Queue, exc: BaseException) -> None:
         ack_queue.join_thread()
     except Exception:  # noqa: BLE001 -- reporting is a nicety; never shadow the real exception
         pass
+
+
+def _hard_exit_failed_scheduler(exc: BaseException) -> NoReturn:
+    """Terminate a scheduler worker immediately after an unhandled fatal error.
+
+    A scheduler owns CUDA/NCCL and ZeroMQ background threads.  Letting an exception unwind
+    through ``multiprocessing`` can therefore hang forever in interpreter cleanup: the worker
+    has already stopped serving, but ``Process.is_alive()`` remains true and the frontend keeps
+    reporting healthy.  Flush the traceback, then bypass cleanup so the backend supervisor sees
+    the process sentinel promptly and lets the service manager restart the complete TP group.
+    """
+    logger = init_logger(__name__)
+    logger.critical(
+        "Scheduler worker failed fatally; terminating without interpreter cleanup",
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os._exit(1)
 
 
 def _detach_process_group() -> None:
@@ -83,13 +104,13 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         try:
             scheduler = Scheduler(args)
             scheduler.sync_all_ranks()
-        except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
+        except BaseException as exc:  # noqa: BLE001 -- startup failure is fatal to this worker
             # A startup failure (bad config, OOM, corrupt weights) would otherwise reach the
             # parent only as a dead process -> a generic "exited during load". Push the real
             # reason first so the supervisor (and the desktop failure modal) can surface it;
             # the traceback still prints and the process still exits non-zero.
             _report_startup_error(ack_queue, exc)
-            raise
+            _hard_exit_failed_scheduler(exc)
 
         if args.tp_info.is_primary():
             # Report the real per-unit cache VRAM costs (KV/expert/mamba), the device-wide free
@@ -123,6 +144,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
+        except BaseException as exc:  # noqa: BLE001 -- a dead scheduler cannot recover in place
+            _hard_exit_failed_scheduler(exc)
 
 
 def launch_server(
