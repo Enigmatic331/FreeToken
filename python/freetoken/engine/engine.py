@@ -36,6 +36,33 @@ from freetoken.kvcache.linear_state_pool import (
 logger = init_logger(__name__)
 
 
+def _finalize_moe_prefill_warmup(cache: OffloadMoeCache | None) -> None:
+    """Restore normal cache state after the synthetic prefill warmup.
+
+    Sparse prefill benefits from keeping the correctly materialized expert rows:
+    discarding them makes the first short request pay a fully cold, scattered H2D
+    gather.  The rows are ordinary cache entries and are safe to reuse; only the
+    synthetic warmup counters should be hidden from operational telemetry.  The
+    legacy full-layer path still gets the historical cold reset.
+    """
+    if cache is None:
+        return
+    if cache.sparse_prefill_max_tokens > 0:
+        cache.reset_stats()
+    else:
+        cache.reset()
+
+
+def _needs_prefill_warmup(
+    attention_backend: str, cache: OffloadMoeCache | None
+) -> bool:
+    """Whether startup needs a real prefill pass before serving requests."""
+    return (
+        attention_backend.split(",")[0] == "triton"
+        or (cache is not None and cache.sparse_prefill_max_tokens > 0)
+    )
+
+
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
     (e.g. a bare offload run with moe_cache_size unset and auto disabled) must fail loudly."""
@@ -477,8 +504,10 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
+        if _needs_prefill_warmup(config.attention_backend, self.moe_offload_cache):
+            # Triton needs its autotune cache compiled. Sparse prefill additionally
+            # needs representative expert rows resident before the first request,
+            # including when auto attention selected qsa_sparse.
             self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -1054,8 +1083,7 @@ class Engine:
                     self.model.forward()
         finally:
             dummy_row.fill_(dummy_slot)
-            if self.moe_offload_cache is not None:
-                self.moe_offload_cache.reset()
+            _finalize_moe_prefill_warmup(self.moe_offload_cache)
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
