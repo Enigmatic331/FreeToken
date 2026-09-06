@@ -122,7 +122,6 @@ class PrefillAdder:
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
-        reserved_swa_before = self.reserved_swa
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
         if self.cache_manager.swa_paged:
@@ -165,12 +164,6 @@ class PrefillAdder:
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
-        if is_chunked and pending_req.is_multimodal:
-            # Image soft tokens and their MRoPE coordinates must enter the decoder in one
-            # forward. Leave this request pending until it gets a fresh token budget; the
-            # scheduler rejects prompts that cannot fit even that full budget.
-            self.reserved_swa = reserved_swa_before
-            return None
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len

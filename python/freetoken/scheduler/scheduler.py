@@ -536,21 +536,6 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            if msg.is_multimodal and input_len > self.prefill_budget:
-                self.send_result(
-                    [
-                        ErrorReplyMsg(
-                            uid=msg.uid,
-                            error=(
-                                f"multimodal prompt is too long: {input_len} tokens exceeds "
-                                f"the single-prefill limit of {self.prefill_budget}; shrink "
-                                "the image/prompt or increase --max-prefill-length"
-                            ),
-                            code="context_length_exceeded",
-                        )
-                    ]
-                )
-                return
             if msg.is_multimodal:
                 vision_error: Exception | None = None
                 if self.config.tp_info.is_primary() and msg.mm_embeds is None:
@@ -933,14 +918,32 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        """Gather only the vision soft tokens present in this prefill chunk.
+
+        ``req.mm_embeds`` covers every image-placeholder token in the complete prompt, while a
+        chunked prefill forwards only ``[cached_len, device_len)``. Count placeholders before
+        and inside that span to take the corresponding contiguous feature rows. MRoPE already
+        slices the same span in ``_make_rope_positions``. Keep the complete tensor on the request
+        for later chunks and so cache management can exclude image-dependent KV from shared
+        prefix reuse.
+        """
+        image_token_id = self.config.model_config.image_token_id
+        parts = []
+        for req in batch.reqs:
+            if req.mm_embeds is None:
+                continue
+            if image_token_id is None:
+                raise ValueError("multimodal request has no configured image token")
+            prefix_ids = req.input_ids[: req.cached_len]
+            chunk_ids = req.input_ids[req.cached_len : req.device_len]
+            first = int((prefix_ids == image_token_id).sum().item())
+            count = int((chunk_ids == image_token_id).sum().item())
+            if count:
+                parts.append(req.mm_embeds[first : first + count])
         if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+            # Batch one is the serving default and a view avoids duplicating up to one full
+            # chunk of vision features on the already memory-bound backbone GPU.
+            batch.mm_embeds = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first

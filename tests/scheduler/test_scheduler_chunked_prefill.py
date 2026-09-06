@@ -152,12 +152,12 @@ def test_batched_prefill_carries_each_new_prompt_admission():
     assert batch.prompt_admissions == [(1, 3, 0), (2, 5, 0)]
 
 
-def test_multimodal_prompt_waits_for_a_single_full_prefill_budget():
+def test_multimodal_prompt_can_continue_across_prefill_chunks():
     from freetoken.core import SamplingParams
     from freetoken.scheduler.prefill import ChunkedReq
     from freetoken.scheduler.utils import PendingReq
 
-    _cm, tm, _dm, pm = _build_managers(num_pages=64)
+    cm, tm, _dm, pm = _build_managers(num_pages=64)
     prompt_len = 10
     soft_tokens = torch.zeros(2, 4)
     pm.pending_list = [
@@ -173,13 +173,49 @@ def test_multimodal_prompt_waits_for_a_single_full_prefill_budget():
         )
     ]
 
-    # A partially consumed batch budget must not create a multimodal ChunkedReq.
-    assert pm.schedule_next_batch(prompt_len - 1) is None
+    first = pm.schedule_next_batch(6)
+    assert first is not None
+    assert isinstance(first.reqs[0], ChunkedReq)
+    assert first.reqs[0].mm_embeds is soft_tokens
     assert pm.runnable
-    assert tm.available_size == MAX_RUNNING
+    cm.allocate_paged(first.reqs)
+    first.reqs[0].complete_one()
 
-    batch = pm.schedule_next_batch(prompt_len)
-    assert batch is not None
-    assert len(batch.reqs) == 1
-    assert batch.reqs[0].mm_embeds is soft_tokens
-    assert not isinstance(batch.reqs[0], ChunkedReq)
+    final = pm.schedule_next_batch(6)
+    assert final is not None
+    assert len(final.reqs) == 1
+    assert final.reqs[0].cached_len == 6
+    assert final.reqs[0].extend_len == 4
+    assert final.reqs[0].mm_embeds is soft_tokens
+    assert not isinstance(final.reqs[0], ChunkedReq)
+    assert not pm.runnable
+    assert tm.available_size == MAX_RUNNING - 1
+
+
+def test_multimodal_gather_slices_features_for_each_chunk():
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    image_token_id = 99
+    ids = torch.tensor([1, 2, 99, 99, 3, 99, 99, 99, 4], dtype=torch.int32)
+    features = torch.arange(5 * 4, dtype=torch.float32).view(5, 4)
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(
+            model_config=SimpleNamespace(image_token_id=image_token_id)
+        )
+    )
+
+    expected = ((0, 2, features[:0]), (2, 5, features[:2]),
+                (5, 7, features[2:4]), (7, 9, features[4:]))
+    for cached_len, device_len, selected in expected:
+        req = SimpleNamespace(
+            input_ids=ids[:device_len], cached_len=cached_len, device_len=device_len,
+            mm_embeds=features,
+        )
+        batch = SimpleNamespace(reqs=[req], mm_embeds=None)
+        Scheduler._gather_multimodal(scheduler, batch)
+        if selected.numel() == 0:
+            assert batch.mm_embeds is None
+        else:
+            torch.testing.assert_close(batch.mm_embeds, selected)
