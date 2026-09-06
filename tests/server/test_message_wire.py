@@ -142,12 +142,16 @@ def test_multimodal_tensors_round_trip_with_shape_and_bfloat16():
         rope_positions=rope,
         mrope_position_delta=-3,
         is_multimodal=True,
+        image_cache_keys=[b"a" * 32],
+        image_inputs=[b"compressed-image"],
     )
 
     out = BaseBackendMsg.decoder(msg.encoder())
 
     assert isinstance(out, UserMsg)
     assert out.is_multimodal and out.mrope_position_delta == -3
+    assert out.image_cache_keys == [b"a" * 32]
+    assert out.image_inputs == [b"compressed-image"]
     for actual, expected in (
         (out.input_ids, msg.input_ids),
         (out.mm_embeds, soft_tokens),
@@ -170,6 +174,8 @@ def test_ep_worker_copy_drops_pixels_but_keeps_mrope_metadata():
         rope_positions=torch.arange(12, dtype=torch.int32).reshape(4, 3),
         mrope_position_delta=-1,
         is_multimodal=True,
+        image_cache_keys=[b"b" * 32],
+        image_inputs=["data:image/png;base64,AAAA"],
     )
 
     worker, changed = _without_vision_pixels(msg)
@@ -179,3 +185,5 @@ def test_ep_worker_copy_drops_pixels_but_keeps_mrope_metadata():
     assert torch.equal(worker.input_ids, msg.input_ids)
     assert torch.equal(worker.rope_positions, msg.rope_positions)
     assert worker.is_multimodal and worker.mrope_position_delta == -1
+    assert worker.image_cache_keys == [b"b" * 32]
+    assert worker.image_inputs is None

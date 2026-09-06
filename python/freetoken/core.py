@@ -40,14 +40,17 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
-    # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
-    # hidden]) scattered at image-token positions during this request's prefill.
+    # Optional precomputed multimodal soft-token embeddings ([num_image_tokens,
+    # hidden]). Online cache hits may keep these on CPU until their image span is forwarded.
     mm_embeds: torch.Tensor | None = None
     # Qwen-VL prompt coordinates in engine layout [prompt_tokens, T/H/W]. Generated
     # tokens use ``logical_position + mrope_position_delta`` on all three axes.
     prompt_rope_positions: torch.Tensor | None = None
     mrope_position_delta: int = 0
     is_multimodal: bool = False
+    # Prefix-cache identity. Text positions equal input_ids; image-placeholder
+    # positions carry scheduler-local content identities. Never sent to the model.
+    cache_ids: torch.Tensor | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -72,6 +75,10 @@ class Req:
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
+        if self.cache_ids is not None:
+            assert self.cache_ids.is_cpu
+            assert self.cache_ids.dtype == self.input_ids.dtype
+            assert self.cache_ids.shape == self.input_ids.shape
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
@@ -81,6 +88,10 @@ class Req:
         self._ids_buf = torch.empty(self.max_device_len, dtype=self.input_ids.dtype)
         self._ids_buf[: self.device_len] = self.input_ids
         self.input_ids = self._ids_buf[: self.device_len]
+        if self.cache_ids is not None:
+            self._cache_ids_buf = torch.empty(self.max_device_len, dtype=self.cache_ids.dtype)
+            self._cache_ids_buf[: self.device_len] = self.cache_ids
+            self.cache_ids = self._cache_ids_buf[: self.device_len]
 
     @property
     def remain_len(self) -> int:
@@ -100,6 +111,15 @@ class Req:
         assert m <= self.max_device_len
         self._ids_buf[n:m] = next_token
         self.input_ids = self._ids_buf[:m]
+        if self.cache_ids is not None:
+            self._cache_ids_buf[n:m] = next_token
+            self.cache_ids = self._cache_ids_buf[:m]
+
+    @property
+    def prefix_cache_ids(self) -> torch.Tensor | None:
+        if self.is_multimodal and self.cache_ids is None:
+            return None
+        return self.cache_ids if self.cache_ids is not None else self.input_ids
 
     @property
     def can_decode(self) -> bool:

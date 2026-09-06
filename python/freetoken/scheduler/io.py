@@ -26,8 +26,12 @@ def _without_vision_pixels(msg: BaseBackendMsg) -> tuple[BaseBackendMsg, bool]:
     ranks wastes CPU copies and ZMQ bandwidth, while token ids and MRoPE coordinates must
     remain identical on every rank so scheduling stays lock-step.
     """
-    if isinstance(msg, UserMsg) and msg.pixel_values is not None:
-        return replace(msg, pixel_values=None, image_grid_thw=None), True
+    if isinstance(msg, UserMsg) and (
+        msg.pixel_values is not None or msg.image_inputs is not None
+    ):
+        return replace(
+            msg, pixel_values=None, image_grid_thw=None, image_inputs=None
+        ), True
     if isinstance(msg, BatchBackendMsg):
         changed = False
         data: list[BaseBackendMsg] = []

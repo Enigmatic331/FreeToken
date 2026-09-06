@@ -42,3 +42,21 @@ def test_chunked_req_keeps_prompt_view_and_rejects_append():
     assert req.input_ids is ids
     with pytest.raises(NotImplementedError):
         req.append_host(torch.tensor([1], dtype=torch.int32))
+
+
+def test_append_host_extends_multimodal_cache_identity_with_generated_tokens():
+    req = Req(
+        input_ids=torch.tensor([1, 99, 99, 2], dtype=torch.int32),
+        cache_ids=torch.tensor([1, -7, -7, 2], dtype=torch.int32),
+        table_idx=0,
+        cached_len=0,
+        output_len=2,
+        uid=0,
+        sampling_params=SamplingParams(),
+        cache_handle=None,
+        is_multimodal=True,
+    )
+    req.append_host(torch.tensor([123], dtype=torch.int32))
+    assert req.input_ids.tolist() == [1, 99, 99, 2, 123]
+    assert req.cache_ids.tolist() == [1, -7, -7, 2, 123]
+    assert req.prefix_cache_ids is req.cache_ids

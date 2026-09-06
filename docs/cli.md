@@ -77,10 +77,13 @@ ft serve --model ... --gpu 0,1 --tp-size 2 \
 OpenAI chat `image_url`, Responses `input_image`, and Anthropic URL/base64 image
 blocks are accepted. HTTP(S) and base64 data URLs are supported; each encoded
 image is limited to 64 MiB. Multiple images are allowed, but video and precomputed
-embedding inputs are not exposed by the online API yet. Multimodal prompts must
-fit within one `--max-prefill-length` chunk, and are intentionally excluded from
-cross-request prefix-cache reuse because identical image-placeholder token IDs can
-represent different pixels.
+embedding inputs are not exposed by the online API yet. Multimodal prompts can span
+prefill chunks. Online images are content-addressed from their exact decoded RGB
+pixels and processor grid, so repeated turns can safely reuse image-dependent KV;
+different images never share those entries. Repeated vision features use a bounded
+CPU LRU (256 MiB by default); set `FREETOKEN_VISION_CACHE_BYTES` to another byte
+limit or `0` to disable feature reuse. Unkeyed offline soft-token inputs remain
+excluded from shared prefix caching.
 
 ### KV cache & memory
 

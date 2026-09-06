@@ -30,6 +30,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .multimodal_cache import MultimodalCacheKeyRegistry, VisionFeatureCache
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -91,6 +92,9 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        self.multimodal_cache_keys = MultimodalCacheKeyRegistry()
+        self.vision_feature_cache = VisionFeatureCache()
+        self._vision_fallback_processor = None
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -536,21 +540,41 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+            cache_ids = None
             if msg.is_multimodal:
                 vision_error: Exception | None = None
                 if self.config.tp_info.is_primary() and msg.mm_embeds is None:
                     try:
-                        if (
-                            msg.pixel_values is None
-                            or msg.image_grid_thw is None
-                            or msg.rope_positions is None
-                        ):
+                        if msg.rope_positions is None:
                             raise ValueError(
-                                "multimodal request is missing pixels, image grid, or MRoPE metadata"
+                                "multimodal request is missing MRoPE metadata"
                             )
-                        msg.mm_embeds = self.engine.model.encode_images(
-                            msg.pixel_values, msg.image_grid_thw
-                        )
+                        image_keys = tuple(msg.image_cache_keys or ())
+                        msg.mm_embeds = self.vision_feature_cache.get(image_keys)
+                        cache_hit = msg.mm_embeds is not None
+                        if not cache_hit:
+                            if msg.pixel_values is None or msg.image_grid_thw is None:
+                                if not msg.image_inputs:
+                                    raise ValueError(
+                                        "vision-feature cache miss has no pixels or image fallback"
+                                    )
+                                if self._vision_fallback_processor is None:
+                                    from freetoken.multimodal.qwen_vl import QwenVLProcessor
+
+                                    self._vision_fallback_processor = QwenVLProcessor(
+                                        self.config.model_path
+                                    )
+                                pixels, grid, reconstructed_keys = (
+                                    self._vision_fallback_processor.process_images(msg.image_inputs)
+                                )
+                                if reconstructed_keys != msg.image_cache_keys:
+                                    raise ValueError(
+                                        "reconstructed image content does not match its cache identity"
+                                    )
+                                msg.pixel_values, msg.image_grid_thw = pixels, grid
+                            msg.mm_embeds = self.engine.model.encode_images(
+                                msg.pixel_values, msg.image_grid_thw
+                            )
                         image_token_id = self.config.model_config.image_token_id
                         slots = int((msg.input_ids == image_token_id).sum().item())
                         if msg.rope_positions.shape != (msg.input_ids.numel(), 3):
@@ -560,6 +584,15 @@ class Scheduler(SchedulerIOMixin):
                                 f"image-token slots ({slots}) do not match vision features "
                                 f"({msg.mm_embeds.shape[0]})"
                             )
+                        if image_keys and not cache_hit:
+                            self.vision_feature_cache.put(image_keys, msg.mm_embeds)
+                        logger.info_rank0(
+                            "Vision feature cache %s for request %d (%d images, %.2f MiB cached)",
+                            "hit" if cache_hit else "miss",
+                            msg.uid,
+                            len(image_keys),
+                            self.vision_feature_cache.current_bytes / (1 << 20),
+                        )
                         msg.pixel_values = None
                         msg.image_grid_thw = None
                     except Exception as exc:  # noqa: BLE001 -- isolate a bad image/request
@@ -587,6 +620,25 @@ class Scheduler(SchedulerIOMixin):
                             ]
                         )
                     return
+                if msg.image_cache_keys:
+                    try:
+                        cache_ids = self.multimodal_cache_keys.cache_ids(
+                            msg.input_ids,
+                            self.config.model_config.image_token_id,
+                            msg.image_cache_keys,
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- request-local validation
+                        if self.config.tp_info.is_primary():
+                            self.send_result(
+                                [
+                                    ErrorReplyMsg(
+                                        uid=msg.uid,
+                                        error=f"invalid image cache identity: {exc}",
+                                        code="invalid_value",
+                                    )
+                                ]
+                            )
+                        return
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
                 logger.warning_rank0(
@@ -617,7 +669,7 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            self.prefill_manager.add_one_req(msg)
+            self.prefill_manager.add_one_req(msg, cache_ids=cache_ids)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)
@@ -924,8 +976,8 @@ class Scheduler(SchedulerIOMixin):
         chunked prefill forwards only ``[cached_len, device_len)``. Count placeholders before
         and inside that span to take the corresponding contiguous feature rows. MRoPE already
         slices the same span in ``_make_rope_positions``. Keep the complete tensor on the request
-        for later chunks and so cache management can exclude image-dependent KV from shared
-        prefix reuse.
+        for later chunks. A content-keyed KV hit can skip the image span entirely; CPU-cached
+        features move to the backbone GPU only if this chunk actually forwards image tokens.
         """
         image_token_id = self.config.model_config.image_token_id
         parts = []
@@ -939,7 +991,8 @@ class Scheduler(SchedulerIOMixin):
             first = int((prefix_ids == image_token_id).sum().item())
             count = int((chunk_ids == image_token_id).sum().item())
             if count:
-                parts.append(req.mm_embeds[first : first + count])
+                target = getattr(self, "device", req.mm_embeds.device)
+                parts.append(req.mm_embeds[first : first + count].to(target))
         if parts:
             # Batch one is the serving default and a view avoids duplicating up to one full
             # chunk of vision features on the already memory-bound backbone GPU.

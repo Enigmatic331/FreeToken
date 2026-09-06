@@ -183,6 +183,11 @@ class PrefillAdder:
             prompt_rope_positions=pending_req.prompt_rope_positions,
             mrope_position_delta=pending_req.mrope_position_delta,
             is_multimodal=pending_req.is_multimodal,
+            cache_ids=(
+                pending_req.cache_ids[: cached_len + chunk_size]
+                if pending_req.cache_ids is not None
+                else None
+            ),
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -241,7 +246,7 @@ class PrefillManager:
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
 
-    def add_one_req(self, req: UserMsg) -> None:
+    def add_one_req(self, req: UserMsg, cache_ids: torch.Tensor | None = None) -> None:
         self.pending_list.append(
             PendingReq(
                 req.uid,
@@ -251,6 +256,7 @@ class PrefillManager:
                 prompt_rope_positions=req.rope_positions,
                 mrope_position_delta=req.mrope_position_delta,
                 is_multimodal=req.is_multimodal,
+                cache_ids=cache_ids,
             )
         )
 

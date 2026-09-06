@@ -21,6 +21,7 @@ class PendingReq:
     prompt_rope_positions: torch.Tensor | None = None
     mrope_position_delta: int = 0
     is_multimodal: bool = False
+    cache_ids: torch.Tensor | None = None
 
     @property
     def input_len(self) -> int:

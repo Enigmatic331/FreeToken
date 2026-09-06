@@ -22,10 +22,14 @@ def _pool(num_slots=16):
                            device=torch.device("cpu"), tp_size=1)
 
 
-def _pend(ids):
+def _pend(ids, *, cache_ids=None, is_multimodal=False):
     # int32 to match production Req.input_ids dtype (fast_compare_key needs consistent dtype)
     t = torch.tensor(ids, dtype=torch.int32)
-    return SimpleNamespace(input_ids=t, input_len=len(ids), mm_embeds=None)
+    keys = torch.tensor(cache_ids, dtype=torch.int32) if cache_ids is not None else None
+    return SimpleNamespace(
+        input_ids=t, input_len=len(ids), mm_embeds=None,
+        cache_ids=keys, is_multimodal=is_multimodal,
+    )
 
 
 def test_hybrid_cache_manager_donate_then_hit():
@@ -80,6 +84,36 @@ def test_hybrid_finish_donates_live_slot():
     # ping-pong pair freed; live slot kept (now owned by the tree)
     mr2 = cm.match_req(_pend([7, 8, 9, 10]))
     assert mr2.cuda_handle.cached_len == 3 and mr2.mamba_value == live
+
+
+def test_hybrid_multimodal_cache_reuses_same_image_but_isolates_different_image():
+    pool = _pool()
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+    actual = [7, 99, 99, 10]
+    key_a = [7, -1, -1, 10]
+    key_b = [7, -2, -2, 10]
+
+    mr = cm.match_req(_pend(actual, cache_ids=key_a, is_multimodal=True))
+    live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
+    page_table[0, :3] = torch.tensor([300, 301, 302], dtype=torch.int32)
+    req = Req(
+        input_ids=torch.tensor(actual, dtype=torch.int32),
+        cache_ids=torch.tensor(key_a, dtype=torch.int32),
+        table_idx=0, cached_len=3, output_len=1, uid=4,
+        sampling_params=SamplingParams(), cache_handle=mr.cuda_handle,
+        is_multimodal=True,
+    )
+    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    cm.lock(mr.cuda_handle)
+    cm.cache_req(req, finished=True)
+
+    same = cm.match_req(_pend(actual, cache_ids=key_a, is_multimodal=True))
+    different = cm.match_req(_pend(actual, cache_ids=key_b, is_multimodal=True))
+    legacy = cm.match_req(_pend(actual, is_multimodal=True))
+    assert same.cuda_handle.cached_len == 3 and same.mamba_value == live
+    assert different.cuda_handle.cached_len == 0 and different.mamba_value is None
+    assert legacy.cuda_handle.cached_len == 0 and legacy.mamba_value is None
 
 
 def test_free_req_slots_idempotent():

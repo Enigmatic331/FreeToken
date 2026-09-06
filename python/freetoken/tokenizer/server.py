@@ -279,6 +279,8 @@ def tokenize_worker(
                                     rope_positions=encoded.rope_positions,
                                     mrope_position_delta=encoded.mrope_position_delta,
                                     is_multimodal=encoded.is_multimodal,
+                                    image_cache_keys=encoded.image_cache_keys,
+                                    image_inputs=encoded.image_inputs,
                                 )
                             )
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))

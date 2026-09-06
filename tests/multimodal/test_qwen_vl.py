@@ -7,6 +7,7 @@ import torch
 from PIL import Image
 
 from freetoken.multimodal.qwen_vl import (
+    image_cache_keys,
     image_sources,
     load_image,
     qwen_vl_mrope_positions,
@@ -62,3 +63,17 @@ def test_qwen_image_mrope_positions_and_decode_delta():
     )
     assert torch.equal(positions, expected)
     assert delta == -3
+
+
+def test_image_cache_keys_are_content_and_geometry_addressed():
+    image_a = Image.new("RGB", (3, 2), (12, 34, 56))
+    image_a_copy = image_a.copy()
+    image_b = image_a.copy()
+    image_b.putpixel((2, 1), (12, 34, 57))
+    grid = torch.tensor([[1, 4, 6]], dtype=torch.int32)
+
+    key_a = image_cache_keys([image_a], grid)[0]
+    assert len(key_a) == 32
+    assert image_cache_keys([image_a_copy], grid)[0] == key_a
+    assert image_cache_keys([image_b], grid)[0] != key_a
+    assert image_cache_keys([image_a], torch.tensor([[1, 6, 6]]))[0] != key_a

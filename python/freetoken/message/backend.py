@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 import torch
@@ -44,6 +44,11 @@ class UserMsg(BaseBackendMsg):
     rope_positions: torch.Tensor | None = None  # CPU [prompt_tokens, 3]
     mrope_position_delta: int = 0
     is_multimodal: bool = False
+    # Full SHA-256 identities in image-token-span order. These are safe across
+    # tokenizer workers; the scheduler converts them to local radix symbols.
+    image_cache_keys: list[bytes] | None = None
+    # Original compressed bytes/URL strings for a scheduler feature-cache miss.
+    image_inputs: list[str | bytes] | None = field(default=None, repr=False)
 
 
 @dataclass
