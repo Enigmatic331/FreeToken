@@ -103,6 +103,7 @@ def routed_experts_fp4(
     down_packed: torch.Tensor,     # [S, H, I//2] uint8
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
+    return_route_outputs: bool = False,
 ) -> torch.Tensor:
     """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
@@ -129,7 +130,7 @@ def routed_experts_fp4(
         act, down_packed, down_scale, slots, topk_weights,
         a_row_is_route=True, mul_routed_weight=True,
     )  # [T, top_k, H]
-    return down.sum(dim=1)  # [T, H]
+    return down if return_route_outputs else down.sum(dim=1)
 
 
 # Above this the grouped GEMM beats the per-route GEMV despite its padding;
@@ -191,6 +192,7 @@ def routed_experts_fp4_prefill(
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
     num_rows: int,
+    return_route_outputs: bool = False,
 ) -> torch.Tensor:
     """Grouped-GEMM counterpart of :func:`routed_experts_fp4` for dense prefill
     chunks: one moe_align sort shared by both GEMMs, each expert's weights
@@ -202,6 +204,7 @@ def routed_experts_fp4_prefill(
         return routed_experts_fp4(
             x, slots, topk_weights,
             gate_up_packed, gate_up_scale, down_packed, down_scale, swiglu_limit,
+            return_route_outputs=return_route_outputs,
         )
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
@@ -232,7 +235,7 @@ def routed_experts_fp4_prefill(
         act, down_packed, down_scale, down, tw,
         sorted_ids, expert_ids, ntpp, routes, 1, True, cfg,
     )
-    return down.sum(dim=1)  # [T, H]
+    return down if return_route_outputs else down.sum(dim=1)
 
 
 __all__ = ["routed_experts_fp4", "routed_experts_fp4_prefill", "_grouped_decode"]

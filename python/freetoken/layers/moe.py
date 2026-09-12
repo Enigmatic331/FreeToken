@@ -637,6 +637,7 @@ class OffloadMoELayer(MoELayer):
                     hidden_states, topk_ids, topk_weights,
                     gate_up_packed, gate_up_scale, down_packed, down_scale,
                     self.swiglu_limit, n,
+                    return_route_outputs=getattr(self, "return_route_outputs", False),
                 )
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
@@ -644,6 +645,7 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, topk_ids, topk_weights,
                 gate_up_packed, gate_up_scale, down_packed, down_scale,
                 self.swiglu_limit,
+                return_route_outputs=getattr(self, "return_route_outputs", False),
             )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"
         gate_up, down = views

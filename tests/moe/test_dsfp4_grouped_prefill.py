@@ -128,3 +128,22 @@ def test_sparse_chunk_falls_back_to_gemv():
     ref = fmod.routed_experts_fp4(x, slots.clone(), w, gup, gus, dp, ds, LIMIT)
     out = fmod.routed_experts_fp4_prefill(x, slots.clone(), w, gup, gus, dp, ds, LIMIT, E)
     assert torch.equal(ref, out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_grouped_prefill_can_preserve_weighted_route_outputs():
+    import freetoken.moe.fused_ds_fp4 as fmod
+
+    device = "cuda"
+    gup, gus, dp, ds = _banks(device)
+    x, slots, w = _routing(128, device)
+    routes = fmod.routed_experts_fp4_prefill(
+        x.clone(), slots.clone(), w, gup, gus, dp, ds, LIMIT, E,
+        return_route_outputs=True,
+    )
+    combined = fmod.routed_experts_fp4_prefill(
+        x.clone(), slots.clone(), w, gup, gus, dp, ds, LIMIT, E,
+    )
+
+    assert routes.shape == (*slots.shape, x.shape[-1])
+    torch.testing.assert_close(routes.sum(dim=1), combined)
