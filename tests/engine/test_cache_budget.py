@@ -37,6 +37,29 @@ def test_offload_case_experts_take_most_kv_gets_reserve_floor():
     assert overlap is True
 
 
+def test_explicit_kv_geometry_is_fixed_while_experts_take_the_remainder():
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=1000, per_expert_bytes=100, cache_per_page=10,
+        num_experts=2, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=99, max_slots=50,
+        fixed_num_pages=10, fixed_kv_bytes=125,
+    )
+    # The exact 125-byte target, not the unrelated 99-page auto reserve, leaves
+    # room for eight slots.  Residual bytes do not grow the explicit page target.
+    assert size == 8
+    assert pages == 10
+    assert overlap is True
+
+
+def test_explicit_kv_geometry_requires_pages_and_bytes_together():
+    with pytest.raises(ValueError, match="supplied together"):
+        plan_cache_budget(
+            budget_bytes=1000, per_expert_bytes=100, cache_per_page=10,
+            num_experts=2, total_experts=50, prefill_overlap=True,
+            kv_reserve_pages=10, max_slots=50, fixed_num_pages=10,
+        )
+
+
 def test_marlin_cap_clamps_count_and_rolls_bytes_to_kv():
     # budget would fund 1500 experts, but marlin caps at 992; freed bytes become KV pages.
     size, pages, overlap = plan_cache_budget(
@@ -332,6 +355,59 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         kv_reserve_tokens=0, page_size=16, quant_format="bf16",
     )
     assert (size, pages, overlap) == expected
+
+
+def test_engine_auto_cache_prices_explicit_pages_instead_of_auto_reserve():
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class StubModelConfig:
+        has_swa_attention = False
+        num_experts = 2
+        num_moe_layers = 25
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0,), num_kv_heads=1, head_dim=5,
+                sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    class StubConfig:
+        dtype = torch.float16
+        page_size = 10
+        max_running_req = 1
+        memory_ratio = 1.0
+        moe_prefill_overlap = True
+        kv_reserve_tokens = 900
+        num_page_override = 10
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        model_config = StubModelConfig()
+
+        class tp_info:
+            size = 1
+
+    class StubBanks:
+        quant_format = "bf16"
+        sources = {"weight": [torch.zeros(2, 50, dtype=torch.uint8)] * 25}
+
+    engine = Engine.__new__(Engine)
+    engine._baseline_free = 3000
+    engine._weights_bytes = 0
+    engine._pool_cls = MHAKVCache
+
+    size, pages, overlap = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+
+    # MHA page cost is 200 bytes here.  Ten explicit pages consume 2000 bytes and
+    # leave 1000 bytes for twenty 50-byte expert slots.  The unrelated 900-token
+    # auto reserve would be 90 pages and make this plan impossible.
+    assert pages == 10
+    assert size == 20
+    assert overlap is True
 
 
 # ---------------------------------------------------------------------------

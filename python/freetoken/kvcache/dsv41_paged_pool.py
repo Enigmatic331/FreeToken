@@ -81,6 +81,16 @@ class DSV41PagedKVCache(DSV4PagedKVCache):
         return int(num_pages)
 
     @classmethod
+    def allocation_bytes(cls, config, num_pages: int) -> int:
+        """Byte-exact V4.1 allocation for an explicit usable-page target."""
+        from .dsv41_cost_model import _dsv41_pool_sizes, dsv41_pool_bytes
+
+        sizes = _dsv41_pool_sizes(config, int(num_pages) + 1)
+        return dsv41_pool_bytes(
+            sizes, cls._args(config), config.max_running_req + 1
+        )
+
+    @classmethod
     def min_kv_tokens(cls, config) -> int:
         from .dsv4_cost_model import _dsv4_window_floor_pages
 

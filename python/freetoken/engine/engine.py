@@ -582,8 +582,17 @@ class Engine:
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
-        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        cache_per_page, kv_fixed_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+        fixed_num_pages = getattr(config, "num_page_override", None)
+        fixed_kv_bytes = None
+        if fixed_num_pages is None:
+            fixed_cache_size = kv_fixed_size + state_pool_bytes(config)
+        else:
+            # An explicit KV target supersedes the auto solver's reserve/slack.  Price
+            # the actual pool geometry (including rounded SWA tiers and dummy/scratch
+            # rows) and leave only the sibling state pool in the fixed term.
+            fixed_cache_size = state_pool_bytes(config)
+            fixed_kv_bytes = self._pool_cls.allocation_bytes(config, fixed_num_pages)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -599,6 +608,8 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
+            fixed_num_pages=fixed_num_pages,
+            fixed_kv_bytes=fixed_kv_bytes,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -1534,13 +1545,7 @@ def _adjust_config(config: EngineConfig):
         # table and graph capture all stay bs=1.
         if config.max_running_req != 1:
             override("max_running_req", 1)
-        if dsv41_args is not None:
-            # Engram's three-token history is still assembled from Req state on
-            # the host. Keep decode eager until it rides the graph input buffer;
-            # capturing now would freeze the dummy request's history.
-            override("cuda_graph_bs", [])
-            override("cuda_graph_max_bs", 0)
-        elif config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 

@@ -54,6 +54,8 @@ def plan_cache_budget(
     prefill_overlap: bool,
     kv_reserve_pages: int,
     max_slots: int,
+    fixed_num_pages: int | None = None,
+    fixed_kv_bytes: int | None = None,
 ) -> tuple[int, int, bool]:
     """Split ``budget_bytes`` MoE-first into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -61,7 +63,9 @@ def plan_cache_budget(
     weights + fixed_cache_size; the (1-memory_ratio) remainder is the graph headroom).
     Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
     to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
-    overlap is feasible else ``num_experts``); KV pages take whatever remains.
+    overlap is feasible else ``num_experts``); KV pages take whatever remains.  When
+    ``fixed_num_pages`` is supplied, ``fixed_kv_bytes`` is the byte-exact cost of that
+    pinned geometry and no residual budget is silently converted back into KV pages.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
@@ -73,7 +77,16 @@ def plan_cache_budget(
     lo = 2 * num_experts if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
-    kv_reserve_bytes = kv_reserve_pages * cache_per_page
+    if (fixed_num_pages is None) != (fixed_kv_bytes is None):
+        raise ValueError("fixed_num_pages and fixed_kv_bytes must be supplied together")
+    if fixed_num_pages is not None and fixed_num_pages <= 1:
+        raise ValueError("fixed_num_pages must be greater than one")
+
+    kv_reserve_bytes = (
+        int(fixed_kv_bytes)
+        if fixed_kv_bytes is not None
+        else kv_reserve_pages * cache_per_page
+    )
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
@@ -81,11 +94,19 @@ def plan_cache_budget(
     overlap = overlap and moe_cache_size >= 2 * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
-    num_pages = max(remaining // cache_per_page, kv_reserve_pages)
+    num_pages = (
+        int(fixed_num_pages)
+        if fixed_num_pages is not None
+        else max(remaining // cache_per_page, kv_reserve_pages)
+    )
     # A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is below
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
-    total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+    total = moe_cache_size * per_expert_bytes + (
+        int(fixed_kv_bytes)
+        if fixed_kv_bytes is not None
+        else num_pages * cache_per_page
+    )
     assert total <= budget_bytes, (
         f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
         f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
@@ -109,6 +130,8 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     quant_format: str,
+    fixed_num_pages: int | None = None,
+    fixed_kv_bytes: int | None = None,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -128,4 +151,6 @@ def resolve_moe_cache_auto(
         prefill_overlap=prefill_overlap,
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
+        fixed_num_pages=fixed_num_pages,
+        fixed_kv_bytes=fixed_kv_bytes,
     )

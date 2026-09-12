@@ -83,6 +83,19 @@ class BaseKVCachePool(ABC):
         return num_pages
 
     @classmethod
+    def allocation_bytes(cls, config, num_pages: int) -> int:
+        """Exact bytes allocated by this pool for ``num_pages`` usable pages.
+
+        Uniform pools are affine in the page count, so ``kv_cost`` is exact.  Pool
+        families with rounded secondary tiers (for example DSV4/DSV4.1 window
+        pages) override this method.  Startup auto-sizing uses it when the user
+        pins ``--num-pages``: an explicit geometry must be priced as that geometry,
+        rather than through the auto solver's deliberately conservative reserve.
+        """
+        cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config)
+        return int(num_pages) * cache_per_page + fixed_cache_size
+
+    @classmethod
     def min_kv_tokens(cls, config) -> int:
         # rebuild rejects num_pages <= 0, so the floor is one page's worth of tokens.
         return int(config.page_size)
