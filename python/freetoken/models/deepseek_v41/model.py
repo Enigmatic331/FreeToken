@@ -28,6 +28,7 @@ from .indexer import (
 )
 from .layers import Linear, RMSNorm
 from .moe import Gate, MoE, SharedExpert
+from .profile import profile, profile_range
 
 
 class SharedAttentionRuntime:
@@ -575,27 +576,33 @@ class MoEState(nn.Module):
         shape = x.shape
         hidden = x.view(-1, self.dim)
         if self.execution.enabled:
-            hidden = self._comm.broadcast(
-                hidden.contiguous(), self.execution.backbone_rank
-            )
-        weights, ids = self.gate(hidden)
+            with profile_range("DSV41/EP/HiddenBroadcast"):
+                hidden = self._comm.broadcast(
+                    hidden.contiguous(), self.execution.backbone_rank
+                )
+        with profile_range("DSV41/MoE/Router"):
+            weights, ids = self.gate(hidden)
         if self.execution.enabled:
-            weights = self._comm.broadcast(
-                weights.float().contiguous(), self.execution.backbone_rank
-            )
-            ids = self._comm.broadcast(
-                ids.to(torch.int32).contiguous(), self.execution.backbone_rank
-            )
-            from freetoken.moe.partition import localize_expert_routes
+            with profile_range("DSV41/EP/RouteBroadcast"):
+                weights = self._comm.broadcast(
+                    weights.float().contiguous(), self.execution.backbone_rank
+                )
+                ids = self._comm.broadcast(
+                    ids.to(torch.int32).contiguous(), self.execution.backbone_rank
+                )
+                from freetoken.moe.partition import localize_expert_routes
 
-            weights, ids = localize_expert_routes(weights, ids, self.partition)
-        self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
-        shared = self.shared_experts(hidden)
-        routed = self.experts.routed_forward(
-            hidden,
-            weights.float().contiguous(),
-            ids.to(torch.int32).contiguous(),
-        )
+                weights, ids = localize_expert_routes(weights, ids, self.partition)
+        with profile_range("DSV41/MoE/PrepareRouted"):
+            self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+        with profile_range("DSV41/MoE/SharedExpert"):
+            shared = self.shared_experts(hidden)
+        with profile_range("DSV41/MoE/RoutedExpert"):
+            routed = self.experts.routed_forward(
+                hidden,
+                weights.float().contiguous(),
+                ids.to(torch.int32).contiguous(),
+            )
         return (shared + routed.to(shared.dtype)).view(shape)
 
 
@@ -607,6 +614,7 @@ class Block(nn.Module):
         layout: AttentionLayout,
     ) -> None:
         super().__init__()
+        self.layer_id = int(layer_id)
         self.attn = Attention(args, layer_id, layout)
         self.engram = Engram(args, layer_id) if layer_id in args.engram_layer_ids else None
         self.ffn = MoEState(args)
@@ -654,8 +662,10 @@ class Block(nn.Module):
             return hidden
         if engram_rows is None:
             raise RuntimeError(f"Engram rows missing at layer {self.attn.layer_id}")
-        return self.engram(hidden, engram_rows, token_mask)
+        with profile_range("DSV41/Engram/Inject"):
+            return self.engram(hidden, engram_rows, token_mask)
 
+    @profile("DSV41/Layer_{}/Prefill", layer_id_field="layer_id")
     def prefill_single(
         self,
         hidden: torch.Tensor,
@@ -672,17 +682,20 @@ class Block(nn.Module):
         residual = hidden
         attn_pre, attn_post, attn_comb = self._mixes(hidden, "attn")
         block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
-        block_output = self.attn.prefill_single(
-            block_input, start_pos, table_idx
-        )
+        with profile_range("DSV41/Attention/Prefill"):
+            block_output = self.attn.prefill_single(
+                block_input, start_pos, table_idx
+            )
         hidden = hc_post(block_output, residual, attn_post, attn_comb)
 
         residual = hidden
         ffn_pre, ffn_post, ffn_comb = self._mixes(hidden, "ffn")
         block_input = self.ffn_norm(hc_pre(hidden, attn_pre))
-        block_output = self.ffn(block_input)
+        with profile_range("DSV41/MoE/Authority"):
+            block_output = self.ffn(block_input)
         return hc_post(block_output, residual, ffn_post, ffn_comb), ffn_pre
 
+    @profile("DSV41/Layer_{}/Decode", layer_id_field="layer_id")
     def decode_step(
         self,
         hidden: torch.Tensor,
@@ -701,15 +714,17 @@ class Block(nn.Module):
         residual = hidden
         attn_pre, attn_post, attn_comb = self._mixes(hidden, "attn")
         block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
-        block_output = self.attn.decode_step(
-            block_input, positions, rows, cmp_stage_cap, window_ctx
-        )
+        with profile_range("DSV41/Attention/Decode"):
+            block_output = self.attn.decode_step(
+                block_input, positions, rows, cmp_stage_cap, window_ctx
+            )
         hidden = hc_post(block_output, residual, attn_post, attn_comb)
 
         residual = hidden
         ffn_pre, ffn_post, ffn_comb = self._mixes(hidden, "ffn")
         block_input = self.ffn_norm(hc_pre(hidden, attn_pre))
-        block_output = self.ffn(block_input)
+        with profile_range("DSV41/MoE/Authority"):
+            block_output = self.ffn(block_input)
         return hc_post(block_output, residual, ffn_post, ffn_comb), ffn_pre
 
 
@@ -882,14 +897,17 @@ class DeepseekV41ExpertWorkerModel:
         device = input_ids.device
         hidden_shape = (num_tokens, self.args.dim)
         for layer_id, layer in enumerate(self.layers):
-            if layer_id in self.args.engram_layer_ids:
-                self.engram_coordinator.worker_lookup(
-                    layer_id,
-                    num_tokens=num_tokens,
-                    hashes_per_token=self.args.engram_hashes_per_token,
-                    device=device,
-                )
-            layer.worker_forward(hidden_shape, device)
+            with profile_range(f"DSV41/Layer_{layer_id}/ExpertWorker"):
+                if layer_id in self.args.engram_layer_ids:
+                    with profile_range("DSV41/Engram/Worker"):
+                        self.engram_coordinator.worker_lookup(
+                            layer_id,
+                            num_tokens=num_tokens,
+                            hashes_per_token=self.args.engram_hashes_per_token,
+                            device=device,
+                        )
+                with profile_range("DSV41/MoE/Worker"):
+                    layer.worker_forward(hidden_shape, device)
         return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
 
@@ -1026,6 +1044,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                 )
         return sum(table.nbytes for table in tables.values())
 
+    @profile("DSV41/Engram/Hash")
     def _engram_rows(self, batch, input_ids: torch.Tensor) -> dict[int, torch.Tensor]:
         if self._engram_hasher is None:
             raise RuntimeError("V4.1 Engram hasher was not initialized")
@@ -1056,25 +1075,28 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         if self._execution.is_expert_worker:
-            return self._model.forward(batch.input_ids)
+            with profile_range("DSV41/Batch/ExpertWorker"):
+                return self._model.forward(batch.input_ids)
         self.prepare_for_runtime()
         input_ids = batch.input_ids.long()
         engram_rows = self._engram_rows(batch, input_ids)
         if batch.is_prefill:
             req = batch.reqs[0]
-            return self._model.prefill_single(
-                input_ids.view(1, -1),
-                start_pos=req.cached_len,
-                table_idx=req.table_idx,
+            with profile_range("DSV41/Batch/Prefill"):
+                return self._model.prefill_single(
+                    input_ids.view(1, -1),
+                    start_pos=req.cached_len,
+                    table_idx=req.table_idx,
+                    engram_rows=engram_rows,
+                )
+        positions = batch.positions.long().view(-1)[: batch.padded_size]
+        with profile_range("DSV41/Batch/Decode"):
+            return self._model.decode(
+                input_ids.view(batch.padded_size, 1),
+                positions,
+                int(positions.max().item()),
                 engram_rows=engram_rows,
             )
-        positions = batch.positions.long().view(-1)[: batch.padded_size]
-        return self._model.decode(
-            input_ids.view(batch.padded_size, 1),
-            positions,
-            int(positions.max().item()),
-            engram_rows=engram_rows,
-        )
 
 
 __all__ = [

@@ -13,6 +13,7 @@ from freetoken.moe.partition import localize_expert_routes
 from .args import DeepseekV41Args
 from .execution import get_execution_plan
 from .layers import Linear
+from .profile import profile_range
 
 
 class Gate(nn.Module):
@@ -119,21 +120,23 @@ class MoE(nn.Module):
     def worker_forward(self, hidden_shape: tuple[int, ...], device: torch.device) -> None:
         if not self.execution.is_expert_worker:
             raise RuntimeError("worker_forward is valid only on an expert worker")
-        hidden = self._comm.broadcast(
-            torch.empty(hidden_shape, dtype=torch.bfloat16, device=device),
-            self.execution.backbone_rank,
-        ).view(-1, self.dim)
-        route_shape = (hidden.shape[0], self.experts.top_k)
-        weights = self._comm.broadcast(
-            torch.empty(route_shape, dtype=torch.float32, device=device),
-            self.execution.backbone_rank,
-        )
-        ids = self._comm.broadcast(
-            torch.empty(route_shape, dtype=torch.int32, device=device),
-            self.execution.backbone_rank,
-        )
-        weights, ids = localize_expert_routes(weights, ids, self.partition)
-        self.experts.routed_forward(hidden, weights.contiguous(), ids.contiguous())
+        with profile_range("DSV41/EP/WorkerReceive"):
+            hidden = self._comm.broadcast(
+                torch.empty(hidden_shape, dtype=torch.bfloat16, device=device),
+                self.execution.backbone_rank,
+            ).view(-1, self.dim)
+            route_shape = (hidden.shape[0], self.experts.top_k)
+            weights = self._comm.broadcast(
+                torch.empty(route_shape, dtype=torch.float32, device=device),
+                self.execution.backbone_rank,
+            )
+            ids = self._comm.broadcast(
+                torch.empty(route_shape, dtype=torch.int32, device=device),
+                self.execution.backbone_rank,
+            )
+            weights, ids = localize_expert_routes(weights, ids, self.partition)
+        with profile_range("DSV41/MoE/WorkerRoutedExpert"):
+            self.experts.routed_forward(hidden, weights.contiguous(), ids.contiguous())
 
 
 __all__ = ["Gate", "MoE", "RoutedExperts", "SharedExpert"]

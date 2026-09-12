@@ -10,6 +10,7 @@ from freetoken.distributed import DistributedCommunicator
 
 from .engram import EngramHostTable
 from .execution import DeepseekV41ExecutionPlan, get_execution_plan
+from .profile import profile_range
 
 
 class EngramCoordinator:
@@ -46,9 +47,10 @@ class EngramCoordinator:
             # register an int64 datatype.  V4.1's largest Engram row id is only
             # ~384M, so int32 is an exact wire representation and is also what
             # the EP router already uses for its ids.
-            row_ids = self.communicator.broadcast(
-                row_ids.to(torch.int32).contiguous(), self.execution.backbone_rank
-            )
+            with profile_range("DSV41/Engram/RowIdBroadcast"):
+                row_ids = self.communicator.broadcast(
+                    row_ids.to(torch.int32).contiguous(), self.execution.backbone_rank
+                )
         return self._table(layer_id).lookup(
             row_ids,
             reduce=self.execution.enabled,
@@ -68,7 +70,8 @@ class EngramCoordinator:
         row_ids = torch.empty(
             (num_tokens, hashes_per_token), dtype=torch.int32, device=device
         )
-        row_ids = self.communicator.broadcast(row_ids, self.execution.backbone_rank)
+        with profile_range("DSV41/Engram/RowIdBroadcast"):
+            row_ids = self.communicator.broadcast(row_ids, self.execution.backbone_rank)
         self._table(layer_id).lookup(
             row_ids,
             reduce=True,

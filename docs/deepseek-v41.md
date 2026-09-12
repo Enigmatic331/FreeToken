@@ -65,3 +65,14 @@ top-k rows immediately. One chunk is capped at 512 MiB by default; set
 GPU needs tighter transient-memory headroom. This is an operator-internal
 workspace limit, not a scheduler prefill-chunk setting, so it does not replay
 the expert bank.
+
+## Profiling
+
+Set `FREETOKEN_DSV41_PROFILE=1` before starting the server to emit nested NVTX
+ranges for each layer, prefill/decode attention, Engram hash/UVA
+gather/all-reduce, EP broadcasts, router, shared expert, and routed expert.
+The ranges do not synchronize CUDA; leave the flag unset for ordinary serving.
+Because the model executes in spawned rank processes, launch the server under
+Nsight first and use an interactive `nsys start`/`nsys stop` window after the
+server is ready. A capture-range trigger attached only to the frontend process
+will not see the rank-local ranges.

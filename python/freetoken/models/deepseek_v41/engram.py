@@ -33,6 +33,8 @@ from freetoken.kernel.pinned import device_ptr
 from freetoken.moe.host_banks import HostBank, HostResidency, read_range_into
 from freetoken.utils.progress import byte_bar
 
+from .profile import profile_range
+
 _DEFAULT_BLOCK_SIZE = 32
 _MADV_COLLAPSE = 25  # Linux >= 6.1; Python's mmap module does not expose it.
 _THP_DIR = "/sys/kernel/mm/transparent_hugepage"
@@ -430,9 +432,11 @@ class EngramHostTable:
         if pending is not None and pending[0] is row_ids:
             rows = pending[1]
         else:
-            rows = self._gather(row_ids, self._stage(row_ids.numel(), row_ids.device))
+            with profile_range("DSV41/Engram/GatherUVA"):
+                rows = self._gather(row_ids, self._stage(row_ids.numel(), row_ids.device))
         if reduce and self.plan.world_size > 1:
-            rows = (communicator or DistributedCommunicator()).all_reduce(rows)
+            with profile_range("DSV41/Engram/AllReduce"):
+                rows = (communicator or DistributedCommunicator()).all_reduce(rows)
         rows = rows.view(*row_ids.shape, self.plan.dim)
         if out is None:
             return rows
