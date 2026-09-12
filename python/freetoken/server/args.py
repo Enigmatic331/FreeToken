@@ -104,6 +104,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be in [0, 1]")
         return rate
 
+    def _positive_unit_fraction(value: str) -> float:
+        try:
+            ratio = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
+        if not 0 < ratio <= 1:
+            raise argparse.ArgumentTypeError("must be in (0, 1]")
+        return ratio
+
     def _positive_int(value: str) -> int:
         try:
             n = int(value)
@@ -336,6 +345,16 @@ def parse_args(
         help=(
             "Fraction of total GPU free memory the engine may use for weights + MoE "
             "cache + KV cache combined; the remainder is reserved runtime headroom."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=_positive_unit_fraction,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Size the sliding-window KV tier as this fraction of the full KV token "
+            "capacity. Applies to DSV4 and radix-SWA models."
         ),
     )
 
