@@ -14,7 +14,7 @@ class FakeCommunicator:
         self.broadcasts = []
 
     def broadcast(self, tensor, source):
-        self.broadcasts.append((tuple(tensor.shape), source))
+        self.broadcasts.append((tuple(tensor.shape), tensor.dtype, source))
         return tensor if self.broadcast_value is None else self.broadcast_value
 
 
@@ -63,10 +63,11 @@ def test_engram_authority_and_worker_enter_identical_collective_sequence():
     )
     result = authority.authority_lookup(1, row_ids)
     assert result.shape == (2, 12, 8)
-    assert authority_comm.broadcasts == [((2, 12), 0)]
+    assert authority_comm.broadcasts == [((2, 12), torch.int32, 0)]
+    assert authority_table.lookups[0][0].dtype == torch.int32
     assert authority_table.lookups[0][1]
 
-    worker_comm, worker_table = FakeCommunicator(row_ids), FakeTable()
+    worker_comm, worker_table = FakeCommunicator(row_ids.to(torch.int32)), FakeTable()
     worker = EngramCoordinator(
         {1: worker_table},
         execution=DeepseekV41ExecutionPlan(1, 2, backbone_rank=0),
@@ -75,8 +76,8 @@ def test_engram_authority_and_worker_enter_identical_collective_sequence():
     worker.worker_lookup(
         1, num_tokens=2, hashes_per_token=12, device=torch.device("cpu")
     )
-    assert worker_comm.broadcasts == [((2, 12), 0)]
-    torch.testing.assert_close(worker_table.lookups[0][0], row_ids)
+    assert worker_comm.broadcasts == [((2, 12), torch.int32, 0)]
+    torch.testing.assert_close(worker_table.lookups[0][0], row_ids.to(torch.int32))
     assert worker_table.lookups[0][1]
 
 

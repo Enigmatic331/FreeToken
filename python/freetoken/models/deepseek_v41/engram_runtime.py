@@ -42,8 +42,12 @@ class EngramCoordinator:
         if not self.execution.is_backbone:
             raise RuntimeError("authority_lookup called on a V4.1 expert worker")
         if self.execution.enabled:
+            # The native NCCL bridge used by DistributedCommunicator does not
+            # register an int64 datatype.  V4.1's largest Engram row id is only
+            # ~384M, so int32 is an exact wire representation and is also what
+            # the EP router already uses for its ids.
             row_ids = self.communicator.broadcast(
-                row_ids.contiguous(), self.execution.backbone_rank
+                row_ids.to(torch.int32).contiguous(), self.execution.backbone_rank
             )
         return self._table(layer_id).lookup(
             row_ids,
@@ -62,7 +66,7 @@ class EngramCoordinator:
         if not self.execution.is_expert_worker:
             raise RuntimeError("worker_lookup called on the V4.1 backbone authority")
         row_ids = torch.empty(
-            (num_tokens, hashes_per_token), dtype=torch.int64, device=device
+            (num_tokens, hashes_per_token), dtype=torch.int32, device=device
         )
         row_ids = self.communicator.broadcast(row_ids, self.execution.backbone_rank)
         self._table(layer_id).lookup(
