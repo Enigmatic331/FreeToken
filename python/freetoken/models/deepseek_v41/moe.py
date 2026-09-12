@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -37,19 +39,29 @@ class Gate(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.is_cuda:
             from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
-            from freetoken.kernel.triton.dsv41.router import fused_sqrtsoftplus_topk
 
-            logits = bf16_linear_fp32(x, self.weight)
-            if self.score_func != "sqrtsoftplus":
-                raise ValueError(f"unsupported V4.1 route score {self.score_func}")
-            return fused_sqrtsoftplus_topk(
-                logits,
-                self.bias,
-                topk=self.topk,
-                temperature=self.gate_temp,
-                renormalize=self.norm_topk_prob,
-                route_scale=self.route_scale,
-            )
+            scores = bf16_linear_fp32(x, self.weight)
+            fused = os.getenv(
+                "FREETOKEN_DSV41_FUSED_ROUTER", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if fused:
+                from freetoken.kernel.triton.dsv41.router import (
+                    fused_sqrtsoftplus_topk,
+                )
+
+                if self.score_func != "sqrtsoftplus":
+                    raise ValueError(
+                        f"unsupported V4.1 route score {self.score_func}"
+                    )
+                return fused_sqrtsoftplus_topk(
+                    scores,
+                    self.bias,
+                    topk=self.topk,
+                    temperature=self.gate_temp,
+                    renormalize=self.norm_topk_prob,
+                    route_scale=self.route_scale,
+                )
+            scores = scores / self.gate_temp
         else:
             scores = F.linear(x.float(), self.weight.float()) / self.gate_temp
         if self.score_func == "sqrtsoftplus":

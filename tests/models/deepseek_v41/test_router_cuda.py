@@ -8,11 +8,11 @@ from freetoken.kernel.triton.dsv41.router import fused_sqrtsoftplus_topk
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows", [1, 17])
-def test_fused_sqrtsoftplus_router_matches_torch(rows: int):
+@pytest.mark.parametrize("rows,experts", [(1, 385), (17, 385), (64, 384)])
+def test_fused_sqrtsoftplus_router_matches_torch(rows: int, experts: int):
     generator = torch.Generator().manual_seed(41)
-    logits = torch.randn(rows, 385, generator=generator, dtype=torch.float32)
-    bias = torch.randn(385, generator=generator, dtype=torch.float32) * 0.1
+    logits = torch.randn(rows, experts, generator=generator, dtype=torch.float32)
+    bias = torch.randn(experts, generator=generator, dtype=torch.float32) * 0.1
     scores = F.softplus(logits / 0.7).sqrt()
     expected_ids = (scores + bias).topk(8, dim=-1).indices
     expected_weights = scores.gather(-1, expected_ids)

@@ -13,6 +13,11 @@ default because the PyNCCL collective sequence can deadlock on replay. Set
 `FREETOKEN_DSV41_CUDA_GRAPH=1` only for an attended qualification run; it is not
 a production setting yet.
 
+The fused sqrt-softplus router is likewise retained behind
+`FREETOKEN_DSV41_FUSED_ROUTER=1`. Its standalone CUDA numerical fixture passes,
+but the first full EP2 prefill does not complete, so ordinary serving keeps the
+proven PyTorch selection/normalization path.
+
 ```bash
 ft serve \
   --model /path/to/DeepSeek-V4.1-Flash \
