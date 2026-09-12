@@ -23,7 +23,9 @@ def _spec(name, attn_type, *, mla=False, index_head_dim=0, sliding_window=None):
 
 
 def _model_config(specs, **attrs):
-    mc = SimpleNamespace(has_swa_attention=False, dsv4_args=None, **attrs)
+    defaults = dict(has_swa_attention=False, dsv4_args=None, dsv41_args=None)
+    defaults.update(attrs)
+    mc = SimpleNamespace(**defaults)
     mc.kv_cache_group_specs = lambda: specs
     return mc
 
@@ -31,6 +33,7 @@ def _model_config(specs, **attrs):
 def test_resolve_pool_class_follows_attn_type():
     from freetoken.kvcache.dsa_pool import DSAKVCache, MLAKVCache
     from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
     from freetoken.kvcache.mha_pool import MHAKVCache
 
@@ -47,6 +50,7 @@ def test_resolve_pool_class_follows_attn_type():
 
     # duck-typed configs without the spec walk: dsv4_args marks DSV4, else generic
     assert resolve_pool_class(SimpleNamespace(dsv4_args=object())) is DSV4PagedKVCache
+    assert resolve_pool_class(SimpleNamespace(dsv41_args=object())) is DSV41PagedKVCache
     assert resolve_pool_class(SimpleNamespace()) is MHAKVCache
 
 

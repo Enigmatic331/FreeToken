@@ -303,6 +303,10 @@ class ModelConfig:
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
     dsv4_args: Any | None = None
+    # DeepSeek-V4.1 payload. Kept distinct from dsv4_args because CSA2 ratio-1/2
+    # caches are source-owned, while V4 ratio-4/128 allocates compressed tiers
+    # per layer. Engine policy may recognize both as members of the DSV4 family.
+    dsv41_args: Any | None = None
     # GLM-5.2 (glm_moe_dsa) MLA/DSA payload (GlmMoeDsaArgs): the MLA low-rank dims and the
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.

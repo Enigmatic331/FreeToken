@@ -83,6 +83,10 @@ class EngineConfig:
     # every rank owns a contiguous routed-expert shard.
     qwen4_exp_backbone_rank: int | None = None
     qwen4_exp_expert_shards: tuple[int, ...] | None = None
+    # DeepSeek-V4.1 heterogeneous EP: one rank owns the complete TP1 text
+    # backbone; every rank owns a routed-expert shard and an Engram row shard.
+    dsv41_backbone_rank: int | None = None
+    dsv41_expert_shards: tuple[int, ...] | None = None
     # Optional auxiliary CUDA device for a multimodal encoder. Supplying it opts
     # into loading vision weights; it need not be one of the model TP/EP devices.
     vision_device: str | None = None
@@ -118,11 +122,15 @@ class EngineConfig:
     def model_tp_size(self) -> int:
         """Tensor-parallel width of model tensors and their runtime state.
 
-        Qwen EP keeps a TP1 backbone on the authority while the process group is
-        still world-size EP for collectives. Its KV/GDN geometry must therefore
-        remain unsharded on every rank.
+        Heterogeneous EP keeps a TP1 backbone on the authority while the process
+        group remains world-size EP for collectives. Its cache geometry must
+        therefore remain unsharded on every rank.
         """
-        return 1 if self.qwen4_exp_backbone_rank is not None else self.tp_info.size
+        heterogeneous_ep = (
+            self.qwen4_exp_backbone_rank is not None
+            or self.dsv41_backbone_rank is not None
+        )
+        return 1 if heterogeneous_ep else self.tp_info.size
 
     @property
     def distributed_addr(self) -> str:

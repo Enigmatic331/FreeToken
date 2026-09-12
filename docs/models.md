@@ -6,6 +6,7 @@ for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
 |---|---|
+| DeepSeek-V4.1 | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (experimental text-only baseline; see [launch notes](deepseek-v41.md)) |
 | DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) |
 | GLM-5.2 | [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) |
 | GLM-4.7 | [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4) |
@@ -36,6 +37,8 @@ for them; other checkpoints of the same architectures work too.
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
+- DeepSeek-V4.1 currently serves directly from the original safetensors checkpoint;
+  FTW conversion rejects it until FTW can represent rank-sharded Engram tables.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.

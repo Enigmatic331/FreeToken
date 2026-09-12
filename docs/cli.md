@@ -48,6 +48,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+| `--dsv41-backbone-rank` | off | DeepSeek-V4.1 heterogeneous EP authority rank; V4.1 currently requires `--tp-size 2 --dsv41-backbone-rank 0` |
+| `--dsv41-expert-shards` | even split | Optional comma-separated rank-local routed-expert counts for DeepSeek-V4.1 EP |
 
 ### Choosing a GPU
 

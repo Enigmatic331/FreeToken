@@ -33,6 +33,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
 
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
     if specs_fn is None:
+        if getattr(model_config, "dsv41_args", None) is not None:
+            from .dsv41_paged_pool import DSV41PagedKVCache
+
+            return DSV41PagedKVCache
         if getattr(model_config, "dsv4_args", None) is not None:
             from .dsv4_paged_pool import DSV4PagedKVCache
 
@@ -42,6 +46,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         return MHAKVCache
     types = {spec.attn_type for spec in specs_fn()}
     if AttnType.DSV4 in types:
+        if getattr(model_config, "dsv41_args", None) is not None:
+            from .dsv41_paged_pool import DSV41PagedKVCache
+
+            return DSV41PagedKVCache
         from .dsv4_paged_pool import DSV4PagedKVCache
 
         return DSV4PagedKVCache
@@ -77,8 +85,22 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
+    from .dsv41_paged_pool import DSV41PagedKVCache
 
     model_config = config.model_config
+    if resolve_pool_class(model_config) is DSV41PagedKVCache:
+        from .dsv41_cost_model import _dsv41_pool_sizes
+
+        pool = DSV41PagedKVCache(
+            sizes=_dsv41_pool_sizes(config, num_pages + 1),
+            args=model_config.dsv41_args,
+            device=device,
+            dtype=dtype,
+            P=model_config.dsv41_args.window_size,
+            n_scratch=config.max_running_req + 1,
+        )
+        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        return pool
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state

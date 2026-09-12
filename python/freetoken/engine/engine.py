@@ -197,7 +197,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     validate_attn_backend(config.attention_backend, allow_auto=False)
 
     model_config = config.model_config
-    if config.vision_device is not None:
+    if getattr(config, "vision_device", None) is not None:
         if getattr(model_config, "qwen4_args", None) is None:
             raise ValueError("--vision-device currently supports Qwen3.8/Qwen4Exp checkpoints")
         if not model_config.is_multimodal:
@@ -341,6 +341,17 @@ class Engine:
             config.qwen4_exp_backbone_rank,
             config.qwen4_exp_expert_shards,
         )
+        if getattr(config.model_config, "dsv41_args", None) is not None:
+            from freetoken.models.deepseek_v41.execution import configure_execution
+
+            self._dsv41_plan = configure_execution(
+                config.dsv41_backbone_rank,
+                config.dsv41_expert_shards,
+            )
+            self._execution_plan = self._dsv41_plan
+        else:
+            self._dsv41_plan = None
+            self._execution_plan = self._qwen4_plan
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -362,7 +373,7 @@ class Engine:
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
-        with self._qwen4_plan.model_tp_context():
+        with self._execution_plan.model_tp_context():
             with torch.device("meta"), torch_dtype(config.dtype):
                 self.model = create_model(config.model_config)
             if hasattr(self.model, "set_vision_device") and config.vision_device is not None:
@@ -387,21 +398,19 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
-            if self._qwen4_plan.enabled:
-                # Qwen's expert tensors are interleaved through nearly every checkpoint
-                # shard. Two rank-local readers therefore issue duplicate 122-GB shard
-                # scans and throttle one another badly on a single NVMe. Let workers load
-                # one at a time, backbone last. The first worker still overlaps its scan
-                # with the backbone rank's one-time 47.7-GB PLE load above.
+            if self._execution_plan.enabled:
+                # Heterogeneous EP rank-local readers share one NVMe. Load one at
+                # a time, workers first and the dense authority last, rather than
+                # multiplying read amplification across processes.
                 load_order = tuple(
                     rank
                     for rank in range(config.tp_info.size)
-                    if rank != self._qwen4_plan.backbone_rank
-                ) + (self._qwen4_plan.backbone_rank,)
+                    if rank != self._execution_plan.backbone_rank
+                ) + (self._execution_plan.backbone_rank,)
                 for load_rank in load_order:
                     if config.tp_info.rank == load_rank:
                         logger.info(
-                            "Qwen4Exp EP rank %d loading its expert bank (order=%s)",
+                            "Heterogeneous EP rank %d loading its expert bank (order=%s)",
                             load_rank,
                             load_order,
                         )
@@ -414,14 +423,14 @@ class Engine:
 
         # ======================= KV cache initialization ========================
         new_free_pair = self._sync_get_memory()
-        new_free = new_free_pair[0] if self._qwen4_plan.enabled else new_free_pair[1]
+        new_free = new_free_pair[0] if self._execution_plan.enabled else new_free_pair[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
-        with self._qwen4_plan.model_tp_context():
+        with self._execution_plan.model_tp_context():
             self.ctx.kv_cache = self.kv_cache = create_kv_pool(
                 config, self.num_pages, device=self.device, dtype=self.dtype
             )
@@ -458,12 +467,20 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention & MoE backend initialization ========================
-        if self._qwen4_plan.is_expert_worker:
-            from freetoken.models.qwen4_exp.execution import (
-                Qwen4ExpExpertWorkerAttentionBackend,
-            )
+        if self._execution_plan.is_expert_worker:
+            if self._dsv41_plan is not None:
+                from freetoken.models.deepseek_v41.execution import (
+                    DeepseekV41ExpertWorkerAttentionBackend,
+                )
 
-            self.ctx.attn_backend = self.attn_backend = Qwen4ExpExpertWorkerAttentionBackend()
+                worker_backend = DeepseekV41ExpertWorkerAttentionBackend()
+            else:
+                from freetoken.models.qwen4_exp.execution import (
+                    Qwen4ExpExpertWorkerAttentionBackend,
+                )
+
+                worker_backend = Qwen4ExpExpertWorkerAttentionBackend()
+            self.ctx.attn_backend = self.attn_backend = worker_backend
         else:
             self.ctx.attn_backend = self.attn_backend = create_attention_backend(
                 config.attention_backend, config.model_config
@@ -500,7 +517,10 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=(1 if self._qwen4_plan.is_expert_worker else config.model_config.vocab_size),
+            vocab_size=(
+                1 if self._execution_plan.is_expert_worker
+                else config.model_config.vocab_size
+            ),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -615,8 +635,9 @@ class Engine:
             decode_target = "cpu"
         else:
             decode_target = "gpu"
-        # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
-        # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
+        # Split residency: where pinning is quota-capped, pin only GPU layers' banks.
+        # CPU layers are normally mlocked; V4.1 leaves them pageable because its 94-GiB
+        # pinned Engram shard and GPU expert layers already consume the memlock budget.
         # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
         split_residency = (
             bool(cpu_layer_ids)
@@ -638,10 +659,11 @@ class Engine:
                     f"pin budget; OS-locking all layers instead of pinning"
                 )
         if split_residency and config.moe_prefill_overlap:
-            # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
+            # Unregistered locked/pageable layers cannot feed the async pinned H2D
+            # double buffer; their prefill is a synchronous copy via materialize.
             logger.info_rank0(
                 "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
+                "(unpinned layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         if cache_factory is None:
@@ -656,7 +678,12 @@ class Engine:
                 from freetoken.moe.host_banks import HostResidency
 
                 requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
+                    (
+                        HostResidency.PAGEABLE.value
+                        if getattr(config.model_config, "dsv41_args", None) is not None
+                        else HostResidency.LOCKED.value
+                    )
+                    if i in cpu_layer_ids
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
@@ -807,7 +834,7 @@ class Engine:
         max_free_memory = -int(free_mem_tensor[1].item())
         if (
             max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024
-            and not self._qwen4_plan.enabled
+            and not self._execution_plan.enabled
         ):
             logger.error(
                 f"Memory across TP ranks are imbalanced:"
@@ -999,7 +1026,10 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=free_min,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=(1 if self._qwen4_plan.is_expert_worker else config.model_config.vocab_size),
+            vocab_size=(
+                1 if self._execution_plan.is_expert_worker
+                else config.model_config.vocab_size
+            ),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
@@ -1020,15 +1050,15 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        if self._qwen4_plan.is_expert_worker:
+        if self._execution_plan.is_expert_worker:
             next_tokens_gpu = torch.empty(
                 batch.size, dtype=torch.int32, device=self.device
             )
         else:
             next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        if self._qwen4_plan.enabled:
+        if self._execution_plan.enabled:
             next_tokens_gpu = DistributedCommunicator().broadcast(
-                next_tokens_gpu, self._qwen4_plan.backbone_rank
+                next_tokens_gpu, self._execution_plan.backbone_rank
             )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
@@ -1259,15 +1289,33 @@ def _cpu_moe_executor_viable(model_config) -> bool:
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
-    """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
+    """Bytes this process can still safely cudaHostRegister.
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
-    if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
-        cap = int(float(env) * 2**30)
-    elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
-        return None
-    else:
+    ``FREETOKEN_PIN_BUDGET_GB`` can lower the allocation policy. WSL otherwise
+    uses its conservative 40%-of-RAM cap. Native Linux is additionally bounded
+    by the process's *soft* ``RLIMIT_MEMLOCK`` (the enforced value, unlike the
+    merely attainable hard limit) and remains uncapped only at infinity.
+    ``reserved`` subtracts host tables already pinned outside the expert banks.
+    """
+    is_wsl = hasattr(os, "uname") and "microsoft" in os.uname().release.lower()
+    configured = os.environ.get("FREETOKEN_PIN_BUDGET_GB")
+    if configured:
+        cap = int(float(configured) * 2**30)
+        if not is_wsl:
+            import resource
+
+            soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+            if soft != resource.RLIM_INFINITY:
+                cap = min(cap, int(soft))
+    elif is_wsl:
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
+    else:
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        if soft == resource.RLIM_INFINITY:
+            return None
+        cap = int(soft)
     return max(0, cap - reserved)
 
 
@@ -1295,7 +1343,7 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
     ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
     logger.info_rank0(
         f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; locking {n} head+tail MoE layers for CPU decode "
+        f"{budget / 2**30:.2f} GiB; selecting {n} head+tail MoE layers for CPU decode "
         f"({sorted(ids)})"
     )
     return ids
@@ -1325,11 +1373,19 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    dsv41_args = getattr(model_config, "dsv41_args", None)
     qwen4_args = getattr(model_config, "qwen4_args", None)
     qwen_backbone_rank = getattr(config, "qwen4_exp_backbone_rank", None)
     qwen_expert_shards = getattr(config, "qwen4_exp_expert_shards", None)
+    dsv41_backbone_rank = getattr(config, "dsv41_backbone_rank", None)
+    dsv41_expert_shards = getattr(config, "dsv41_expert_shards", None)
     moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
     tp_info = getattr(config, "tp_info", None)
+
+    if qwen_backbone_rank is not None and dsv41_backbone_rank is not None:
+        raise ValueError(
+            "--qwen4-exp-backbone-rank and --dsv41-backbone-rank are mutually exclusive"
+        )
 
     if qwen_expert_shards is not None and qwen_backbone_rank is None:
         raise ValueError(
@@ -1360,6 +1416,48 @@ def _adjust_config(config: EngineConfig):
             tp_info.rank,
             tp_info.size,
             qwen_backbone_rank,
+            partition.global_offset,
+            partition.global_stop,
+            partition.local_count,
+        )
+
+    if dsv41_expert_shards is not None and dsv41_backbone_rank is None:
+        raise ValueError("--dsv41-expert-shards requires --dsv41-backbone-rank")
+    if dsv41_args is not None and dsv41_backbone_rank is None:
+        raise ValueError(
+            "DeepSeek-V4.1 requires row-sharded Engram/EP execution; pass "
+            "--tensor-parallel-size 2 --dsv41-backbone-rank 0"
+        )
+    if dsv41_backbone_rank is not None:
+        if dsv41_args is None:
+            raise ValueError(
+                "--dsv41-backbone-rank is valid only for DeepSeek-V4.1-Flash"
+            )
+        if tp_info is None or tp_info.size != 2:
+            raise ValueError(
+                "DeepSeek-V4.1 heterogeneous EP currently requires "
+                "--tensor-parallel-size 2"
+            )
+        if not 0 <= dsv41_backbone_rank < tp_info.size:
+            raise ValueError(
+                f"--dsv41-backbone-rank {dsv41_backbone_rank} is outside "
+                f"[0, {tp_info.size})"
+            )
+        if config.moe_backend not in ("auto", "offload"):
+            raise ValueError(
+                "DeepSeek-V4.1 EP currently requires --moe-backend offload"
+            )
+        from freetoken.models.deepseek_v41.execution import get_execution_plan
+
+        partition = get_execution_plan().partition(dsv41_args.n_routed_experts)
+        object.__setattr__(model_config, "num_experts", partition.local_count)
+        if config.distributed_timeout == EngineConfig.distributed_timeout:
+            override("distributed_timeout", 1800.0)
+        logger.info(
+            "DeepSeek-V4.1 EP rank=%d/%d backbone=%s experts=[%d,%d) local=%d",
+            tp_info.rank,
+            tp_info.size,
+            dsv41_backbone_rank,
             partition.global_offset,
             partition.global_stop,
             partition.local_count,
@@ -1436,7 +1534,13 @@ def _adjust_config(config: EngineConfig):
         # table and graph capture all stay bs=1.
         if config.max_running_req != 1:
             override("max_running_req", 1)
-        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
+        if dsv41_args is not None:
+            # Engram's three-token history is still assembled from Req state on
+            # the host. Keep decode eager until it rides the graph input buffer;
+            # capturing now would freeze the dummy request's history.
+            override("cuda_graph_bs", [])
+            override("cuda_graph_max_bs", 0)
+        elif config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 

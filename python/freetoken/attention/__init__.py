@@ -97,6 +97,10 @@ def create_triton_backend(config: ModelConfig):
     BackendInfo(supported_types=frozenset({AttnType.DSV4})),
 )
 def create_dsv4_sparse_backend(config: ModelConfig):
+    if getattr(config, "dsv41_args", None) is not None:
+        from .dsv41_sparse import DSV41SparseAttnBackend
+
+        return DSV41SparseAttnBackend(config)
     from .dsv4_sparse import DSV4SparseAttnBackend
 
     return DSV4SparseAttnBackend(config)

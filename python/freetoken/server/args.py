@@ -281,6 +281,21 @@ def parse_args(
         default=ServerArgs.qwen4_exp_expert_shards,
         help="Optional comma-separated whole-expert counts per Qwen EP rank.",
     )
+    parser.add_argument(
+        "--dsv41-backbone-rank",
+        type=int,
+        default=ServerArgs.dsv41_backbone_rank,
+        help=(
+            "DeepSeek-V4.1 heterogeneous EP: execute the complete TP1 text "
+            "backbone on this rank; every rank serves local experts and Engram rows."
+        ),
+    )
+    parser.add_argument(
+        "--dsv41-expert-shards",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.dsv41_expert_shards,
+        help="Optional comma-separated whole-expert counts per DeepSeek-V4.1 EP rank.",
+    )
 
     parser.add_argument(
         "--vision-device",

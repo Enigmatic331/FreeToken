@@ -37,6 +37,24 @@ def _progress(phase: str, done: int = 0, total: int = 0) -> None:
         print(f"FTCONVERT {phase} {done} {total}", flush=True)
 
 
+def _validate_ftw_conversion_supported(model_config) -> None:
+    """Reject models whose required host tables are not represented by FTW.
+
+    V4.1's two Engram tables are neither ordinary state-dict weights nor MoE
+    expert banks.  They must stay row-sharded over the EP ranks and are read
+    directly from the original safetensors checkpoint.  Silently converting
+    only the dense state and experts would create a plausible-looking FTW that
+    cannot serve the model.
+    """
+
+    if getattr(model_config, "dsv41_args", None) is not None:
+        raise SystemExit(
+            "DeepSeek-V4.1 FTW conversion is not supported yet: FTW has no "
+            "rank-sharded Engram-table entries. Serve the original safetensors "
+            "checkpoint directly."
+        )
+
+
 def _source_fingerprint(model_path: str, model_config, *, device) -> str:
     """Identity of (checkpoint + quant + GPU capability), stored in the FTW index so
     it's clear what an FTW was built from. Cheap (stat only)."""
@@ -190,13 +208,15 @@ def convert_checkpoint(
             f"FTW conversion runs single-process and the format records no TP layout, "
             f"but TP is already set to size={tp.size}"
         )
+    cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
+                       dtype=dtype, moe_backend=moe_backend)
+    mc = cfg.model_config
+    _validate_ftw_conversion_supported(mc)
+
     dev = torch.device(device or "cuda:0")
     torch.cuda.set_device(dev)
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
 
-    cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_backend=moe_backend)
-    mc = cfg.model_config
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
 

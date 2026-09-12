@@ -54,6 +54,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.deepseek_v4",
         "DeepseekV4ForCausalLM",
     ),
+    # DeepSeek-V4.1-Flash text-only ordinary generation. The 384-expert DS-FP4
+    # bank and two FP8 Engram tables are sharded over heterogeneous EP ranks;
+    # MTP/DSpark and vision remain intentionally disabled for this first gate.
+    "DeepseekV41ForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v41",
+        "DeepseekV41ForCausalLM",
+    ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",

@@ -496,7 +496,34 @@ def test_reserved_subtracts_from_the_cap(monkeypatch):
 
 
 def test_uncapped_platform_stays_uncapped(monkeypatch):
+    import resource
+
     monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
+    monkeypatch.setattr(
+        resource,
+        "getrlimit",
+        lambda kind: (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+    )
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_native_finite_memlock_caps_pinning(monkeypatch):
+    import resource
+
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+    if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
+        pytest.skip("WSL uses its WDDM cap")
+    monkeypatch.setattr(resource, "getrlimit", lambda kind: (3 * 2**30, 4 * 2**30))
+    assert _pin_budget_bytes(reserved=2**30) == 2 * 2**30
+
+
+def test_configured_budget_cannot_exceed_native_soft_memlock(monkeypatch):
+    import resource
+
+    if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
+        pytest.skip("WSL uses its WDDM cap")
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "8")
+    monkeypatch.setattr(resource, "getrlimit", lambda kind: (3 * 2**30, 9 * 2**30))
+    assert _pin_budget_bytes(reserved=2**30) == 2 * 2**30
