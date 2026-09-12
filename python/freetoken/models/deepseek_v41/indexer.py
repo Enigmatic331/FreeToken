@@ -2,8 +2,58 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
+
+
+INDEXER_PREFILL_MAX_LOGITS_MB_ENV = "FREETOKEN_DSV41_INDEXER_MAX_LOGITS_MB"
+DEFAULT_INDEXER_PREFILL_MAX_LOGITS_MB = 512
+
+
+def indexer_prefill_max_logits_bytes() -> int:
+    """Configured cap for one fused prefill-logits allocation.
+
+    The score matrix is fp32.  Keeping the limit in bytes makes the row planner
+    explicit and mirrors the limit used by the other V4 indexer runtimes.
+    """
+
+    raw = os.getenv(
+        INDEXER_PREFILL_MAX_LOGITS_MB_ENV,
+        str(DEFAULT_INDEXER_PREFILL_MAX_LOGITS_MB),
+    )
+    try:
+        mib = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{INDEXER_PREFILL_MAX_LOGITS_MB_ENV} must be a positive integer, got {raw!r}"
+        ) from exc
+    if mib <= 0:
+        raise ValueError(
+            f"{INDEXER_PREFILL_MAX_LOGITS_MB_ENV} must be positive, got {mib}"
+        )
+    return mib * 1024 * 1024
+
+
+def indexer_prefill_chunk_rows(
+    query_rows: int, key_rows: int, max_logits_bytes: int
+) -> int:
+    """Largest query-row chunk whose fp32 ``[M, N]`` logits fit the cap.
+
+    A single query row is the indivisible fallback when its key width alone is
+    larger than the cap.  Zero-width keys need no score allocation.
+    """
+
+    if query_rows < 0 or key_rows < 0:
+        raise ValueError("indexer query/key row counts cannot be negative")
+    if max_logits_bytes <= 0:
+        raise ValueError("indexer logits byte cap must be positive")
+    if query_rows == 0:
+        return 0
+    if key_rows == 0:
+        return query_rows
+    return min(query_rows, max(1, max_logits_bytes // (key_rows * 4)))
 
 
 def visible_compressed_lengths(positions: torch.Tensor, ratio: int) -> torch.Tensor:
@@ -112,6 +162,10 @@ class CandidateRuntime:
 
 __all__ = [
     "CandidateRuntime",
+    "DEFAULT_INDEXER_PREFILL_MAX_LOGITS_MB",
+    "INDEXER_PREFILL_MAX_LOGITS_MB_ENV",
+    "indexer_prefill_chunk_rows",
+    "indexer_prefill_max_logits_bytes",
     "select_candidate_blocks",
     "select_index_topk",
     "visible_compressed_lengths",

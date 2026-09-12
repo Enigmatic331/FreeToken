@@ -19,7 +19,13 @@ from .args import DeepseekV41Args
 from .attention_layout import AttentionLayout
 from .compress import Compressor
 from .engram_layer import Engram
-from .indexer import CandidateRuntime, select_index_topk
+from .indexer import (
+    CandidateRuntime,
+    indexer_prefill_chunk_rows,
+    indexer_prefill_max_logits_bytes,
+    select_candidate_blocks,
+    select_index_topk,
+)
 from .layers import Linear, RMSNorm
 from .moe import Gate, MoE, SharedExpert
 
@@ -52,6 +58,7 @@ class Indexer(nn.Module):
         self.index_topk = args.index_topk
         self.candidate_topk_blocks = args.candidate_topk_blocks
         self.candidate_block_size = args.candidate_block_size
+        self.prefill_max_logits_bytes = indexer_prefill_max_logits_bytes()
         self.head_weight_scale = args.index_head_dim**-0.5 * args.index_n_heads**-0.5
         self.wq_b = Linear(args.q_lora_rank, args.index_n_heads * args.index_head_dim)
         self.weights_proj = Linear(args.dim, args.index_n_heads, kind="bf16")
@@ -113,6 +120,16 @@ class Indexer(nn.Module):
             self.index_topk,
             offset=offset,
             candidate_mask=candidate_mask,
+        )
+
+    def select_candidate_mask(
+        self, scores: torch.Tensor, compressed_lengths: torch.Tensor | int
+    ) -> torch.Tensor:
+        return select_candidate_blocks(
+            scores,
+            compressed_lengths,
+            self.candidate_topk_blocks,
+            self.candidate_block_size,
         )
 
 
@@ -264,23 +281,58 @@ class Attention(nn.Module):
             freqs = self.freqs_cis.index_select(0, positions)
             query = self.indexer.queries(q_lora[0], freqs)
             weights = self.indexer.head_weights(x[0])
-            scores = self.indexer.scores(query, keys, weights)
             live = torch.div(positions + 1, ratio, rounding_mode="floor")
-            if self.plan.is_candidate_source:
-                shared_attention.candidates.publish(
-                    scores,
-                    live.unsqueeze(-1),
-                    self.indexer.candidate_topk_blocks,
-                    self.indexer.candidate_block_size,
+            rows_per_chunk = indexer_prefill_chunk_rows(
+                query.shape[0], n_blocks, self.indexer.prefill_max_logits_bytes
+            )
+            selected = torch.empty(
+                query.shape[0],
+                min(self.indexer.index_topk, n_blocks),
+                dtype=torch.int32,
+                device=x.device,
+            )
+            published_candidates = (
+                torch.empty(
+                    query.shape[0], n_blocks, dtype=torch.bool, device=x.device
                 )
-            mask = (
-                shared_attention.candidates.mask
-                if self.plan.uses_candidates
+                if self.plan.is_candidate_source
                 else None
             )
-            selected = self.indexer.select(
-                scores, live, candidate_mask=mask
+            consumed_candidates = (
+                shared_attention.candidates.mask if self.plan.uses_candidates else None
             )
+            if self.plan.uses_candidates:
+                if consumed_candidates is None:
+                    raise RuntimeError("candidate consumer ran before the source layer")
+                expected = (query.shape[0], n_blocks)
+                if consumed_candidates.shape != expected:
+                    raise ValueError(
+                        f"published candidate mask {consumed_candidates.shape} "
+                        f"!= logits {expected}"
+                    )
+
+            for row_start in range(0, query.shape[0], rows_per_chunk):
+                row_end = min(row_start + rows_per_chunk, query.shape[0])
+                rows = slice(row_start, row_end)
+                scores = self.attn.indexer_prefill_logits(
+                    query[rows].unsqueeze(0),
+                    keys.unsqueeze(0),
+                    weights[rows].unsqueeze(0),
+                )[0]
+                if published_candidates is not None:
+                    mask = self.indexer.select_candidate_mask(
+                        scores, live[rows].unsqueeze(-1)
+                    )
+                    published_candidates[rows].copy_(mask)
+                elif consumed_candidates is not None:
+                    mask = consumed_candidates[rows]
+                else:
+                    mask = None
+                selected[rows].copy_(
+                    self.indexer.select(scores, live[rows], candidate_mask=mask)
+                )
+            if published_candidates is not None:
+                shared_attention.candidates.mask = published_candidates
         rows = self.attn.blocks_to_global(selected, ratio, ti=table_idx).unsqueeze(0)
         shared_attention.topk_rows = rows
         return rows

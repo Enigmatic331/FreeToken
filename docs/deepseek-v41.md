@@ -53,3 +53,15 @@ Do not treat successful allocation as a stability result. A full load makes
 hundreds of GiB unreclaimable and should be followed by DIMM-temperature,
 ECC/EDAC, GPU Xid and short deterministic generation checks before performance
 measurements.
+
+## Indexer prefill workspace
+
+V4.1 prefill uses a fused Lightning Indexer kernel that reduces the 32 heads
+before writing scores, avoiding the otherwise enormous `[tokens, heads,
+compressed_tokens]` intermediate. The remaining fp32 `[tokens,
+compressed_tokens]` logits are processed in query-row chunks and reduced to
+top-k rows immediately. One chunk is capped at 512 MiB by default; set
+`FREETOKEN_DSV41_INDEXER_MAX_LOGITS_MB` to a smaller positive integer when the
+GPU needs tighter transient-memory headroom. This is an operator-internal
+workspace limit, not a scheduler prefill-chunk setting, so it does not replay
+the expert bank.

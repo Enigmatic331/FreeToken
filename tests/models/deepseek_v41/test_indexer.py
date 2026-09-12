@@ -4,10 +4,26 @@ import torch
 
 from freetoken.models.deepseek_v41.indexer import (
     CandidateRuntime,
+    indexer_prefill_chunk_rows,
+    indexer_prefill_max_logits_bytes,
     select_candidate_blocks,
     select_index_topk,
     visible_compressed_lengths,
 )
+
+
+def test_prefill_chunk_rows_caps_fp32_logits_and_handles_indivisible_row():
+    mib = 1024 * 1024
+    assert indexer_prefill_chunk_rows(4096, 4096, 512 * mib) == 4096
+    assert indexer_prefill_chunk_rows(32768, 32768, 512 * mib) == 4096
+    assert indexer_prefill_chunk_rows(9, 1_000_000, 1 * mib) == 1
+    assert indexer_prefill_chunk_rows(0, 4096, 1 * mib) == 0
+    assert indexer_prefill_chunk_rows(9, 0, 1 * mib) == 9
+
+
+def test_prefill_logits_cap_environment(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_DSV41_INDEXER_MAX_LOGITS_MB", "64")
+    assert indexer_prefill_max_logits_bytes() == 64 * 1024 * 1024
 
 
 def _candidate_reference(logits, lengths, topk_blocks, block_size):
