@@ -1545,7 +1545,17 @@ def _adjust_config(config: EngineConfig):
         # table and graph capture all stay bs=1.
         if config.max_running_req != 1:
             override("max_running_req", 1)
-        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
+        dsv41_graph_opt_in = os.getenv(
+            "FREETOKEN_DSV41_CUDA_GRAPH", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if dsv41_args is not None and not dsv41_graph_opt_in:
+            # Engram history itself is graph-safe, but the heterogeneous EP graph
+            # currently deadlocks its PyNCCL collective sequence on first replay.
+            # Keep the implementation available for qualification without making
+            # an unproven distributed graph the serving default.
+            override("cuda_graph_bs", [])
+            override("cuda_graph_max_bs", 0)
+        elif config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 

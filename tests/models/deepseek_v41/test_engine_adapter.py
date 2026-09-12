@@ -141,7 +141,7 @@ def test_worker_adapter_has_no_dense_state_but_joins_every_expert_layer():
         distributed_info._TP_INFO = None
 
 
-def test_engine_config_resolves_ep2_single_stream_and_graph_decode():
+def test_engine_config_resolves_ep2_single_stream_and_safe_eager_default():
     from freetoken.engine.engine import _adjust_config
 
     config = _engine_config()
@@ -153,10 +153,27 @@ def test_engine_config_resolves_ep2_single_stream_and_graph_decode():
         assert config.model_tp_size == 1
         assert config.model_config.num_experts == 4
         assert config.max_running_req == 1
-        assert config.cuda_graph_bs == [1]
-        assert config.cuda_graph_max_bs == 1
+        assert config.cuda_graph_bs == []
+        assert config.cuda_graph_max_bs == 0
         assert config.page_size == 128
         assert config.distributed_timeout == 1800.0
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_engine_config_can_opt_in_to_ep2_graph_decode(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setenv("FREETOKEN_DSV41_CUDA_GRAPH", "1")
+    config = _engine_config()
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(config.dsv41_backbone_rank)
+        _adjust_config(config)
+        assert config.cuda_graph_bs == [1]
+        assert config.cuda_graph_max_bs == 1
     finally:
         _reset_execution_for_tests()
         distributed_info._TP_INFO = None

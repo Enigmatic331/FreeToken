@@ -7,8 +7,11 @@ Vision and DSpark/MTP speculative decoding are intentionally outside this gate.
 
 The current topology is exactly two ranks: rank 0 owns the complete TP1 text
 backbone, while both ranks own 192 routed experts per layer and half of every
-Engram table. Decode is eager and single-stream while Engram's three-token
-history is still prepared from live request state.
+Engram table. Decode is single-stream. Engram's three-token history has an
+address-stable graph input, but heterogeneous-EP CUDA graphs remain disabled by
+default because the PyNCCL collective sequence can deadlock on replay. Set
+`FREETOKEN_DSV41_CUDA_GRAPH=1` only for an attended qualification run; it is not
+a production setting yet.
 
 ```bash
 ft serve \
