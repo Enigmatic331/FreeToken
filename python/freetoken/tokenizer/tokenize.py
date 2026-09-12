@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import threading
@@ -204,14 +203,35 @@ def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleTy
     model_path = getattr(tokenizer, "name_or_path", None) or getattr(tokenizer, "_name_or_path", "")
     if not model_path:
         return None
-    encoder_path = os.path.join(str(model_path), "encoding", "encoding_dsv4.py")
-    if not os.path.isfile(encoder_path):
+    encoding_dir = os.path.join(str(model_path), "encoding")
+    # V4.1 publishes ``encoding.py``; V4 publishes ``encoding_dsv4.py``.  Prefer
+    # the architecture-matched V4.1 reference when both are present.
+    encoder_path = next(
+        (
+            path
+            for path in (
+                os.path.join(encoding_dir, "encoding.py"),
+                os.path.join(encoding_dir, "encoding_dsv4.py"),
+            )
+            if os.path.isfile(path)
+        ),
+        None,
+    )
+    if encoder_path is None:
         return None
-    spec = importlib.util.spec_from_file_location("encoding_dsv4", encoder_path)
-    if spec is None or spec.loader is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module_name = (
+        "freetoken_deepseek_v41_encoding"
+        if os.path.basename(encoder_path) == "encoding.py"
+        else "freetoken_deepseek_v4_encoding"
+    )
+    # Execute the checkpoint's self-contained reference directly.  Avoid the
+    # import loader's timestamp-based bytecode cache: model snapshots can replace
+    # one tiny encoder with another inside the same filesystem timestamp tick.
+    module = ModuleType(module_name)
+    module.__file__ = encoder_path
+    with open(encoder_path, encoding="utf-8") as encoder_file:
+        source = encoder_file.read()
+    exec(compile(source, encoder_path, "exec"), module.__dict__)
     if not hasattr(module, "encode_messages"):
         return None
     return module

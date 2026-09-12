@@ -126,6 +126,31 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     assert input_ids.tolist() == [4, 5, 6]
 
 
+def test_tokenize_manager_prefers_dsv41_encoding_when_both_references_exist(tmp_path):
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding.py").write_text(
+        "def encode_messages(messages, thinking_mode, reasoning_effort=None):\n"
+        "    return 'dsv41 prompt'\n"
+    )
+    (encoding_dir / "encoding_dsv4.py").write_text(
+        "def encode_messages(messages, thinking_mode, reasoning_effort=None):\n"
+        "    return 'dsv4 prompt'\n"
+    )
+    tokenizer = FakeDsv4Tokenizer(tmp_path)
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+    )
+
+    [input_ids] = manager.tokenize([msg])
+
+    assert tokenizer.prompt == "dsv41 prompt"
+    assert input_ids.tolist() == [4, 5, 6]
+
+
 def test_dsv4_encoder_gets_tool_call_arguments_as_json_string(tmp_path):
     """Regression: render_messages hands the template dict arguments; the dsv4
     encoder contract is a JSON-object STRING -- a dict trips its fallback that
