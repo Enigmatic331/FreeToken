@@ -83,8 +83,16 @@ def init_logger(
             colored_level = f"{level_color}{record.levelname:<8}{self.RESET}"
             message = record.getMessage()
 
-            # Pretty format: [timestamp] LEVEL message
-            return f"{self.BOLD}{timestamp}{self.RESET} {colored_level} {message}"
+            # Pretty format: [timestamp] LEVEL message.  This formatter builds the
+            # line itself instead of delegating to logging.Formatter.format(), so it
+            # must also render exc_info explicitly; otherwise logger.exception() and
+            # logger.*(..., exc_info=...) silently discard the traceback.
+            rendered = f"{self.BOLD}{timestamp}{self.RESET} {colored_level} {message}"
+            if record.exc_info:
+                rendered += "\n" + self.formatException(record.exc_info)
+            if record.stack_info:
+                rendered += "\n" + self.formatStack(record.stack_info)
+            return rendered
 
     logger = logging.getLogger(name)
     logger.setLevel(_LOG_LEVEL)
