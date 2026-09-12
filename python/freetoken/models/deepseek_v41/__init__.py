@@ -31,6 +31,7 @@ from .weight import (
     ExpertShardPlan,
     TensorInfo,
     inspect_checkpoint,
+    iter_weights,
     validate_resident_checkpoint,
     setup_offload_expert_banks,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "TensorInfo",
     "Transformer",
     "inspect_checkpoint",
+    "iter_weights",
     "validate_resident_checkpoint",
     "setup_offload_expert_banks",
     "Linear",
