@@ -319,6 +319,7 @@ class FakeState:
         self.config = SimpleNamespace(
             reasoning_parser=None, tool_call_parser="llama3",
             served_model_name="test-model", model_path="/test",
+            max_output_tokens=None, max_seq_len=262144,
         )
         self._uid = 0
         self.last_sent = None
@@ -779,7 +780,7 @@ def test_default_output_tokens_honors_server_config():
     assert fake.last_sent.sampling_params.max_tokens == 77
     fake.config.max_output_tokens = None
     client.post("/v1/responses", json={"model": "gpt-x", "input": "hi"})
-    assert fake.last_sent.sampling_params.max_tokens == RP.DEFAULT_MAX_OUTPUT_TOKENS
+    assert fake.last_sent.sampling_params.max_tokens == 262144
 
 
 # --------------------------------------------------------------------------- #

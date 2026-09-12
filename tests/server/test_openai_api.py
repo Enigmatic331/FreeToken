@@ -34,6 +34,8 @@ class FakeState:
             served_model_name="unit-model",
             tool_call_parser=tool_call_parser,
             reasoning_parser=reasoning_parser,
+            max_output_tokens=None,
+            max_seq_len=262144,
         )
         self.replies = replies
         self.sent: TokenizeMsg | None = None
@@ -391,22 +393,37 @@ def test_completion_forwards_length_finish_reason():
     assert response["choices"][0]["finish_reason"] == "length"
 
 
-def test_omitted_max_tokens_defaults_to_hardcoded_32k():
-    from freetoken.server.generation import DEFAULT_MAX_OUTPUT_TOKENS
-
+def test_omitted_max_tokens_uses_context_or_server_default():
     chat_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
     run(handle_chat_completion(
         ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
         request=None, state=chat_state, model_sampling={},
     ))
-    assert chat_state.sent.sampling_params.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+    assert chat_state.sent.sampling_params.max_tokens == 262144
 
     cmpl_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
     run(handle_completion(
         CompletionRequest(model="m", prompt="hi"),
         request=None, state=cmpl_state, model_sampling={},
     ))
-    assert cmpl_state.sent.sampling_params.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+    assert cmpl_state.sent.sampling_params.max_tokens == 262144
+
+    # An explicit server default overrides the remaining-context default.
+    cmpl_state.config.max_output_tokens = 4096
+    run(handle_completion(
+        CompletionRequest(model="m", prompt="hi"),
+        request=None, state=cmpl_state, model_sampling={},
+    ))
+    assert cmpl_state.sent.sampling_params.max_tokens == 4096
+
+    # A checkpoint sampling default has the same precedence as vLLM: client, model,
+    # server/context.
+    cmpl_state.config.max_output_tokens = None
+    run(handle_completion(
+        CompletionRequest(model="m", prompt="hi"),
+        request=None, state=cmpl_state, model_sampling={"max_tokens": 2048},
+    ))
+    assert cmpl_state.sent.sampling_params.max_tokens == 2048
 
     # explicit value wins
     exp_state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
