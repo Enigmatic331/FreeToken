@@ -1051,19 +1051,22 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         reqs = batch.padded_reqs
         if len(reqs) != 1:
             raise RuntimeError("V4.1 ordinary-generation baseline supports one stream")
-        ctx = self._args.engram_max_ngram_size - 1
-        pin = {"pin_memory": torch.cuda.is_available()}
-        history = torch.full(
-            (1, ctx), self._args.engram_pad_id, dtype=torch.int64, **pin
-        )
-        req = reqs[0]
-        prefix = req.input_ids[max(0, req.cached_len - ctx) : req.cached_len].long()
-        if prefix.numel():
-            history[0, -prefix.numel() :] = prefix
-        history = history.to(input_ids.device, non_blocking=True)
-        cu = torch.tensor(
-            [0, input_ids.numel()], dtype=torch.int32, **pin
-        ).to(input_ids.device, non_blocking=True)
+        history = getattr(batch, "engram_history", None)
+        cu = getattr(batch, "engram_cu_seqlens", None)
+        if history is None or cu is None:
+            ctx = self._args.engram_max_ngram_size - 1
+            pin = {"pin_memory": torch.cuda.is_available()}
+            history = torch.full(
+                (1, ctx), self._args.engram_pad_id, dtype=torch.int64, **pin
+            )
+            req = reqs[0]
+            prefix = req.input_ids[max(0, req.cached_len - ctx) : req.cached_len].long()
+            if prefix.numel():
+                history[0, -prefix.numel() :] = prefix
+            history = history.to(input_ids.device, non_blocking=True)
+            cu = torch.tensor(
+                [0, input_ids.numel()], dtype=torch.int32, **pin
+            ).to(input_ids.device, non_blocking=True)
         all_rows = self._engram_hasher.row_ids(
             input_ids.view(-1), batch.positions.view(-1), cu, history
         )
@@ -1090,11 +1093,18 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                     engram_rows=engram_rows,
                 )
         positions = batch.positions.long().view(-1)[: batch.padded_size]
+        if torch.cuda.is_current_stream_capturing():
+            # The capture metadata snapshot is sized to the admitted KV ceiling.
+            # Use that static width so one graph can replay at every live position;
+            # device-side valid counts still mask work beyond the current history.
+            cmp_stage_cap = batch.attn_metadata.stage_width - 1
+        else:
+            cmp_stage_cap = int(positions.max().item())
         with profile_range("DSV41/Batch/Decode"):
             return self._model.decode(
                 input_ids.view(batch.padded_size, 1),
                 positions,
-                int(positions.max().item()),
+                cmp_stage_cap,
                 engram_rows=engram_rows,
             )
 

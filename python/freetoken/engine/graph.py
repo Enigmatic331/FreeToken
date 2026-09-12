@@ -30,10 +30,20 @@ class GraphCaptureBuffer:
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
+    engram_history: torch.Tensor | None
+    engram_cu_seqlens: torch.Tensor | None
+    engram_pad_id: int
 
     @classmethod
     def init(
-        cls, bs: int, vocab_size: int, device: torch.device, *, use_mrope: bool = False
+        cls,
+        bs: int,
+        vocab_size: int,
+        device: torch.device,
+        *,
+        use_mrope: bool = False,
+        engram_history_width: int = 0,
+        engram_pad_id: int = 0,
     ) -> GraphCaptureBuffer:
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -44,6 +54,23 @@ class GraphCaptureBuffer:
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            engram_history=(
+                torch.full(
+                    (bs, engram_history_width),
+                    engram_pad_id,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                if engram_history_width
+                else None
+            ),
+            # Decode contributes exactly one token per request, hence arange.
+            engram_cu_seqlens=(
+                torch.arange(bs + 1, dtype=torch.int32, device=device)
+                if engram_history_width
+                else None
+            ),
+            engram_pad_id=int(engram_pad_id),
         )
 
     def set_batch(self, batch: Batch) -> None:
@@ -62,6 +89,9 @@ class GraphCaptureBuffer:
         batch.fla_metadata = FLAMetadata(
             cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
         )
+        if self.engram_history is not None:
+            batch.engram_history = self.engram_history[_slice]
+            batch.engram_cu_seqlens = self.engram_cu_seqlens[: bs + 1]
 
     def copy_from(self, batch: Batch) -> None:
         _slice = slice(batch.padded_size)
@@ -76,6 +106,17 @@ class GraphCaptureBuffer:
                 self.rope_positions[_slice] = batch.rope_positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
+        if self.engram_history is not None:
+            history = self.engram_history[_slice]
+            history.fill_(self.engram_pad_id)
+            width = history.shape[1]
+            for row, req in enumerate(batch.padded_reqs):
+                prefix = req.input_ids[
+                    max(0, req.cached_len - width) : req.cached_len
+                ].long()
+                take = min(width, prefix.numel())
+                if take:
+                    history[row, -take:].copy_(prefix[-take:], non_blocking=True)
 
 
 def _determine_cuda_graph_bs(
@@ -164,8 +205,16 @@ class GraphRunner:
             and qwen_args.mrope_section
             and qwen_args.mrope_interleaved
         )
+        dsv41_args = getattr(getattr(model, "_config", None), "dsv41_args", None)
         self.buffer = GraphCaptureBuffer.init(
-            self.max_graph_bs, vocab_size, self.device, use_mrope=use_mrope
+            self.max_graph_bs,
+            vocab_size,
+            self.device,
+            use_mrope=use_mrope,
+            engram_history_width=(
+                int(dsv41_args.engram_max_ngram_size) - 1 if dsv41_args else 0
+            ),
+            engram_pad_id=(int(dsv41_args.engram_pad_id) if dsv41_args else 0),
         )
         self._reset_moe_offload_cache()
 

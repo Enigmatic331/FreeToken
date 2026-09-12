@@ -161,6 +161,12 @@ class Batch:
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Optional model-specific graph inputs.  DeepSeek-V4.1 hashes the three raw
+    # tokens immediately before a decode step; GraphRunner points these fields at
+    # address-stable buffers so capture records the hash arithmetic without
+    # freezing the dummy request's host-side history.
+    engram_history: torch.Tensor | None = field(default=None, init=False)
+    engram_cu_seqlens: torch.Tensor | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

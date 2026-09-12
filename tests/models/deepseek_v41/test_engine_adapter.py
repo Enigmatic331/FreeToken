@@ -141,7 +141,7 @@ def test_worker_adapter_has_no_dense_state_but_joins_every_expert_layer():
         distributed_info._TP_INFO = None
 
 
-def test_engine_config_resolves_ep2_single_stream_and_eager_decode():
+def test_engine_config_resolves_ep2_single_stream_and_graph_decode():
     from freetoken.engine.engine import _adjust_config
 
     config = _engine_config()
@@ -153,8 +153,8 @@ def test_engine_config_resolves_ep2_single_stream_and_eager_decode():
         assert config.model_tp_size == 1
         assert config.model_config.num_experts == 4
         assert config.max_running_req == 1
-        assert config.cuda_graph_bs == []
-        assert config.cuda_graph_max_bs == 0
+        assert config.cuda_graph_bs == [1]
+        assert config.cuda_graph_max_bs == 1
         assert config.page_size == 128
         assert config.distributed_timeout == 1800.0
     finally:
@@ -206,6 +206,31 @@ def test_engram_history_comes_from_tokens_immediately_before_the_forward():
     assert history.tolist() == [[6, 7, 8]]
     assert set(rows) == {1, 14}
     assert rows[1].shape == (2, 24)
+
+
+def test_engram_history_uses_address_stable_graph_inputs_when_present():
+    class CapturingHasher:
+        def row_ids(self, input_ids, positions, cu, history):
+            self.args = (input_ids.clone(), positions.clone(), cu.clone(), history.clone())
+            return torch.zeros(input_ids.numel(), 2, 24, dtype=torch.int64)
+
+    model = object.__new__(DeepseekV41ForCausalLM)
+    model._args = SimpleNamespace(
+        engram_max_ngram_size=4,
+        engram_pad_id=2,
+        engram_layer_ids=(1, 14),
+    )
+    model._engram_hasher = CapturingHasher()
+    batch = SimpleNamespace(
+        padded_reqs=[SimpleNamespace(input_ids=torch.tensor([99]), cached_len=1)],
+        positions=torch.tensor([9], dtype=torch.int32),
+        engram_history=torch.tensor([[6, 7, 8]], dtype=torch.int64),
+        engram_cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    model._engram_rows(batch, torch.tensor([10], dtype=torch.int64))
+    _, _, cu, history = model._engram_hasher.args
+    assert cu.tolist() == [0, 1]
+    assert history.tolist() == [[6, 7, 8]]
 
 
 def test_worker_enters_engram_collective_at_the_matching_layer_boundary():
