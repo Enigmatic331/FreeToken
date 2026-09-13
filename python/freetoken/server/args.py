@@ -29,6 +29,10 @@ class ServerArgs(SchedulerConfig):
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
+    # Optional server-level sampling overrides. These apply only when the request omits the
+    # corresponding field, so callers can still choose a different sampling policy per request.
+    default_temperature: float | None = None
+    default_top_p: float | None = None
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -116,6 +120,15 @@ def parse_args(
         if not 0 < ratio <= 1:
             raise argparse.ArgumentTypeError("must be in (0, 1]")
         return ratio
+
+    def _nonnegative_float(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative number") from exc
+        if number < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return number
 
     def _positive_int(value: str) -> int:
         try:
@@ -551,6 +564,26 @@ def parse_args(
             "temperature/top_k/top_p from the checkpoint's generation_config.json "
             "(recommended for reasoning models to avoid greedy repetition loops); "
             "'none' uses framework defaults only."
+        ),
+    )
+
+    parser.add_argument(
+        "--default-temperature",
+        type=_nonnegative_float,
+        default=ServerArgs.default_temperature,
+        help=(
+            "Temperature used when a request omits temperature. Overrides the selected "
+            "--sampling-defaults source; an explicit request value still wins."
+        ),
+    )
+
+    parser.add_argument(
+        "--default-top-p",
+        type=_positive_unit_fraction,
+        default=ServerArgs.default_top_p,
+        help=(
+            "Top-p used when a request omits top_p. Overrides the selected "
+            "--sampling-defaults source; an explicit request value still wins."
         ),
     )
 
