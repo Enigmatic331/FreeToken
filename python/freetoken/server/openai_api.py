@@ -60,7 +60,7 @@ def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int | None = None,
-    default_reasoning_effort: str | None = None,
+    default_reasoning_effort: str | int | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -173,10 +173,18 @@ async def handle_chat_completion(
         return create_error_response("Only n=1 is supported", param="n")
     # Case/whitespace and the "off" disable synonym stay accepted here because
     # effort_toggle_kwargs normalizes and honors them downstream.
-    effort = req.reasoning_effort.strip().lower() if isinstance(req.reasoning_effort, str) else None
-    if effort and effort not in _ACCEPTED_EFFORTS:
+    effort = (
+        req.reasoning_effort.strip().lower()
+        if isinstance(req.reasoning_effort, str)
+        else req.reasoning_effort
+    )
+    invalid_numeric = type(effort) is int and not 1 <= effort <= 100
+    invalid_named = isinstance(effort, str) and bool(effort) and effort not in _ACCEPTED_EFFORTS
+    invalid_type = effort is not None and not isinstance(effort, (str, int))
+    if invalid_numeric or invalid_named or invalid_type:
         return create_error_response(
-            f"reasoning_effort must be one of {', '.join(_ACCEPTED_EFFORTS)}; "
+            f"reasoning_effort must be an integer in [1, 100] or one of "
+            f"{', '.join(_ACCEPTED_EFFORTS)}; "
             f"got {req.reasoning_effort!r}",
             param="reasoning_effort",
         )
@@ -681,7 +689,7 @@ def _is_token_prompt(prompt: Any) -> bool:
     )
 
 
-async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
+async def _effort_fields(state: Any) -> tuple[list[str] | None, str | int | None]:
     """The checkpoint's probed effort vocabulary for /v1/models, or (None, None)
     when there is no frontend tokenizer, it fails to build, or the model has no
     effort knob — a metadata route must never 500 over this."""
@@ -700,7 +708,16 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
         return None, None
     ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
     configured = getattr(state.config, "default_reasoning_effort", None)
-    default = quantize_effort(configured, profile) if configured else profile.default
+    numeric_supported = False
+    if type(configured) is int:
+        accepts_numeric = getattr(manager, "accepts_numeric_effort", None)
+        if callable(accepts_numeric):
+            numeric_supported = await asyncio.to_thread(accepts_numeric, configured)
+    default = (
+        configured
+        if numeric_supported
+        else quantize_effort(configured, profile) if configured else profile.default
+    )
     return ordered, default
 
 

@@ -173,10 +173,33 @@ class TokenizeManager:
     ) -> str:
         return self._render(_EFFORT_PROBE_MESSAGES, tools, kwargs)
 
+    def accepts_numeric_effort(self, value: Any) -> bool:
+        """Whether the checkpoint's native Python encoder accepts a 1-100 budget.
+
+        Generic Jinja templates stay on their probed named vocabularies. DeepSeek
+        V4.1's reference encoder validates integer budgets itself; older DSV4
+        encoders reject the probe and therefore retain their named fallback.
+        """
+        if type(value) is not int or not 1 <= value <= 100 or self._dsv4_encoder is None:
+            return False
+        try:
+            self._probe_render(
+                {"enable_thinking": True, "reasoning_effort": value}, None
+            )
+        except Exception:  # noqa: BLE001 -- a rejection means no numeric dialect
+            return False
+        return True
+
     def _sanitize_effort(self, chat_template_kwargs: dict[str, Any]) -> dict[str, Any]:
         if "reasoning_effort" not in chat_template_kwargs:
             return chat_template_kwargs
         raw = chat_template_kwargs.get("reasoning_effort")
+        # DeepSeek V4.1's official Python encoder accepts literal integer budgets
+        # from 1 through 100. Keep one only when this checkpoint's encoder proves
+        # it can render the value; generic templates and older DSV4 encoders retain
+        # the named-effort quantization/fallback behavior below.
+        if self.accepts_numeric_effort(raw):
+            return chat_template_kwargs
         mapped = quantize_effort(raw, self.effort_profile())
         if mapped == raw:
             return chat_template_kwargs

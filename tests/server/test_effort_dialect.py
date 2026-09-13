@@ -32,7 +32,7 @@ class FakeState:
     def __init__(
         self,
         reasoning_parser: str | None = None,
-        default_reasoning_effort: str | None = None,
+        default_reasoning_effort: str | int | None = None,
     ) -> None:
         self.config = SimpleNamespace(
             model_path="/models/unit-model",
@@ -54,9 +54,15 @@ class FakeState:
 
 
 class FakeManager:
-    def __init__(self, profile: EffortProfile | None = None, render_error: Exception | None = None):
+    def __init__(
+        self,
+        profile: EffortProfile | None = None,
+        render_error: Exception | None = None,
+        numeric_effort: bool = False,
+    ):
         self._profile = profile
         self._render_error = render_error
+        self._numeric_effort = numeric_effort
 
     def effort_profile(self) -> EffortProfile:
         assert self._profile is not None
@@ -66,6 +72,9 @@ class FakeManager:
         if self._render_error is not None:
             raise self._render_error
         return "rendered"
+
+    def accepts_numeric_effort(self, value) -> bool:
+        return self._numeric_effort and type(value) is int and 1 <= value <= 100
 
 
 def chat_request(**overrides) -> ChatCompletionRequest:
@@ -109,6 +118,13 @@ def test_enabled_template_kwargs_keep_the_protocol_effort():
     assert ctk == {"thinking": True, "reasoning_effort": "low"}
 
 
+def test_numeric_effort_is_forwarded_verbatim():
+    assert effort_toggle_kwargs(25, {"thinking": True}) == {
+        "thinking": True,
+        "reasoning_effort": 25,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # handle_chat_completion: superset validation and the pre-stream render check.
 # --------------------------------------------------------------------------- #
@@ -119,6 +135,25 @@ def test_unknown_reasoning_effort_is_a_400():
     assert isinstance(response, JSONResponse)
     assert response.status_code == 400
     assert "reasoning_effort" in json.loads(response.body)["error"]["message"]
+
+
+def test_numeric_reasoning_effort_is_accepted_and_range_checked():
+    state = FakeState(reasoning_parser="deepseekv32")
+    response = run(
+        handle_chat_completion(chat_request(reasoning_effort=25), None, state, {})
+    )
+    assert not isinstance(response, JSONResponse)
+    assert state.sent is not None
+    assert state.sent.chat_template_kwargs == {**ON, "reasoning_effort": 25}
+
+    for effort in (0, 101):
+        response = run(
+            handle_chat_completion(
+                chat_request(reasoning_effort=effort), None, FakeState(), {}
+            )
+        )
+        assert isinstance(response, JSONResponse)
+        assert response.status_code == 400
 
 
 def test_unknown_thinking_type_is_a_400():
@@ -187,6 +222,14 @@ def test_server_default_effort_is_used_and_an_explicit_request_wins():
     )
     assert not isinstance(response, JSONResponse)
     assert state.sent.chat_template_kwargs == OFF
+
+
+def test_numeric_server_default_is_forwarded_verbatim():
+    state = FakeState(reasoning_parser="deepseekv32", default_reasoning_effort=25)
+    response = run(handle_chat_completion(chat_request(), None, state, {}))
+    assert not isinstance(response, JSONResponse)
+    assert state.sent is not None
+    assert state.sent.chat_template_kwargs == {**ON, "reasoning_effort": 25}
 
 
 def test_foreign_thinking_shapes_stay_ignored():
@@ -271,6 +314,30 @@ def test_v1_models_publishes_the_configured_default_effort():
     card = _models_payload(state)
     assert card["supported_reasoning_efforts"] == ["max", "high", "low"]
     assert card["default_reasoning_effort"] == "low"
+
+
+def test_v1_models_publishes_a_numeric_configured_default_effort():
+    state = FakeState(default_reasoning_effort=25)
+    state.frontend_tokenizer = lambda: FakeManager(
+        profile=EffortProfile(
+            supported=frozenset({"max", "high", "low"}),
+            default="high",
+            consumes_effort=True,
+            validates=True,
+        ),
+        numeric_effort=True,
+    )
+    from freetoken.server.openai_api import _effort_fields
+
+    async def inline_to_thread(func, *args):
+        return func(*args)
+
+    from unittest.mock import patch
+
+    with patch("freetoken.server.openai_api.asyncio.to_thread", inline_to_thread):
+        efforts, default = run(_effort_fields(state))
+    assert efforts == ["max", "high", "low"]
+    assert default == 25
 
 
 def test_v1_models_omits_efforts_without_a_frontend_tokenizer():

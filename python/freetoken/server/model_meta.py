@@ -91,7 +91,7 @@ _DISABLE_EFFORTS = ("none", "off")
 
 
 def effort_toggle_kwargs(
-    effort: str | None,
+    effort: str | int | None,
     chat_template_kwargs: dict | None,
     thinking_type: str | None = None,
 ) -> dict:
@@ -100,8 +100,10 @@ def effort_toggle_kwargs(
     effort; a separate protocol effort is retained when those kwargs enable
     thinking but do not provide their own effort. Unrelated extras ride along.
     Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
-    effort enables it, forwarded for templates that grade it (quantized against
-    the checkpoint's probed vocabulary at render time). ``thinking_type`` is the
+    effort enables it, forwarded for templates that grade it. Named values are
+    quantized against the checkpoint's probed vocabulary at render time; native
+    numeric budgets are retained only when the checkpoint accepts them.
+    ``thinking_type`` is the
     DeepSeek-wire ``thinking: {"type": ...}`` toggle; when present it decides
     the on/off direction unless explicit template kwargs already do."""
     ctk = dict(chat_template_kwargs or {})

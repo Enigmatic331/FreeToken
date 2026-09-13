@@ -297,6 +297,34 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     assert tokenizer.prompt == "dsv4 prompt effort=low"
 
 
+def test_tokenize_forwards_numeric_effort_to_the_dsv41_encoder(tmp_path):
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding.py").write_text(
+        """
+SEEN = []
+
+def encode_messages(messages, thinking_mode, reasoning_effort=None):
+    assert type(reasoning_effort) is int and 1 <= reasoning_effort <= 100
+    SEEN.append(reasoning_effort)
+    return f"dsv41 prompt effort={reasoning_effort}"
+""".lstrip()
+    )
+    tokenizer = FakeDsv4Tokenizer(tmp_path)
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+        chat_template_kwargs={"enable_thinking": True, "reasoning_effort": 25},
+    )
+
+    manager.tokenize([msg])
+
+    assert tokenizer.prompt == "dsv41 prompt effort=25"
+    assert manager._dsv4_encoder.SEEN[-1] == 25
+
+
 def test_tokenize_survives_an_unhashable_effort():
     tokenizer = Qwen38LikeTokenizer()
     manager = TokenizeManager(tokenizer)

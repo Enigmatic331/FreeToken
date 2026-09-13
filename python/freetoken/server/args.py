@@ -35,7 +35,7 @@ class ServerArgs(SchedulerConfig):
     # Protocol-level reasoning effort used when a chat request omits one. None preserves the
     # checkpoint/template default. The tokenizer still projects this onto the vocabulary the
     # checkpoint actually accepts, and an explicit request value always wins.
-    default_reasoning_effort: str | None = None
+    default_reasoning_effort: str | int | None = None
     # Report the prefix-cache hit in each response's usage block (OpenAI
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
@@ -125,6 +125,23 @@ def parse_args(
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
+
+    def _reasoning_effort(value: str) -> str | int:
+        normalized = value.strip().lower()
+        try:
+            numeric = int(normalized)
+        except ValueError:
+            numeric = None
+        if numeric is not None:
+            if 1 <= numeric <= 100:
+                return numeric
+            raise argparse.ArgumentTypeError("numeric effort must be in [1, 100]")
+        allowed = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "off")
+        if normalized not in allowed:
+            raise argparse.ArgumentTypeError(
+                f"must be an integer in [1, 100] or one of {', '.join(allowed)}"
+            )
+        return normalized
 
     def _nonnegative_int(value: str) -> int:
         try:
@@ -364,12 +381,12 @@ def parse_args(
 
     parser.add_argument(
         "--default-reasoning-effort",
-        type=lambda value: value.strip().lower(),
-        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max", "off"),
+        type=_reasoning_effort,
         default=ServerArgs.default_reasoning_effort,
         help=(
-            "Reasoning effort for chat requests that omit one. The checkpoint tokenizer "
-            "maps it onto its supported effort vocabulary; unset preserves the checkpoint default."
+            "Reasoning effort for chat requests that omit one: a named level or an integer "
+            "in [1, 100]. The checkpoint tokenizer maps it onto what the checkpoint supports; "
+            "unset preserves the checkpoint default."
         ),
     )
 
