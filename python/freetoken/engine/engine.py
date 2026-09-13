@@ -347,6 +347,7 @@ class Engine:
             self._dsv41_plan = configure_execution(
                 config.dsv41_backbone_rank,
                 config.dsv41_expert_shards,
+                config.dsv41_tp2_ep2,
             )
             self._execution_plan = self._dsv41_plan
         else:
@@ -1390,6 +1391,7 @@ def _adjust_config(config: EngineConfig):
     qwen_expert_shards = getattr(config, "qwen4_exp_expert_shards", None)
     dsv41_backbone_rank = getattr(config, "dsv41_backbone_rank", None)
     dsv41_expert_shards = getattr(config, "dsv41_expert_shards", None)
+    dsv41_tp2_ep2 = getattr(config, "dsv41_tp2_ep2", False)
     moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
     tp_info = getattr(config, "tp_info", None)
 
@@ -1434,6 +1436,8 @@ def _adjust_config(config: EngineConfig):
 
     if dsv41_expert_shards is not None and dsv41_backbone_rank is None:
         raise ValueError("--dsv41-expert-shards requires --dsv41-backbone-rank")
+    if dsv41_tp2_ep2 and dsv41_backbone_rank is None:
+        raise ValueError("--dsv41-tp2-ep2 requires --dsv41-backbone-rank")
     if dsv41_args is not None and dsv41_backbone_rank is None:
         raise ValueError(
             "DeepSeek-V4.1 requires row-sharded Engram/EP execution; pass "
@@ -1465,7 +1469,8 @@ def _adjust_config(config: EngineConfig):
         if config.distributed_timeout == EngineConfig.distributed_timeout:
             override("distributed_timeout", 1800.0)
         logger.info(
-            "DeepSeek-V4.1 EP rank=%d/%d backbone=%s experts=[%d,%d) local=%d",
+            "DeepSeek-V4.1 %s rank=%d/%d backbone=%s experts=[%d,%d) local=%d",
+            "TP2+EP2" if dsv41_tp2_ep2 else "EP",
             tp_info.rank,
             tp_info.size,
             dsv41_backbone_rank,

@@ -6,7 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.kernel.triton.dsv41 import block_fp8_linear_32
+from freetoken.utils import div_even
 
 
 class Linear(nn.Module):
@@ -22,20 +24,39 @@ class Linear(nn.Module):
         out_features: int,
         bias: bool = False,
         kind: str = "fp8",
+        parallel: str | None = None,
     ) -> None:
         super().__init__()
-        self.in_features = int(in_features)
-        self.out_features = int(out_features)
+        if parallel not in (None, "column", "row"):
+            raise ValueError(f"unsupported V4.1 linear parallel mode: {parallel}")
+        tp = get_tp_info() if parallel is not None else None
+        self.parallel = parallel
+        self.tp_size = tp.size if tp is not None else 1
+        self.in_features = (
+            div_even(int(in_features), self.tp_size)
+            if parallel == "row"
+            else int(in_features)
+        )
+        self.out_features = (
+            div_even(int(out_features), self.tp_size)
+            if parallel == "column"
+            else int(out_features)
+        )
+        self._comm = DistributedCommunicator() if parallel == "row" else None
         self.kind = kind
         if kind == "fp8":
             self.weight = nn.Parameter(
-                torch.empty(out_features, in_features, dtype=torch.float8_e4m3fn),
+                torch.empty(
+                    self.out_features,
+                    self.in_features,
+                    dtype=torch.float8_e4m3fn,
+                ),
                 requires_grad=False,
             )
             self.scale = nn.Parameter(
                 torch.empty(
-                    (out_features + 31) // 32,
-                    (in_features + 31) // 32,
+                    (self.out_features + 31) // 32,
+                    (self.in_features + 31) // 32,
                     dtype=torch.float8_e8m0fnu,
                 ),
                 requires_grad=False,
@@ -43,13 +64,16 @@ class Linear(nn.Module):
         elif kind in ("bf16", "fp32"):
             dtype = torch.bfloat16 if kind == "bf16" else torch.float32
             self.weight = nn.Parameter(
-                torch.empty(out_features, in_features, dtype=dtype), requires_grad=False
+                torch.empty(self.out_features, self.in_features, dtype=dtype),
+                requires_grad=False,
             )
             self.register_parameter("scale", None)
         else:
             raise ValueError(f"unsupported V4.1 linear kind: {kind}")
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features), requires_grad=False)
+            self.bias = nn.Parameter(
+                torch.empty(self.out_features), requires_grad=False
+            )
         else:
             self.register_parameter("bias", None)
 
@@ -57,8 +81,13 @@ class Linear(nn.Module):
         if self.kind == "fp8":
             if not x.is_cuda:
                 raise RuntimeError("V4.1 block-FP8 linear requires CUDA")
-            return block_fp8_linear_32(x, self.weight, self.scale, self.bias)
-        return F.linear(x, self.weight.to(x.dtype), self.bias)
+            output = block_fp8_linear_32(x, self.weight, self.scale, self.bias)
+        else:
+            output = F.linear(x, self.weight.to(x.dtype), self.bias)
+        if self.parallel == "row" and self.tp_size > 1:
+            assert self._comm is not None
+            output = self._comm.all_reduce(output)
+        return output
 
 
 class RMSNorm(nn.Module):

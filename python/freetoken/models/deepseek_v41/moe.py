@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator
 from freetoken.layers import ExpertParallelOffloadMoELayer
 from freetoken.moe.partition import localize_expert_routes
@@ -78,9 +79,23 @@ class Gate(nn.Module):
 class SharedExpert(nn.Module):
     def __init__(self, args: DeepseekV41Args) -> None:
         super().__init__()
-        self.w1 = Linear(args.dim, args.moe_inter_dim)
-        self.w2 = Linear(args.moe_inter_dim, args.dim)
-        self.w3 = Linear(args.dim, args.moe_inter_dim)
+        execution = get_execution_plan()
+        parallel = execution.tp2_ep2
+        self.w1 = Linear(
+            args.dim,
+            args.moe_inter_dim,
+            parallel="column" if parallel else None,
+        )
+        self.w2 = Linear(
+            args.moe_inter_dim,
+            args.dim,
+            parallel="row" if parallel else None,
+        )
+        self.w3 = Linear(
+            args.dim,
+            args.moe_inter_dim,
+            parallel="column" if parallel else None,
+        )
         self.limit = args.swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -125,19 +140,28 @@ class MoE(nn.Module):
             raise RuntimeError("V4.1 expert workers must call worker_forward")
         shape = x.shape
         hidden = x.view(-1, self.dim)
-        if self.execution.enabled:
+        if self.execution.uses_authority_transport:
             hidden = self._comm.broadcast(hidden.contiguous(), self.execution.backbone_rank)
         assert self.gate is not None and self.shared_experts is not None
         weights, ids = self.gate(hidden)
-        if self.execution.enabled:
+        if self.execution.uses_authority_transport:
             weights = self._comm.broadcast(weights.float().contiguous(), self.execution.backbone_rank)
             ids = self._comm.broadcast(ids.to(torch.int32).contiguous(), self.execution.backbone_rank)
         weights, ids = localize_expert_routes(weights, ids, self.partition)
-        self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+        if not self.execution.tp2_ep2:
+            self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         shared = self.shared_experts(hidden)
+        if self.execution.tp2_ep2:
+            self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         routed = self.experts.routed_forward(
             hidden, weights.float().contiguous(), ids.to(torch.int32).contiguous()
         )
+        if self.execution.tp2_ep2 and get_global_ctx().batch.is_prefill:
+            if self.execution.rank != self.execution.backbone_rank:
+                routed = torch.empty_like(hidden)
+            routed = self._comm.broadcast(
+                routed.contiguous(), self.execution.backbone_rank
+            )
         return (shared + routed.to(shared.dtype)).view(shape)
 
     def worker_forward(self, hidden_shape: tuple[int, ...], device: torch.device) -> None:

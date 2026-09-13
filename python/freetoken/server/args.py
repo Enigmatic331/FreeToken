@@ -305,6 +305,16 @@ def parse_args(
         default=ServerArgs.dsv41_expert_shards,
         help="Optional comma-separated whole-expert counts per DeepSeek-V4.1 EP rank.",
     )
+    parser.add_argument(
+        "--dsv41-tp2-ep2",
+        action="store_true",
+        default=ServerArgs.dsv41_tp2_ep2,
+        help=(
+            "Experimental DeepSeek-V4.1 topology: shard supported dense "
+            "projections across both ranks while retaining EP2 experts and "
+            "row-sharded Engram tables. Requires TP size 2."
+        ),
+    )
 
     parser.add_argument(
         "--vision-device",

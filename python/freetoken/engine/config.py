@@ -35,7 +35,7 @@ class EngineConfig:
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
-    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
+    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 13.0
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     # Qwen EP block-FP8 only: prefills at or below this token count load just the
@@ -87,6 +87,9 @@ class EngineConfig:
     # backbone; every rank owns a routed-expert shard and an Engram row shard.
     dsv41_backbone_rank: int | None = None
     dsv41_expert_shards: tuple[int, ...] | None = None
+    # Experimental hybrid topology: both ranks execute a TP2 dense backbone
+    # while retaining EP2 routed experts and row-sharded Engram tables.
+    dsv41_tp2_ep2: bool = False
     # Optional auxiliary CUDA device for a multimodal encoder. Supplying it opts
     # into loading vision weights; it need not be one of the model TP/EP devices.
     vision_device: str | None = None
@@ -128,7 +131,10 @@ class EngineConfig:
         """
         heterogeneous_ep = (
             self.qwen4_exp_backbone_rank is not None
-            or self.dsv41_backbone_rank is not None
+            or (
+                self.dsv41_backbone_rank is not None
+                and not self.dsv41_tp2_ep2
+            )
         )
         return 1 if heterogeneous_ep else self.tp_info.size
 

@@ -8,7 +8,14 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+import freetoken.distributed.info as distributed_info
+from freetoken.distributed import DistributedInfo
+from freetoken.models.deepseek_v41.execution import (
+    _reset_execution_for_tests,
+    configure_execution,
+)
 from freetoken.models.deepseek_v41.weight import (
+    _tp2_ep2_resident_slice,
     expected_resident_specs,
     inspect_checkpoint,
     iter_weights,
@@ -19,6 +26,30 @@ from freetoken.models.deepseek_v41.weight import (
 
 
 MODEL_PATH = "/home/enigmatic331/models/DeepSeek-V4.1-Flash"
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tp2_ep2_resident_slices_match_projection_partition(rank):
+    _reset_execution_for_tests()
+    distributed_info._TP_INFO = DistributedInfo(rank, 2)
+    configure_execution(0, tp2_ep2=True)
+    try:
+        matrix = torch.arange(32, dtype=torch.float32).view(4, 8)
+        column = _tp2_ep2_resident_slice(
+            "layers.0.attn.wq_b.weight", matrix
+        )
+        row = _tp2_ep2_resident_slice(
+            "layers.0.attn.wo_b.weight", matrix
+        )
+        groups = _tp2_ep2_resident_slice("layers.0.attn.wo_a", matrix)
+        assert column.shape == groups.shape == (2, 8)
+        assert row.shape == (4, 4)
+        torch.testing.assert_close(column, matrix.chunk(2, 0)[rank])
+        torch.testing.assert_close(row, matrix.chunk(2, 1)[rank])
+        torch.testing.assert_close(groups, matrix.chunk(2, 0)[rank])
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
 
 
 def test_ftw_conversion_rejects_missing_engram_representation():

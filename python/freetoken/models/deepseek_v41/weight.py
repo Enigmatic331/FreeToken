@@ -333,6 +333,43 @@ def _dequant_fp8_block32(weight: torch.Tensor, scale: torch.Tensor) -> torch.Ten
     return (weight.float() * values).bfloat16()
 
 
+def _tp2_ep2_resident_slice(name: str, value: torch.Tensor) -> torch.Tensor:
+    """Slice the dense tensors sharded by the experimental TP2+EP2 model.
+
+    Everything not listed here is deliberately replicated.  Attention assigns
+    whole output groups to each rank; shared experts use conventional
+    column/row parallel projections.  Routed experts remain whole-expert EP2.
+    """
+
+    from .execution import get_execution_plan
+
+    execution = get_execution_plan()
+    if not execution.tp2_ep2:
+        return value
+    rank, world = execution.rank, execution.world_size
+    column = (
+        ".attn.wq_b.weight",
+        ".attn.wq_b.scale",
+        ".ffn.shared_experts.w1.weight",
+        ".ffn.shared_experts.w1.scale",
+        ".ffn.shared_experts.w3.weight",
+        ".ffn.shared_experts.w3.scale",
+    )
+    row = (
+        ".attn.wo_b.weight",
+        ".attn.wo_b.scale",
+        ".ffn.shared_experts.w2.weight",
+        ".ffn.shared_experts.w2.scale",
+    )
+    if name.endswith(column):
+        return value.chunk(world, dim=0)[rank].contiguous()
+    if name.endswith(row):
+        return value.chunk(world, dim=1)[rank].contiguous()
+    if name.endswith((".attn.wo_a", ".attn.attn_sink")):
+        return value.chunk(world, dim=0)[rank].contiguous()
+    return value
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -373,11 +410,13 @@ def iter_weights(
                 if name.endswith(".attn.wo_a.weight"):
                     prefix = name.removesuffix(".weight")
                     scale = handle.get_tensor(f"{prefix}.scale")
-                    yield prefix, _dequant_fp8_block32(value, scale)
+                    yield prefix, _tp2_ep2_resident_slice(
+                        prefix, _dequant_fp8_block32(value, scale)
+                    )
                 elif name == "head.weight":
                     yield "head", value
                 else:
-                    yield name, value
+                    yield name, _tp2_ep2_resident_slice(name, value)
         drop_page_cache(path)
 
 

@@ -1,4 +1,4 @@
-"""Execution roles for one V4.1 backbone authority and rank-local expert shards."""
+"""V4.1 authority-EP and opt-in TP2+EP2 execution roles."""
 
 from __future__ import annotations
 
@@ -16,12 +16,15 @@ class DeepseekV41ExecutionPlan:
     world_size: int
     backbone_rank: int | None = None
     expert_shards: tuple[int, ...] | None = None
+    tp2_ep2: bool = False
 
     def __post_init__(self) -> None:
         if self.world_size <= 0 or not 0 <= self.rank < self.world_size:
             raise ValueError(f"invalid execution rank {self.rank}/{self.world_size}")
         if self.backbone_rank is not None and not 0 <= self.backbone_rank < self.world_size:
             raise ValueError(f"invalid backbone rank {self.backbone_rank}")
+        if self.tp2_ep2 and (self.backbone_rank is None or self.world_size != 2):
+            raise ValueError("V4.1 TP2+EP2 requires a backbone root and world size 2")
         if self.expert_shards is not None:
             shards = tuple(self.expert_shards)
             object.__setattr__(self, "expert_shards", shards)
@@ -34,11 +37,15 @@ class DeepseekV41ExecutionPlan:
 
     @property
     def is_backbone(self) -> bool:
-        return not self.enabled or self.rank == self.backbone_rank
+        return not self.enabled or self.tp2_ep2 or self.rank == self.backbone_rank
 
     @property
     def is_expert_worker(self) -> bool:
-        return self.enabled and self.rank != self.backbone_rank
+        return self.enabled and not self.tp2_ep2 and self.rank != self.backbone_rank
+
+    @property
+    def uses_authority_transport(self) -> bool:
+        return self.enabled and not self.tp2_ep2
 
     @property
     def participates_in_engram(self) -> bool:
@@ -55,6 +62,11 @@ class DeepseekV41ExecutionPlan:
 
     def model_tp_context(self):
         # Dense weights are whole on the authority; workers build only local expert shells.
+        return override_tp_info(0, 1) if self.uses_authority_transport else nullcontext()
+
+    def expert_tp_context(self):
+        # EP ranks own complete experts. Their intermediate dimensions are not
+        # tensor-sharded even when the dense backbone is TP2.
         return override_tp_info(0, 1) if self.enabled else nullcontext()
 
 
@@ -83,10 +95,13 @@ _PLAN: DeepseekV41ExecutionPlan | None = None
 def configure_execution(
     backbone_rank: int | None,
     expert_shards: tuple[int, ...] | None = None,
+    tp2_ep2: bool = False,
 ) -> DeepseekV41ExecutionPlan:
     global _PLAN
     info = get_tp_info()
-    plan = DeepseekV41ExecutionPlan(info.rank, info.size, backbone_rank, expert_shards)
+    plan = DeepseekV41ExecutionPlan(
+        info.rank, info.size, backbone_rank, expert_shards, tp2_ep2
+    )
     if _PLAN is not None and _PLAN != plan:
         raise RuntimeError(f"V4.1 execution already configured as {_PLAN}, got {plan}")
     _PLAN = plan

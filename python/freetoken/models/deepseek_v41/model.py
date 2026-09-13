@@ -1,8 +1,9 @@
 """DeepSeek-V4.1 ordinary-generation text runtime.
 
 MTP/DSpark and vision are intentionally outside this first serving path.  The
-registered adapter below runs one dense TP1 authority plus rank-local routed
-experts and row-sharded, resident Engram tables on every EP rank.
+registered adapter defaults to one dense TP1 authority plus rank-local routed
+experts and row-sharded, resident Engram tables on every EP rank.  The explicit
+TP2+EP2 research mode executes a sharded dense backbone on both ranks.
 """
 
 from __future__ import annotations
@@ -142,33 +143,45 @@ class Attention(nn.Module):
         layout: AttentionLayout,
     ) -> None:
         super().__init__()
+        from .execution import get_execution_plan
+
+        execution = get_execution_plan()
+        tp_size = execution.world_size if execution.tp2_ep2 else 1
         self.args = args
         self.layer_id = layer_id
         self.plan = layout[layer_id]
-        self.n_heads = args.n_heads
+        self.n_heads = args.n_heads // tp_size
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.n_groups = args.o_groups
+        self.n_groups = args.o_groups // tp_size
         self.o_lora_rank = args.o_lora_rank
         self.window_size = args.window_size
         self.softmax_scale = args.head_dim**-0.5
         self.attn_sink = nn.Parameter(
-            torch.empty(args.n_heads, dtype=torch.float32), requires_grad=False
+            torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False
         )
         self.wq_a = Linear(args.dim, args.q_lora_rank)
         self.q_norm = RMSNorm(args.q_lora_rank, args.norm_eps)
-        self.wq_b = Linear(args.q_lora_rank, args.n_heads * args.head_dim)
+        self.wq_b = Linear(
+            args.q_lora_rank,
+            args.n_heads * args.head_dim,
+            parallel="column" if execution.tp2_ep2 else None,
+        )
         self.wkv = Linear(args.dim, args.head_dim)
         self.kv_norm = RMSNorm(args.head_dim, args.norm_eps)
         self.wo_a = nn.Parameter(
             torch.empty(
-                args.o_groups * args.o_lora_rank,
+                self.n_groups * args.o_lora_rank,
                 args.n_heads * args.head_dim // args.o_groups,
                 dtype=torch.bfloat16,
             ),
             requires_grad=False,
         )
-        self.wo_b = Linear(args.o_groups * args.o_lora_rank, args.dim)
+        self.wo_b = Linear(
+            args.o_groups * args.o_lora_rank,
+            args.dim,
+            parallel="row" if execution.tp2_ep2 else None,
+        )
         self.compressor = Compressor(args, layer_id) if self.plan.owns_kv else None
         self.indexer = Indexer(args, layer_id) if self.plan.owns_index else None
         if self.plan.compress_ratio:
@@ -566,7 +579,7 @@ class MoEState(nn.Module):
         self.execution = get_execution_plan()
         self.partition = self.execution.partition(args.n_routed_experts)
         self._comm = DistributedCommunicator()
-        with self.execution.model_tp_context():
+        with self.execution.expert_tp_context():
             self.experts = RoutedExperts(layer_id, args, self.partition.local_count)
         self.experts.packed_prefill_root = self.execution.backbone_rank
 
@@ -575,14 +588,14 @@ class MoEState(nn.Module):
             raise RuntimeError("V4.1 routed experts have not been attached")
         shape = x.shape
         hidden = x.view(-1, self.dim)
-        if self.execution.enabled:
+        if self.execution.uses_authority_transport:
             with profile_range("DSV41/EP/HiddenBroadcast"):
                 hidden = self._comm.broadcast(
                     hidden.contiguous(), self.execution.backbone_rank
                 )
         with profile_range("DSV41/MoE/Router"):
             weights, ids = self.gate(hidden)
-        if self.execution.enabled:
+        if self.execution.uses_authority_transport:
             with profile_range("DSV41/EP/RouteBroadcast"):
                 weights = self._comm.broadcast(
                     weights.float().contiguous(), self.execution.backbone_rank
@@ -590,18 +603,33 @@ class MoEState(nn.Module):
                 ids = self._comm.broadcast(
                     ids.to(torch.int32).contiguous(), self.execution.backbone_rank
                 )
-                from freetoken.moe.partition import localize_expert_routes
+        if self.execution.enabled:
+            from freetoken.moe.partition import localize_expert_routes
 
-                weights, ids = localize_expert_routes(weights, ids, self.partition)
-        with profile_range("DSV41/MoE/PrepareRouted"):
-            self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+            weights, ids = localize_expert_routes(weights, ids, self.partition)
+        if not self.execution.tp2_ep2:
+            with profile_range("DSV41/MoE/PrepareRouted"):
+                self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         with profile_range("DSV41/MoE/SharedExpert"):
             shared = self.shared_experts(hidden)
+        if self.execution.tp2_ep2:
+            # Both TP ranks must finish shared-expert all-reduce before root
+            # posts a P2P receive whose matching worker send occurs below.
+            with profile_range("DSV41/MoE/PrepareRouted"):
+                self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         with profile_range("DSV41/MoE/RoutedExpert"):
             routed = self.experts.routed_forward(
                 hidden,
                 weights.float().contiguous(),
                 ids.to(torch.int32).contiguous(),
+            )
+        if self.execution.tp2_ep2 and get_global_ctx().batch.is_prefill:
+            # Packed EP prefill combines exact per-route outputs only on the
+            # root.  The second dense rank needs that combined residual too.
+            if self.execution.rank != self.execution.backbone_rank:
+                routed = torch.empty_like(hidden)
+            routed = self._comm.broadcast(
+                routed.contiguous(), self.execution.backbone_rank
             )
         return (shared + routed.to(shared.dtype)).view(shape)
 
