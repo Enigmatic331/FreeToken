@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -43,6 +43,7 @@ if _EP_PACKED_WIRE_DTYPE not in {"bf16", "fp8"}:
     )
 _EP_PACKED_RECV_STREAM: torch.cuda.Stream | None = None
 _EP_PACKED_SEND_STREAM: torch.cuda.Stream | None = None
+_DECODE_REFILL_STREAMS: dict[int, torch.cuda.Stream] = {}
 _FP8_E4M3_MAX = 448.0
 
 
@@ -58,6 +59,25 @@ def _ep_packed_send_stream(device: torch.device) -> torch.cuda.Stream:
     if _EP_PACKED_SEND_STREAM is None:
         _EP_PACKED_SEND_STREAM = torch.cuda.Stream(device=device)
     return _EP_PACKED_SEND_STREAM
+
+
+def _decode_refill_stream(device: torch.device) -> torch.cuda.Stream:
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    stream = _DECODE_REFILL_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _DECODE_REFILL_STREAMS[index] = stream
+    return stream
+
+
+class RoutedDecodePlan(NamedTuple):
+    """Cache-backed route ids whose refill is queued on a side stream."""
+
+    cache: OffloadMoeCache
+    topk_ids: torch.Tensor
+    refill_stream: torch.cuda.Stream
 
 
 def _quantize_ep_routes(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -386,6 +406,54 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def begin_routed_decode(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> RoutedDecodePlan | None:
+        """Queue a pure-GPU decode refill before independent dense work.
+
+        The caller must eventually pass the returned plan to
+        :meth:`finish_routed_decode` on the original compute stream. CPU and hybrid
+        layers deliberately return ``None`` because their host-node choreography is
+        not safe to split around unrelated GPU work.
+        """
+        del topk_weights
+        cache = self.offload_cache
+        assert cache is not None
+        if cache.is_cpu_layer(self.layer_id) or cache.decode_target == "hybrid":
+            return None
+        if not topk_ids.is_cuda:
+            return None
+
+        compute_stream = torch.cuda.current_stream(topk_ids.device)
+        refill_stream = _decode_refill_stream(topk_ids.device)
+        refill_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(refill_stream):
+            cache.ensure_experts(self.layer_id, topk_ids)
+            cache.copy_missing()
+        return RoutedDecodePlan(cache, topk_ids, refill_stream)
+
+    def finish_routed_decode(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        plan: RoutedDecodePlan,
+    ) -> torch.Tensor:
+        """Join a queued refill and run the unchanged routed-expert GEMM."""
+        torch.cuda.current_stream(hidden_states.device).wait_stream(plan.refill_stream)
+        routed = self._expert_gemm(
+            plan.cache,
+            hidden_states,
+            topk_weights,
+            plan.topk_ids,
+            views=plan.cache.bank_views(),
+            n=None,
+            alphas=plan.cache.alphas_for_slots(self.layer_id),
+            is_prefill=False,
+        )
+        return self._maybe_all_reduce(routed)
 
     def _decode_hybrid(
         self,
@@ -977,6 +1045,16 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     ) -> torch.Tensor:
         return super()._decode_routed(
             hidden_states,
+            topk_weights,
+            self._cache_safe_route_ids(topk_weights, topk_ids),
+        )
+
+    def begin_routed_decode(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> RoutedDecodePlan | None:
+        return super().begin_routed_decode(
             topk_weights,
             self._cache_safe_route_ids(topk_weights, topk_ids),
         )

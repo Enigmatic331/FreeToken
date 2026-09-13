@@ -8,6 +8,8 @@ TP2+EP2 research mode executes a sharded dense backbone on both ranks.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -575,6 +577,9 @@ class MoEState(nn.Module):
         self.execution = None
         self.partition = None
         self._comm = None
+        self.decode_refill_overlap = os.getenv(
+            "FREETOKEN_DSV41_DECODE_REFILL_OVERLAP", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def attach_routed_experts(self, layer_id: int, args: DeepseekV41Args) -> None:
         from freetoken.distributed import DistributedCommunicator
@@ -625,6 +630,19 @@ class MoEState(nn.Module):
         if not self.execution.tp2_ep2:
             with profile_range("DSV41/MoE/PrepareRouted"):
                 self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+        routed_weights = weights.float().contiguous()
+        routed_ids = ids.to(torch.int32).contiguous()
+        refill_plan = None
+        if (
+            self.decode_refill_overlap
+            and self.execution.uses_authority_transport
+            and self.execution.rank == self.execution.backbone_rank
+            and not get_global_ctx().batch.is_prefill
+        ):
+            with profile_range("DSV41/MoE/DecodeRefillFork"):
+                refill_plan = self.experts.begin_routed_decode(
+                    routed_weights, routed_ids
+                )
         if not self.execution.attention_tp2_ep2 or (
             self.execution.rank == self.execution.backbone_rank
         ):
@@ -639,11 +657,14 @@ class MoEState(nn.Module):
             with profile_range("DSV41/MoE/PrepareRouted"):
                 self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         with profile_range("DSV41/MoE/RoutedExpert"):
-            routed = self.experts.routed_forward(
-                hidden,
-                weights.float().contiguous(),
-                ids.to(torch.int32).contiguous(),
-            )
+            if refill_plan is None:
+                routed = self.experts.routed_forward(
+                    hidden, routed_weights, routed_ids
+                )
+            else:
+                routed = self.experts.finish_routed_decode(
+                    hidden, routed_weights, refill_plan
+                )
         if self.execution.tp2_ep2 and get_global_ctx().batch.is_prefill:
             # Packed EP prefill combines exact per-route outputs only on the
             # root.  The second dense rank needs that combined residual too.

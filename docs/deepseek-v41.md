@@ -7,13 +7,21 @@ Vision and DSpark/MTP speculative decoding are intentionally outside this gate.
 
 The current topology is exactly two ranks: rank 0 owns the complete TP1 text
 backbone, while both ranks own 192 routed experts per layer and half of every
-Engram table. Decode is single-stream. Engram's three-token history has an
-address-stable graph input. Position-bucketed heterogeneous-EP CUDA graphs have
-passed exact real-checkpoint replay and long-generation gates on a qualified dual
-RTX 5090 setup. They remain an explicit opt-in because P2P, driver, allocator, and
-topology changes require requalification: set `FREETOKEN_DSV41_CUDA_GRAPH=1` and
-use `--cuda-graph-max-bs 1` only after passing the correctness gates on the target
+Engram table. Engram's three-token history has an address-stable graph input.
+Position-bucketed heterogeneous-EP CUDA graphs have passed exact real-checkpoint
+replay and long-generation gates on a qualified dual RTX 5090 setup. They remain
+an explicit opt-in because P2P, driver, allocator, and topology changes require
+requalification: set `FREETOKEN_DSV41_CUDA_GRAPH=1` and use
+`--cuda-graph-max-bs 1` only after passing the correctness gates on the target
 machine.
+
+Authority EP can also overlap its decode-time expert-cache refill with the
+independent shared-expert projection by setting
+`FREETOKEN_DSV41_DECODE_REFILL_OVERLAP=1`. The routed-expert GEMM joins the refill
+stream before consuming cache slots, and the existing collective remains after
+the GEMM. The split is disabled for prefill, CPU/hybrid decode, expert workers,
+and dense-parallel modes. It is CUDA-graph safe but remains opt-in pending
+qualification on each target topology.
 
 The fused sqrt-softplus router is likewise retained behind
 `FREETOKEN_DSV41_FUSED_ROUTER=1`. Its standalone CUDA numerical fixture passes,
@@ -38,6 +46,7 @@ slower than authority EP; keep it as a profiling/experimentation switch.
 
 ```bash
 export FREETOKEN_DSV41_CUDA_GRAPH=1
+export FREETOKEN_DSV41_DECODE_REFILL_OVERLAP=1
 
 ft serve \
   --model /path/to/DeepSeek-V4.1-Flash \
@@ -63,6 +72,7 @@ geometry:
 
 ```bash
 export FREETOKEN_DSV41_CUDA_GRAPH=1
+export FREETOKEN_DSV41_DECODE_REFILL_OVERLAP=1
 
 ft serve \
   --model /path/to/DeepSeek-V4.1-Flash \

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 from freetoken.models.deepseek_v41.execution import DeepseekV41ExecutionPlan
@@ -68,3 +69,85 @@ def test_router_bias_selects_but_unbiased_score_scales_routes():
     torch.testing.assert_close(got_ids, want_ids)
     torch.testing.assert_close(got_weights, want_weights)
     assert got_ids.tolist() == [[1, 3]]
+
+
+def test_authority_decode_refill_is_forked_around_shared_expert(monkeypatch):
+    import freetoken.models.deepseek_v41.model as model_module
+    from freetoken.models.deepseek_v41.model import MoEState
+
+    calls = []
+
+    class FakeGate(nn.Module):
+        def forward(self, hidden):
+            calls.append("router")
+            rows = hidden.shape[0]
+            return (
+                torch.ones((rows, 2), dtype=torch.float32),
+                torch.tensor([[0, 1]], dtype=torch.int32).expand(rows, -1).clone(),
+            )
+
+    class FakeShared(nn.Module):
+        def forward(self, hidden):
+            calls.append("shared")
+            return hidden + 1
+
+    class FakeExperts(nn.Module):
+        top_k = 2
+
+        def prepare_packed_prefill_receive(self, weights, route_dtype):
+            calls.append("prepare")
+
+        def begin_routed_decode(self, weights, ids):
+            calls.append("refill-fork")
+            return object()
+
+        def finish_routed_decode(self, hidden, weights, plan):
+            calls.append("refill-join+routed")
+            return torch.zeros_like(hidden)
+
+        def routed_forward(self, hidden, weights, ids):
+            raise AssertionError("split decode must not run the serial route path")
+
+    state = MoEState.__new__(MoEState)
+    nn.Module.__init__(state)
+    state.dim = 4
+    state.gate = FakeGate()
+    state.shared_experts = FakeShared()
+    state.experts = FakeExperts()
+    state.execution = type(
+        "Plan",
+        (),
+        {
+            "uses_authority_transport": True,
+            "backbone_rank": 0,
+            "rank": 0,
+            "enabled": True,
+            "tp2_ep2": False,
+            "attention_tp2_ep2": False,
+        },
+    )()
+    state.partition = object()
+    state._comm = type("Comm", (), {"broadcast": staticmethod(lambda value, root: value)})()
+    state.decode_refill_overlap = True
+
+    monkeypatch.setattr(
+        "freetoken.moe.partition.localize_expert_routes",
+        lambda weights, ids, partition: (weights, ids),
+    )
+    monkeypatch.setattr(
+        model_module,
+        "get_global_ctx",
+        lambda: type("Ctx", (), {"batch": type("Batch", (), {"is_prefill": False})()})(),
+    )
+
+    hidden = torch.zeros((1, 1, 4), dtype=torch.bfloat16)
+    output = state(hidden)
+
+    assert calls == [
+        "router",
+        "prepare",
+        "refill-fork",
+        "shared",
+        "refill-join+routed",
+    ]
+    torch.testing.assert_close(output, hidden + 1)

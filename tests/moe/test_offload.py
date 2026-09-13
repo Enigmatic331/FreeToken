@@ -472,6 +472,83 @@ def test_offload_cache_cuda_graph_replays_cold_misses_and_changed_routes():
                 )
 
 
+def test_split_decode_refill_replays_cold_misses_in_cuda_graph(monkeypatch):
+    """The refill side stream must fork and rejoin the captured compute stream."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the split decode refill graph")
+
+    from types import MethodType
+
+    import freetoken.layers.moe as moe_module
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    monkeypatch.setattr(moe_module, "_DECODE_REFILL_STREAMS", {})
+    dev = torch.device("cuda")
+    experts = 4
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=experts,
+        cache_size=4,
+        device=dev,
+    )
+    gate_up = torch.empty(
+        (experts, 16, 8), dtype=torch.bfloat16, pin_memory=True
+    )
+    down = torch.empty(
+        (experts, 8, 8), dtype=torch.bfloat16, pin_memory=True
+    )
+    for expert_id in range(experts):
+        gate_up[expert_id].fill_(expert_id + 1)
+        down[expert_id].fill_(10 * (expert_id + 1))
+    cache.set_bank_sources({"gate_up": [gate_up], "down": [down]})
+    layer = OffloadMoELayer(
+        layer_id=0,
+        num_experts=experts,
+        top_k=2,
+        hidden_size=8,
+        intermediate_size=8,
+    )
+    layer.offload_cache = cache
+
+    def fake_expert_gemm(
+        self, cache, hidden, weights, ids, *, views, n, alphas, is_prefill
+    ):
+        assert n is None and not is_prefill
+        return hidden + ids.float().sum().to(hidden.dtype)
+
+    layer._expert_gemm = MethodType(fake_expert_gemm, layer)
+    hidden = torch.ones((1, 8), dtype=torch.bfloat16, device=dev)
+    weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32, device=dev)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32, device=dev)
+
+    # Create/warm the side stream and cache before capture, just as GraphRunner's
+    # eager warmup does before recording the model forward.
+    plan = layer.begin_routed_decode(weights, ids)
+    assert plan is not None
+    layer.finish_routed_decode(hidden, weights, plan)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan = layer.begin_routed_decode(weights, ids)
+        assert plan is not None
+        shared = hidden.square()
+        output = shared + layer.finish_routed_decode(hidden, weights, plan)
+    cache.reset()
+
+    ids.copy_(torch.tensor([[3, 2]], dtype=torch.int32, device=dev))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for slot_id, expert_id in zip(ids.flatten().tolist(), [3, 2]):
+        assert int(cache.id_of_slot[slot_id]) == expert_id
+        assert torch.equal(cache.bank_caches["gate_up"][slot_id].cpu(), gate_up[expert_id])
+        assert torch.equal(cache.bank_caches["down"][slot_id].cpu(), down[expert_id])
+    assert torch.isfinite(output).all()
+
+
 def test_adjust_config_converts_moe_cache_rate_to_cache_size():
     from types import SimpleNamespace
 
