@@ -8,10 +8,12 @@ Vision and DSpark/MTP speculative decoding are intentionally outside this gate.
 The current topology is exactly two ranks: rank 0 owns the complete TP1 text
 backbone, while both ranks own 192 routed experts per layer and half of every
 Engram table. Decode is single-stream. Engram's three-token history has an
-address-stable graph input, but heterogeneous-EP CUDA graphs remain disabled by
-default because the PyNCCL collective sequence can deadlock on replay. Set
-`FREETOKEN_DSV41_CUDA_GRAPH=1` only for an attended qualification run; it is not
-a production setting yet.
+address-stable graph input. Position-bucketed heterogeneous-EP CUDA graphs have
+passed exact real-checkpoint replay and long-generation gates on a qualified dual
+RTX 5090 setup. They remain an explicit opt-in because P2P, driver, allocator, and
+topology changes require requalification: set `FREETOKEN_DSV41_CUDA_GRAPH=1` and
+use `--cuda-graph-max-bs 1` only after passing the correctness gates on the target
+machine.
 
 The fused sqrt-softplus router is likewise retained behind
 `FREETOKEN_DSV41_FUSED_ROUTER=1`. Its standalone CUDA numerical fixture passes,
@@ -35,11 +37,15 @@ attention-only TP recovered part of full TP's prefill regression but remained
 slower than authority EP; keep it as a profiling/experimentation switch.
 
 ```bash
+export FREETOKEN_DSV41_CUDA_GRAPH=1
+
 ft serve \
   --model /path/to/DeepSeek-V4.1-Flash \
   --gpu <first-5090>,<second-5090> \
   --tp-size 2 \
   --dsv41-backbone-rank 0 \
+  --max-running-requests 1 \
+  --cuda-graph-max-bs 1 \
   --moe-backend offload \
   --moe-cache-auto \
   --attention-backend dsv4_sparse
@@ -48,6 +54,46 @@ ft serve \
 Use the original checkpoint directory, including `inference/config.json` and
 the tokenizer files. `ft checkpoint` deliberately rejects V4.1 for now because
 FTW cannot yet encode the rank-sharded Engram payload.
+
+## Qualified 64K reference profile
+
+One dual-RTX-5090 deployment has passed exact-output, uncapped-sampling, unique
+60,000-token, and 64,000-token-plus-generation gates with the following explicit
+geometry:
+
+```bash
+export FREETOKEN_DSV41_CUDA_GRAPH=1
+
+ft serve \
+  --model /path/to/DeepSeek-V4.1-Flash \
+  --gpu <first-5090>,<second-5090> \
+  --tp-size 2 \
+  --dsv41-backbone-rank 0 \
+  --max-running-requests 1 \
+  --max-seq-len-override 65536 \
+  --max-prefill-length 4096 \
+  --num-pages 512 \
+  --swa-full-tokens-ratio 0.28125 \
+  --cache-type radix \
+  --moe-backend offload \
+  --moe-cache-sizes 704,1450 \
+  --moe-prefill-hit-d2d \
+  --expert-load serial \
+  --attention-backend dsv4_sparse \
+  --cuda-graph-max-bs 1 \
+  --sampling-defaults none \
+  --default-temperature 1.0 \
+  --default-top-p 0.95 \
+  --reasoning-parser deepseekv32 \
+  --default-reasoning-effort 25
+```
+
+This is a reproducible hardware-specific reference, not a portable default. The
+64K long-prefill peak left less than 100 MiB driver-visible free on the backbone
+rank; use auto-sizing or requalify cache/KV geometry on other cards. The numeric
+reasoning effort is also only a soft checkpoint prompt signal. It does not bound
+reasoning tokens, and an omitted output limit intentionally allows generation to
+continue until EOS or the remaining context boundary.
 
 ## Host-memory pinning
 

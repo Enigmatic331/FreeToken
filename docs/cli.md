@@ -43,11 +43,13 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--vision-device` | off | Enable Qwen3.8 image input and place its Qwen3-VL encoder on this CUDA device (for example `0` or `cuda:2`) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
-| `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
+| `--max-output-tokens` | remaining context | Default output budget for requests that omit one; unset continues until EOS or the remaining context boundary |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+| `--default-reasoning-effort` | checkpoint default | Named effort or integer 1–100 for chat requests that omit it; this is a model prompt signal, not a hard reasoning-token limit |
+| `--swa-full-tokens-ratio` | model/runtime default | Size the sliding-window KV tier as a fraction of full-token KV capacity |
 | `--dsv41-backbone-rank` | off | DeepSeek-V4.1 heterogeneous EP authority rank; V4.1 currently requires `--tp-size 2 --dsv41-backbone-rank 0` |
 | `--dsv41-expert-shards` | even split | Optional comma-separated rank-local routed-expert counts for DeepSeek-V4.1 EP |
 
@@ -119,6 +121,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--sampling-defaults` | model | Fill unspecified sampling params from the checkpoint's `generation_config.json` (`none` = framework defaults) |
+| `--default-temperature` | selected sampling source | Override temperature only when a request omits it; explicit request values win |
+| `--default-top-p` | selected sampling source | Override top-p only when a request omits it; explicit request values win |
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |

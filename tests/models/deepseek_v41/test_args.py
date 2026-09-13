@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
 from freetoken.models.deepseek_v41.args import load_args
 
 
-MODEL_PATH = "/home/enigmatic331/models/DeepSeek-V4.1-Flash"
+MODEL_PATH = os.environ.get("FREETOKEN_DSV41_MODEL_PATH", "")
 
 
-@pytest.mark.skipif(not __import__("os").path.exists(MODEL_PATH), reason="official checkpoint absent")
+@pytest.mark.skipif(not os.path.exists(MODEL_PATH), reason="official checkpoint absent")
 def test_official_checkpoint_args_and_memory_arithmetic():
     args = load_args(MODEL_PATH)
     assert (args.dim, args.n_layers, args.n_routed_experts) == (5120, 40, 384)

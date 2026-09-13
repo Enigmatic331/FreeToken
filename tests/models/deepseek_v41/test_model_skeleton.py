@@ -13,7 +13,7 @@ from freetoken.models.deepseek_v41.weight import (
 )
 
 
-MODEL_PATH = "/home/enigmatic331/models/DeepSeek-V4.1-Flash"
+MODEL_PATH = os.environ.get("FREETOKEN_DSV41_MODEL_PATH", "")
 DTYPES = {
     "BF16": torch.bfloat16,
     "F32": torch.float32,

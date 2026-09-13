@@ -389,7 +389,10 @@ def parse_args(
         "--max-output-tokens",
         type=_positive_int,
         default=ServerArgs.max_output_tokens,
-        help="Default max output tokens for requests that omit one (default 32k).",
+        help=(
+            "Default max output tokens for requests that omit one. When unset, generation "
+            "continues until EOS or the remaining model context is exhausted."
+        ),
     )
 
     parser.add_argument(

@@ -8,7 +8,7 @@ from freetoken.models.deepseek_v41.args import load_args
 from freetoken.models.deepseek_v41.attention_layout import AttentionLayout
 
 
-MODEL_PATH = "/home/enigmatic331/models/DeepSeek-V4.1-Flash"
+MODEL_PATH = os.environ.get("FREETOKEN_DSV41_MODEL_PATH", "")
 
 
 @pytest.mark.skipif(not os.path.exists(MODEL_PATH), reason="official checkpoint absent")

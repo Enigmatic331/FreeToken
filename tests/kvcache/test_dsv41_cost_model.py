@@ -17,7 +17,7 @@ from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 from freetoken.models.deepseek_v41.args import load_args
 
 
-MODEL_PATH = "/home/enigmatic331/models/DeepSeek-V4.1-Flash"
+MODEL_PATH = os.environ.get("FREETOKEN_DSV41_MODEL_PATH", "")
 
 
 def _engine_config(args, *, num_page_override=None):
