@@ -90,6 +90,10 @@ class EngineConfig:
     # Experimental hybrid topology: both ranks execute a TP2 dense backbone
     # while retaining EP2 routed experts and row-sharded Engram tables.
     dsv41_tp2_ep2: bool = False
+    # Attention-only TP2 variant: attention projections are sharded, while the
+    # backbone root retains the complete router/shared-expert path so that its
+    # shared-expert compute overlaps the other rank's routed experts.
+    dsv41_attention_tp2_ep2: bool = False
     # Optional auxiliary CUDA device for a multimodal encoder. Supplying it opts
     # into loading vision weights; it need not be one of the model TP/EP devices.
     vision_device: str | None = None
@@ -133,7 +137,7 @@ class EngineConfig:
             self.qwen4_exp_backbone_rank is not None
             or (
                 self.dsv41_backbone_rank is not None
-                and not self.dsv41_tp2_ep2
+                and not (self.dsv41_tp2_ep2 or self.dsv41_attention_tp2_ep2)
             )
         )
         return 1 if heterogeneous_ep else self.tp_info.size

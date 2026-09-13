@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +17,31 @@ def test_execution_plan_balances_global_experts_and_keeps_workers_in_engram():
     assert (right.global_offset, right.local_count) == (193, 192)
     assert right_plan.is_expert_worker
     assert right_plan.participates_in_engram
+
+
+def test_attention_tp2_plan_keeps_both_backbones_but_root_owns_shared_path():
+    root = DeepseekV41ExecutionPlan(
+        0, 2, backbone_rank=0, attention_tp2_ep2=True
+    )
+    peer = DeepseekV41ExecutionPlan(
+        1, 2, backbone_rank=0, attention_tp2_ep2=True
+    )
+    assert root.is_backbone and peer.is_backbone
+    assert not root.is_expert_worker and not peer.is_expert_worker
+    assert root.attention_parallel and peer.attention_parallel
+    assert not root.shared_expert_parallel and not peer.shared_expert_parallel
+    assert not root.uses_authority_transport and not peer.uses_authority_transport
+
+
+def test_dense_parallel_modes_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DeepseekV41ExecutionPlan(
+            0,
+            2,
+            backbone_rank=0,
+            tp2_ep2=True,
+            attention_tp2_ep2=True,
+        )
 
 
 def test_router_bias_selects_but_unbiased_score_scales_routes():

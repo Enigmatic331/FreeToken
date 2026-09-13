@@ -80,7 +80,7 @@ class SharedExpert(nn.Module):
     def __init__(self, args: DeepseekV41Args) -> None:
         super().__init__()
         execution = get_execution_plan()
-        parallel = execution.tp2_ep2
+        parallel = execution.shared_expert_parallel
         self.w1 = Linear(
             args.dim,
             args.moe_inter_dim,

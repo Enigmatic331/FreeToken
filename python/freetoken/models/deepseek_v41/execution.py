@@ -1,4 +1,4 @@
-"""V4.1 authority-EP and opt-in TP2+EP2 execution roles."""
+"""V4.1 authority-EP and opt-in dense-parallel execution roles."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ class DeepseekV41ExecutionPlan:
     backbone_rank: int | None = None
     expert_shards: tuple[int, ...] | None = None
     tp2_ep2: bool = False
+    attention_tp2_ep2: bool = False
 
     def __post_init__(self) -> None:
         if self.world_size <= 0 or not 0 <= self.rank < self.world_size:
@@ -25,6 +26,16 @@ class DeepseekV41ExecutionPlan:
             raise ValueError(f"invalid backbone rank {self.backbone_rank}")
         if self.tp2_ep2 and (self.backbone_rank is None or self.world_size != 2):
             raise ValueError("V4.1 TP2+EP2 requires a backbone root and world size 2")
+        if self.attention_tp2_ep2 and (
+            self.backbone_rank is None or self.world_size != 2
+        ):
+            raise ValueError(
+                "V4.1 attention-TP2+EP2 requires a backbone root and world size 2"
+            )
+        if self.tp2_ep2 and self.attention_tp2_ep2:
+            raise ValueError(
+                "V4.1 full TP2+EP2 and attention-TP2+EP2 are mutually exclusive"
+            )
         if self.expert_shards is not None:
             shards = tuple(self.expert_shards)
             object.__setattr__(self, "expert_shards", shards)
@@ -37,15 +48,27 @@ class DeepseekV41ExecutionPlan:
 
     @property
     def is_backbone(self) -> bool:
-        return not self.enabled or self.tp2_ep2 or self.rank == self.backbone_rank
+        return not self.enabled or self.dense_parallel or self.rank == self.backbone_rank
 
     @property
     def is_expert_worker(self) -> bool:
-        return self.enabled and not self.tp2_ep2 and self.rank != self.backbone_rank
+        return self.enabled and not self.dense_parallel and self.rank != self.backbone_rank
 
     @property
     def uses_authority_transport(self) -> bool:
-        return self.enabled and not self.tp2_ep2
+        return self.enabled and not self.dense_parallel
+
+    @property
+    def dense_parallel(self) -> bool:
+        return self.tp2_ep2 or self.attention_tp2_ep2
+
+    @property
+    def attention_parallel(self) -> bool:
+        return self.dense_parallel
+
+    @property
+    def shared_expert_parallel(self) -> bool:
+        return self.tp2_ep2
 
     @property
     def participates_in_engram(self) -> bool:
@@ -96,11 +119,17 @@ def configure_execution(
     backbone_rank: int | None,
     expert_shards: tuple[int, ...] | None = None,
     tp2_ep2: bool = False,
+    attention_tp2_ep2: bool = False,
 ) -> DeepseekV41ExecutionPlan:
     global _PLAN
     info = get_tp_info()
     plan = DeepseekV41ExecutionPlan(
-        info.rank, info.size, backbone_rank, expert_shards, tp2_ep2
+        info.rank,
+        info.size,
+        backbone_rank,
+        expert_shards,
+        tp2_ep2,
+        attention_tp2_ep2,
     )
     if _PLAN is not None and _PLAN != plan:
         raise RuntimeError(f"V4.1 execution already configured as {_PLAN}, got {plan}")

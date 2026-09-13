@@ -146,7 +146,7 @@ class Attention(nn.Module):
         from .execution import get_execution_plan
 
         execution = get_execution_plan()
-        tp_size = execution.world_size if execution.tp2_ep2 else 1
+        tp_size = execution.world_size if execution.attention_parallel else 1
         self.args = args
         self.layer_id = layer_id
         self.plan = layout[layer_id]
@@ -165,7 +165,7 @@ class Attention(nn.Module):
         self.wq_b = Linear(
             args.q_lora_rank,
             args.n_heads * args.head_dim,
-            parallel="column" if execution.tp2_ep2 else None,
+            parallel="column" if execution.attention_parallel else None,
         )
         self.wkv = Linear(args.dim, args.head_dim)
         self.kv_norm = RMSNorm(args.head_dim, args.norm_eps)
@@ -180,7 +180,7 @@ class Attention(nn.Module):
         self.wo_b = Linear(
             args.o_groups * args.o_lora_rank,
             args.dim,
-            parallel="row" if execution.tp2_ep2 else None,
+            parallel="row" if execution.attention_parallel else None,
         )
         self.compressor = Compressor(args, layer_id) if self.plan.owns_kv else None
         self.indexer = Indexer(args, layer_id) if self.plan.owns_index else None
@@ -562,9 +562,15 @@ class MoEState(nn.Module):
 
     def __init__(self, args: DeepseekV41Args) -> None:
         super().__init__()
+        from .execution import get_execution_plan
+
+        execution = get_execution_plan()
+        owns_shared_path = not execution.attention_tp2_ep2 or (
+            execution.rank == execution.backbone_rank
+        )
         self.dim = args.dim
-        self.gate = Gate(args)
-        self.shared_experts = SharedExpert(args)
+        self.gate = Gate(args) if owns_shared_path else None
+        self.shared_experts = SharedExpert(args) if owns_shared_path else None
         self.experts = None
         self.execution = None
         self.partition = None
@@ -593,9 +599,18 @@ class MoEState(nn.Module):
                 hidden = self._comm.broadcast(
                     hidden.contiguous(), self.execution.backbone_rank
                 )
-        with profile_range("DSV41/MoE/Router"):
-            weights, ids = self.gate(hidden)
-        if self.execution.uses_authority_transport:
+        if (
+            self.execution.attention_tp2_ep2
+            and self.execution.rank != self.execution.backbone_rank
+        ):
+            route_shape = (hidden.shape[0], self.experts.top_k)
+            weights = torch.empty(route_shape, dtype=torch.float32, device=hidden.device)
+            ids = torch.empty(route_shape, dtype=torch.int32, device=hidden.device)
+        else:
+            with profile_range("DSV41/MoE/Router"):
+                assert self.gate is not None
+                weights, ids = self.gate(hidden)
+        if self.execution.uses_authority_transport or self.execution.attention_tp2_ep2:
             with profile_range("DSV41/EP/RouteBroadcast"):
                 weights = self._comm.broadcast(
                     weights.float().contiguous(), self.execution.backbone_rank
@@ -610,8 +625,14 @@ class MoEState(nn.Module):
         if not self.execution.tp2_ep2:
             with profile_range("DSV41/MoE/PrepareRouted"):
                 self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
-        with profile_range("DSV41/MoE/SharedExpert"):
-            shared = self.shared_experts(hidden)
+        if not self.execution.attention_tp2_ep2 or (
+            self.execution.rank == self.execution.backbone_rank
+        ):
+            with profile_range("DSV41/MoE/SharedExpert"):
+                assert self.shared_experts is not None
+                shared = self.shared_experts(hidden)
+        else:
+            shared = None
         if self.execution.tp2_ep2:
             # Both TP ranks must finish shared-expert all-reduce before root
             # posts a P2P receive whose matching worker send occurs below.
@@ -631,6 +652,17 @@ class MoEState(nn.Module):
             routed = self._comm.broadcast(
                 routed.contiguous(), self.execution.backbone_rank
             )
+        if self.execution.attention_tp2_ep2:
+            if self.execution.rank == self.execution.backbone_rank:
+                assert shared is not None
+                output = shared + routed.to(shared.dtype)
+            else:
+                output = torch.empty_like(hidden)
+            output = self._comm.broadcast(
+                output.contiguous(), self.execution.backbone_rank
+            )
+            return output.view(shape)
+        assert shared is not None
         return (shared + routed.to(shared.dtype)).view(shape)
 
 

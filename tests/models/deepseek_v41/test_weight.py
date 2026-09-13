@@ -52,6 +52,26 @@ def test_tp2_ep2_resident_slices_match_projection_partition(rank):
         distributed_info._TP_INFO = None
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_attention_tp2_ep2_slices_attention_and_replicates_shared_expert(rank):
+    _reset_execution_for_tests()
+    distributed_info._TP_INFO = DistributedInfo(rank, 2)
+    configure_execution(0, attention_tp2_ep2=True)
+    try:
+        matrix = torch.arange(32, dtype=torch.float32).view(4, 8)
+        attention = _tp2_ep2_resident_slice(
+            "layers.0.attn.wq_b.weight", matrix
+        )
+        shared = _tp2_ep2_resident_slice(
+            "layers.0.ffn.shared_experts.w1.weight", matrix
+        )
+        torch.testing.assert_close(attention, matrix.chunk(2, 0)[rank])
+        torch.testing.assert_close(shared, matrix)
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
 def test_ftw_conversion_rejects_missing_engram_representation():
     from freetoken.checkpoint.convert import _validate_ftw_conversion_supported
 
@@ -112,6 +132,41 @@ def test_text_stream_never_materializes_engram_experts_mtp_or_vision(tmp_path):
     )
     assert set(loaded) == {"head", "layers.0.attn_norm.weight"}
     torch.testing.assert_close(loaded["head"], tensors["head.weight"])
+
+
+def test_attention_tp2_peer_stream_skips_root_owned_router_and_shared(tmp_path):
+    tensors = {
+        "head.weight": torch.arange(8, dtype=torch.bfloat16).view(2, 4),
+        "layers.0.attn.wq_b.weight": torch.arange(
+            16, dtype=torch.bfloat16
+        ).view(4, 4),
+        "layers.0.ffn.gate.weight": torch.ones(4, 4, dtype=torch.bfloat16),
+        "layers.0.ffn.shared_experts.w1.weight": torch.ones(
+            4, 4, dtype=torch.bfloat16
+        ),
+    }
+    shard = "model.safetensors"
+    save_file(tensors, tmp_path / shard)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard for name in tensors}})
+    )
+
+    _reset_execution_for_tests()
+    distributed_info._TP_INFO = DistributedInfo(1, 2)
+    configure_execution(0, attention_tp2_ep2=True)
+    try:
+        loaded = dict(
+            iter_weights(
+                str(tmp_path),
+                torch.device("cpu"),
+                include_moe_experts=False,
+            )
+        )
+        assert set(loaded) == {"head", "layers.0.attn.wq_b.weight"}
+        assert loaded["layers.0.attn.wq_b.weight"].shape == (2, 4)
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
 
 
 def test_expert_loader_places_only_owned_global_rows(tmp_path):

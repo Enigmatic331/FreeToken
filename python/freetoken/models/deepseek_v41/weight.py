@@ -344,26 +344,35 @@ def _tp2_ep2_resident_slice(name: str, value: torch.Tensor) -> torch.Tensor:
     from .execution import get_execution_plan
 
     execution = get_execution_plan()
-    if not execution.tp2_ep2:
+    if not execution.attention_parallel:
         return value
     rank, world = execution.rank, execution.world_size
-    column = (
+    column = [
         ".attn.wq_b.weight",
         ".attn.wq_b.scale",
-        ".ffn.shared_experts.w1.weight",
-        ".ffn.shared_experts.w1.scale",
-        ".ffn.shared_experts.w3.weight",
-        ".ffn.shared_experts.w3.scale",
-    )
-    row = (
+    ]
+    row = [
         ".attn.wo_b.weight",
         ".attn.wo_b.scale",
-        ".ffn.shared_experts.w2.weight",
-        ".ffn.shared_experts.w2.scale",
-    )
-    if name.endswith(column):
+    ]
+    if execution.shared_expert_parallel:
+        column.extend(
+            (
+                ".ffn.shared_experts.w1.weight",
+                ".ffn.shared_experts.w1.scale",
+                ".ffn.shared_experts.w3.weight",
+                ".ffn.shared_experts.w3.scale",
+            )
+        )
+        row.extend(
+            (
+                ".ffn.shared_experts.w2.weight",
+                ".ffn.shared_experts.w2.scale",
+            )
+        )
+    if name.endswith(tuple(column)):
         return value.chunk(world, dim=0)[rank].contiguous()
-    if name.endswith(row):
+    if name.endswith(tuple(row)):
         return value.chunk(world, dim=1)[rank].contiguous()
     if name.endswith((".attn.wo_a", ".attn.attn_sink")):
         return value.chunk(world, dim=0)[rank].contiguous()
@@ -390,7 +399,8 @@ def iter_weights(
         return
     from .execution import get_execution_plan
 
-    if get_execution_plan().is_expert_worker:
+    execution = get_execution_plan()
+    if execution.is_expert_worker:
         return
 
     plan = inspect_checkpoint(model_path)
@@ -404,6 +414,15 @@ def iter_weights(
         with safetensors.safe_open(path, framework="pt", device=str(device)) as handle:
             for tensor in by_shard[shard]:
                 name = tensor.name
+                if (
+                    execution.attention_tp2_ep2
+                    and execution.rank != execution.backbone_rank
+                    and (
+                        ".ffn.gate." in name
+                        or ".ffn.shared_experts." in name
+                    )
+                ):
+                    continue
                 if name.endswith(".attn.wo_a.scale"):
                     continue
                 value = handle.get_tensor(name)

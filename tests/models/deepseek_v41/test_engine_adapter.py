@@ -45,10 +45,14 @@ def _tiny_args() -> DeepseekV41Args:
     )
 
 
-def _build(rank: int, *, tp2_ep2: bool = False):
+def _build(
+    rank: int, *, tp2_ep2: bool = False, attention_tp2_ep2: bool = False
+):
     _reset_execution_for_tests()
     distributed_info._TP_INFO = DistributedInfo(rank, 2)
-    plan = configure_execution(0, tp2_ep2=tp2_ep2)
+    plan = configure_execution(
+        0, tp2_ep2=tp2_ep2, attention_tp2_ep2=attention_tp2_ep2
+    )
     with plan.model_tp_context(), torch.device("meta"):
         model = DeepseekV41ForCausalLM(SimpleNamespace(dsv41_args=_tiny_args()))
     return plan, model
@@ -97,7 +101,11 @@ def _engine_model_config(args: DeepseekV41Args) -> ModelConfig:
 
 
 def _engine_config(
-    *, world_size: int = 2, backbone_rank=0, tp2_ep2: bool = False
+    *,
+    world_size: int = 2,
+    backbone_rank=0,
+    tp2_ep2: bool = False,
+    attention_tp2_ep2: bool = False,
 ) -> ServerArgs:
     args = _tiny_args()
     config = ServerArgs(
@@ -109,6 +117,7 @@ def _engine_config(
         moe_cache_auto=True,
         dsv41_backbone_rank=backbone_rank,
         dsv41_tp2_ep2=tp2_ep2,
+        dsv41_attention_tp2_ep2=attention_tp2_ep2,
         max_running_req=4,
         cuda_graph_bs=[1, 2, 4],
         cuda_graph_max_bs=4,
@@ -166,6 +175,34 @@ def test_tp2_ep2_builds_sharded_dense_backbone_on_both_ranks(rank):
         distributed_info._TP_INFO = None
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_attention_tp2_ep2_shards_attention_but_keeps_shared_expert_whole(rank):
+    plan, model = _build(rank, attention_tp2_ep2=True)
+    try:
+        assert plan.attention_parallel
+        assert not plan.shared_expert_parallel
+        assert not plan.is_expert_worker
+        assert isinstance(model._model, Transformer)
+        layer = model._model.layers[0]
+        assert layer.attn.n_heads == 1
+        assert layer.attn.n_groups == 1
+        assert layer.attn.wq_b.weight.shape == (32, 32)
+        assert layer.attn.wo_a.shape == (16, 32)
+        assert layer.attn.wo_b.weight.shape == (32, 16)
+        if rank == 0:
+            assert layer.ffn.gate is not None
+            assert layer.ffn.shared_experts.w1.weight.shape == (32, 32)
+            assert layer.ffn.shared_experts.w2.weight.shape == (32, 32)
+            assert layer.ffn.shared_experts.w3.weight.shape == (32, 32)
+        else:
+            assert layer.ffn.gate is None
+            assert layer.ffn.shared_experts is None
+        assert layer.ffn.experts.num_experts == 4
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
 def test_engine_config_resolves_ep2_single_stream_and_safe_eager_default():
     from freetoken.engine.engine import _adjust_config
 
@@ -201,6 +238,39 @@ def test_engine_config_exposes_true_model_tp_width_for_tp2_ep2():
         _adjust_config(config)
         assert config.model_tp_size == 2
         assert config.model_config.num_experts == 4
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_engine_config_exposes_true_model_tp_width_for_attention_tp2_ep2():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config(attention_tp2_ep2=True)
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(
+            config.dsv41_backbone_rank,
+            attention_tp2_ep2=config.dsv41_attention_tp2_ep2,
+        )
+        _adjust_config(config)
+        assert config.model_tp_size == 2
+        assert config.model_config.num_experts == 4
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_engine_config_rejects_both_dense_parallel_modes():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config(tp2_ep2=True, attention_tp2_ep2=True)
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _adjust_config(config)
     finally:
         _reset_execution_for_tests()
         distributed_info._TP_INFO = None

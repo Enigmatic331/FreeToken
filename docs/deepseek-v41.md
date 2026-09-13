@@ -18,6 +18,22 @@ The fused sqrt-softplus router is likewise retained behind
 but the first full EP2 prefill does not complete, so ordinary serving keeps the
 proven PyTorch selection/normalization path.
 
+Two dense-parallel research modes are available but are not recommended as the
+default serving topology:
+
+- `--dsv41-tp2-ep2` shards both attention and shared-expert projections. It
+  executes the complete dense backbone on both ranks.
+- `--dsv41-attention-tp2-ep2` shards attention only. The backbone root retains
+  the router and shared expert, overlaps shared-expert compute with the peer's
+  routed experts, and broadcasts the completed MoE result to the peer.
+
+The flags are mutually exclusive and require TP size 2 plus
+`--dsv41-backbone-rank`. Both preserve whole-expert EP2 and row-sharded Engram.
+They change floating-point reduction order, so greedy output need not be bitwise
+identical to the authority-EP topology. On a dual RTX 5090 PCIe system,
+attention-only TP recovered part of full TP's prefill regression but remained
+slower than authority EP; keep it as a profiling/experimentation switch.
+
 ```bash
 ft serve \
   --model /path/to/DeepSeek-V4.1-Flash \

@@ -315,6 +315,16 @@ def parse_args(
             "row-sharded Engram tables. Requires TP size 2."
         ),
     )
+    parser.add_argument(
+        "--dsv41-attention-tp2-ep2",
+        action="store_true",
+        default=ServerArgs.dsv41_attention_tp2_ep2,
+        help=(
+            "Experimental DeepSeek-V4.1 topology: shard attention projections "
+            "across both ranks while keeping router/shared-expert execution on "
+            "the backbone root. Requires TP size 2."
+        ),
+    )
 
     parser.add_argument(
         "--vision-device",
