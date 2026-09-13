@@ -255,10 +255,14 @@ def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Ten
     }
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
-    for t in banks["gate_up_packed"]:  # packed e2m1; scales stay 0 (valid e8m0)
-        t.random_(0, 256)
+    # Values are deliberately deterministic and cheap to initialize.  Randomizing
+    # hundreds of GiB of packed bytes is single-threaded in torch and can make a
+    # dummy model slower to start than the real checkpoint.  Zero is a valid E2M1
+    # code; the scale banks also retain their valid zero E8M0 code.
+    for t in banks["gate_up_packed"]:
+        t.zero_()
     for t in banks["down_packed"]:
-        t.random_(0, 256)
+        t.zero_()
     pin_banks(hb)
     return banks
 

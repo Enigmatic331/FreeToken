@@ -280,7 +280,14 @@ def _make_dummy_weight_state_dict(
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
     for key, param in model_state.items():
-        if param.dtype in fp8_dtypes:
+        if param.dtype == torch.float8_e8m0fnu:
+            # E8M0 is an unsigned power-of-two scale encoding, not a value type
+            # with a normal distribution implementation.  Raw code 127 is 1.0,
+            # giving dummy FP4/FP8 tensors finite, non-degenerate scales.
+            t = torch.empty(param.shape, dtype=param.dtype, device=device)
+            t.view(torch.uint8).fill_(127)
+            state_dict[key] = t
+        elif param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
             # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).

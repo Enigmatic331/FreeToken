@@ -404,6 +404,74 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     assert cache.src_indices[:256].tolist() == list(range(256))
 
 
+def test_offload_cache_cuda_graph_replays_cold_misses_and_changed_routes():
+    """Match GraphRunner's warm-hit capture followed by a cold-cache real replay."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the GPU offload cache graph")
+
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    layers, experts, slots = 2, 4, 8
+    dev = torch.device("cuda")
+
+    def sources(multiplier):
+        result = []
+        for layer_id in range(layers):
+            data = torch.empty(
+                (experts, 16, 8), dtype=torch.bfloat16, pin_memory=True
+            )
+            for expert_id in range(experts):
+                data[expert_id].fill_(multiplier * (layer_id * experts + expert_id + 1))
+            result.append(data)
+        return result
+
+    gate_up = sources(1)
+    down = sources(10)
+    cache = OffloadMoeCache(
+        num_layers=layers,
+        num_experts=experts,
+        cache_size=slots,
+        device=dev,
+    )
+    cache.set_bank_sources({"gate_up": gate_up, "down": down})
+    routes = [
+        torch.tensor([[0, 1]], dtype=torch.int32, device=dev),
+        torch.tensor([[2, 3]], dtype=torch.int32, device=dev),
+    ]
+
+    # Warm the exact cache state used by graph capture, so the captured copy kernels see
+    # num_indices == 0.  Real serving resets immediately afterwards and the same graph must
+    # still execute cold H2D misses correctly from replay-time num_indices/src/slot buffers.
+    for layer_id in range(layers):
+        cache.ensure_experts(layer_id, routes[layer_id])
+        cache.copy_missing()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for layer_id in range(layers):
+            cache.ensure_experts(layer_id, routes[layer_id])
+            cache.copy_missing()
+    cache.reset()
+
+    cases = [
+        [[3, 2], [1, 0]],
+        [[0, 2], [3, 1]],
+    ]
+    for per_layer in cases:
+        for route, raw in zip(routes, per_layer):
+            route.copy_(torch.tensor([raw], dtype=torch.int32, device=dev))
+        graph.replay()
+        torch.cuda.synchronize()
+        for layer_id, (route, raw_ids) in enumerate(zip(routes, per_layer)):
+            for slot_id, expert_id in zip(route.flatten().tolist(), raw_ids):
+                assert int(cache.id_of_slot[slot_id]) == layer_id * experts + expert_id
+                assert torch.equal(
+                    cache.bank_caches["gate_up"][slot_id].cpu(), gate_up[layer_id][expert_id]
+                )
+                assert torch.equal(
+                    cache.bank_caches["down"][slot_id].cpu(), down[layer_id][expert_id]
+                )
+
+
 def test_adjust_config_converts_moe_cache_rate_to_cache_size():
     from types import SimpleNamespace
 

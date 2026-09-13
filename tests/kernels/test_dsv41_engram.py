@@ -65,3 +65,30 @@ def test_pinned_host_shard_matches_device_oracle():
         plan.row_end,
     )
     assert torch.equal(got, want)
+
+
+def test_pinned_host_shard_cuda_graph_follows_row_ids():
+    """The UVA gather must read replay-time ids, not the capture-time values."""
+    from freetoken.models.deepseek_v41.engram import EngramHostTable, EngramShardPlan
+
+    num_rows, dim = 9, 256
+    plan = EngramShardPlan.build(num_rows, dim, rank=0, world_size=1)
+    table = EngramHostTable(plan, device=torch.device("cuda"), prefetch=False)
+    full_weight, full_scale = _fixture(num_rows, dim, "cpu")
+    table.weight.copy_(full_weight)
+    table.scale.copy_(full_scale)
+    table.finish_load(pin=True, collapse=False)
+
+    ids = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int64)
+    # Compile the Triton kernel outside capture.  The graph lookup deliberately receives a
+    # separate staging allocation, matching the real EngramHostTable capture path.
+    table.lookup(ids, reduce=False)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = table.lookup(ids, reduce=False)
+
+    for replay_ids in ([8, 7, 6, 5], [4, 0, 8, 2]):
+        ids.copy_(torch.tensor(replay_ids, device="cuda"))
+        graph.replay()
+        want = _reference(full_weight.cuda(), full_scale.cuda(), ids, 0, num_rows)
+        assert torch.equal(captured, want)

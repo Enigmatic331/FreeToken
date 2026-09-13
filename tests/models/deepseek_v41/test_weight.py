@@ -206,3 +206,16 @@ def test_expert_loader_places_only_owned_global_rows(tmp_path):
     assert banks["down_packed"][1].shape == (2, 64, 16)
     assert banks["gate_up_packed"][0][0, 0, 0].item() == 2
     assert banks["gate_up_packed"][1][1, -1, -1].item() == 13
+
+
+def test_dummy_dsfp4_expert_payloads_are_deterministic_zero(monkeypatch):
+    import freetoken.moe.host_banks as host_banks
+    from freetoken.models.deepseek_v4.weight import dummy_dsfp4_expert_sources
+
+    monkeypatch.setattr(host_banks, "pin_banks", lambda _banks: None)
+    args = SimpleNamespace(n_layers=1, n_routed_experts=2, dim=64, moe_inter_dim=32)
+
+    banks = dummy_dsfp4_expert_sources(args)
+
+    assert not torch.count_nonzero(banks["gate_up_packed"][0])
+    assert not torch.count_nonzero(banks["down_packed"][0])

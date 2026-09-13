@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Callable, Dict, List
 
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
@@ -145,6 +146,82 @@ def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
 
 
+def _dsv41_local_n_heads(model, args) -> int:
+    """Return local attention heads, tolerating EP ranks with only MoE layers."""
+    transformer = getattr(model, "_model", None)
+    for block in getattr(transformer, "layers", ()):
+        attention = getattr(block, "attn", None)
+        if int(
+            getattr(getattr(attention, "plan", None), "compress_ratio", 0)
+        ) > 0:
+            return int(attention.n_heads)
+    return int(args.n_heads)
+
+
+def _dsv41_graph_stage_ranges(
+    args,
+    *,
+    batch_size: int,
+    n_heads: int,
+    max_seq_len: int,
+    device: torch.device,
+    split_counter: Callable[[int, int, int, int, torch.device], int] | None = None,
+) -> tuple[tuple[int, int, int], ...]:
+    """Group decode positions whose sparse-attention split topology is identical.
+
+    A V4.1 graph needs a static compressed-history width large enough for every
+    position it serves.  Capturing only at ``max_seq_len`` is numerically unsafe:
+    ``split_count`` then bakes five split-K partitions into the graph even when an
+    eager short-context launch uses two.  The resulting BF16 reduction-order delta
+    compounds through the model.  Each returned ``(lo, hi, capture_cap)`` range
+    therefore holds the split count constant for every positive compression ratio.
+    The final range still captures at the admitted sequence ceiling so later KV is
+    visible; device-side live counts mask its unused tail.
+    """
+    # A real decode follows at least one prefilled token, so position zero is
+    # unreachable.  Leaving it eager avoids a one-use topology/capture variant.
+    if max_seq_len <= 1:
+        return ()
+    ratios = tuple(sorted({int(r) for r in args.compress_ratios if int(r) > 0}))
+    if not ratios:
+        return ((1, max_seq_len - 1, max_seq_len - 1),)
+    if split_counter is None:
+        from freetoken.kernel.triton.dsv4.sparse_attn import split_count
+
+        split_counter = split_count
+
+    last_position = max_seq_len - 1
+    # Once every ratio has reached index_topk, candidate width (and hence the
+    # topology) cannot change again.  Avoid scanning a 32K/64K context ceiling.
+    scan_end = min(last_position, max(ratios) * int(args.index_topk) - 1)
+
+    def topology(position: int) -> tuple[int, ...]:
+        return tuple(
+            split_counter(
+                batch_size,
+                1,
+                n_heads,
+                int(args.window_size)
+                + min(int(args.index_topk), (position + 1) // ratio),
+                device,
+            )
+            for ratio in ratios
+        )
+
+    ranges: list[tuple[int, int, int]] = []
+    start = 1
+    current = topology(1)
+    for position in range(2, scan_end + 1):
+        candidate = topology(position)
+        if candidate != current:
+            ranges.append((start, position - 1, position - 1))
+            start, current = position, candidate
+    # The range's capture ceiling must cover every position it serves.  This is
+    # especially important for the final, topology-stable long-context range.
+    ranges.append((start, last_position, last_position))
+    return tuple(ranges)
+
+
 class GraphRunner:
     def __init__(
         self,
@@ -170,8 +247,28 @@ class GraphRunner:
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
+        self.model = model
         self.stream = stream
         self.device = device
+        self.graph_stage_ranges_by_bs: dict[
+            int, tuple[tuple[int, int, int], ...]
+        ] | None = None
+        dsv41_args = getattr(getattr(model, "_config", None), "dsv41_args", None)
+        if dsv41_args is not None and self.graph_bs_list:
+            local_n_heads = _dsv41_local_n_heads(model, dsv41_args)
+            self.graph_stage_ranges_by_bs = {
+                bs: _dsv41_graph_stage_ranges(
+                    dsv41_args,
+                    batch_size=bs,
+                    n_heads=local_n_heads,
+                    max_seq_len=max_seq_len,
+                    device=device,
+                )
+                for bs in self.graph_bs_list
+            }
+        self._verify_replays = max(
+            0, int(os.getenv("FREETOKEN_CUDA_GRAPH_VERIFY_STEPS", "0"))
+        )
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -185,7 +282,7 @@ class GraphRunner:
         # reads it as an indeterminate phase and animates the bar. Must precede the
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
-        self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.graph_map: Dict[tuple[int, int | None], torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -195,7 +292,23 @@ class GraphRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
 
-        logger.info_rank0(f"Start capturing CUDA graphs with sizes: {self.graph_bs_list}")
+        if self.graph_stage_ranges_by_bs is None:
+            capture_specs = [
+                (bs, None) for bs in sorted(self.graph_bs_list, reverse=True)
+            ]
+        else:
+            capture_specs = [
+                (bs, cap)
+                for bs in sorted(self.graph_bs_list, reverse=True)
+                for _lo, _hi, cap in reversed(self.graph_stage_ranges_by_bs[bs])
+            ]
+            logger.info_rank0(
+                "DeepSeek-V4.1 CUDA graph position ranges: %s",
+                self.graph_stage_ranges_by_bs,
+            )
+        logger.info_rank0(
+            "Start capturing CUDA graphs with (batch, stage-cap): %s", capture_specs
+        )
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
@@ -219,19 +332,24 @@ class GraphRunner:
         self._reset_moe_offload_cache()
 
         pbar = tqdm(
-            sorted(self.graph_bs_list, reverse=True),
+            capture_specs,
             desc="Preparing for capturing CUDA graphs...",
-            unit="batch",
+            unit="graph",
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
         pool = None
-        for bs in pbar:
+        for bs, stage_cap in pbar:
             free_memory = get_free_memory(self.device)
-            pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
+            cap_label = "default" if stage_cap is None else str(stage_cap)
+            pbar.desc = (
+                f"Capturing graphs: bs = {bs:<3} cap = {cap_label:<7} | "
+                f"avail_mem = {mem_GB(free_memory)}"
+            )
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
+            batch.dsv41_graph_stage_cap = stage_cap
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
@@ -250,21 +368,64 @@ class GraphRunner:
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
-            self.graph_map[bs] = graph
+            self.graph_map[(bs, stage_cap)] = graph
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        if not batch.is_decode or batch.size > self.max_graph_bs:
+            return False
+        if self.graph_stage_ranges_by_bs is None:
+            return True
+        position = max(req.cached_len for req in batch.reqs)
+        padded_size = next(bs for bs in self.graph_bs_list if bs >= batch.size)
+        return any(
+            lo <= position <= hi
+            for lo, hi, _cap in self.graph_stage_ranges_by_bs[padded_size]
+        )
+
+    def _stage_cap_for_batch(self, batch: Batch) -> int | None:
+        if self.graph_stage_ranges_by_bs is None:
+            return None
+        position = max(req.cached_len for req in batch.reqs)
+        for lo, hi, cap in self.graph_stage_ranges_by_bs[batch.padded_size]:
+            if lo <= position <= hi:
+                return cap
+        raise RuntimeError(
+            f"decode position {position} is outside the captured V4.1 graph ranges"
+        )
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
+        stage_cap = self._stage_cap_for_batch(batch)
+        g = self.graph_map[(batch.padded_size, stage_cap)]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
+        if self._verify_replays:
+            # Diagnostic-only shadow execution.  Re-running the same one-token forward is
+            # state-idempotent for the transformer KV/carry stores and lets us compare graph
+            # and eager logits from the same pre-step state without loading a second 400+ GiB
+            # process.  Every EP rank enters the shadow forward, preserving collective order;
+            # only rank 0 reports the real vocabulary logits.
+            graph_logits = self.buffer.logits[: batch.size].clone()
+            eager_logits = self.model.forward()
+            if not get_tp_info().is_primary():
+                self._verify_replays -= 1
+            else:
+                delta = (graph_logits - eager_logits[: batch.size]).abs()
+                logger.info(
+                    "CUDA graph shadow verification: remaining=%d max_abs=%g "
+                    "graph_argmax=%s eager_argmax=%s exact=%s",
+                    self._verify_replays,
+                    float(delta.max().item()),
+                    graph_logits.argmax(-1).tolist(),
+                    eager_logits[: batch.size].argmax(-1).tolist(),
+                    bool(torch.equal(graph_logits, eager_logits[: batch.size])),
+                )
+                self._verify_replays -= 1
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:

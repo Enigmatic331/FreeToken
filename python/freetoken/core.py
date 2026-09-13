@@ -167,6 +167,10 @@ class Batch:
     # freezing the dummy request's host-side history.
     engram_history: torch.Tensor | None = field(default=None, init=False)
     engram_cu_seqlens: torch.Tensor | None = field(default=None, init=False)
+    # Static compressed-history ceiling used only while capturing a DeepSeek-V4.1
+    # decode graph.  Real replay batches leave this unset: the graph has already
+    # baked the matching shape, while eager/shadow execution must use live positions.
+    dsv41_graph_stage_cap: int | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

@@ -364,6 +364,53 @@ def test_engram_history_uses_address_stable_graph_inputs_when_present():
     assert history.tolist() == [[6, 7, 8]]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_graph_buffer_stages_fresh_host_engram_history_each_replay():
+    from freetoken.engine.graph import GraphCaptureBuffer
+
+    buffer = GraphCaptureBuffer.init(
+        1,
+        1,
+        torch.device("cuda"),
+        engram_history_width=3,
+        engram_pad_id=2,
+    )
+    captured_batch = SimpleNamespace(padded_size=1)
+    buffer.set_batch(captured_batch)
+    result = torch.empty((), dtype=torch.int64, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result.copy_(
+            captured_batch.engram_history.sum()
+            + captured_batch.input_ids.long().sum()
+            + captured_batch.positions.long().sum()
+        )
+
+    req = SimpleNamespace(
+        input_ids=torch.tensor([3, 5, 7, 11], dtype=torch.int32), cached_len=3
+    )
+    replay_batch = SimpleNamespace(
+        padded_size=1,
+        padded_reqs=[req],
+        input_ids=torch.tensor([11], dtype=torch.int32, device="cuda"),
+        out_loc=torch.tensor([9], dtype=torch.int32, device="cuda"),
+        positions=torch.tensor([3], dtype=torch.int32, device="cuda"),
+        rope_positions=None,
+        linear_table_idx=None,
+    )
+    buffer.copy_from(replay_batch)
+    graph.replay()
+    assert result.item() == 3 + 5 + 7 + 11 + 3
+
+    req.input_ids = torch.tensor([13, 17, 19, 23, 29], dtype=torch.int32)
+    req.cached_len = 4
+    replay_batch.input_ids.fill_(29)
+    replay_batch.positions.fill_(4)
+    buffer.copy_from(replay_batch)
+    graph.replay()
+    assert result.item() == 17 + 19 + 23 + 29 + 4
+
+
 def test_worker_enters_engram_collective_at_the_matching_layer_boundary():
     events = []
 

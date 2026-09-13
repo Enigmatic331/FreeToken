@@ -149,6 +149,47 @@ def test_ragged_hash_windows_match_one_shot_across_chunk_boundary():
     assert torch.equal(tail, full[4:])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_graph_hasher_follows_token_position_and_history_inputs():
+    """Every decode-time Engram input must remain dynamic across graph replays."""
+    layout = _layout()
+    hasher = object.__new__(EngramHasher)
+    hasher.layout = layout
+    hasher.pad_id = 2
+    hasher.token_map = torch.arange(256, dtype=torch.int64)
+    hasher.multipliers = compute_hash_multipliers(layout.layer_ids, 4, 99_092)
+    flat = [[p for group in layer for p in group] for layer in layout.primes]
+    hasher.primes = torch.tensor(layout.primes)
+    hasher.offsets = torch.tensor(
+        [[sum(row[:i]) for i in range(len(row))] for row in flat]
+    )
+    hasher.to("cuda")
+
+    input_ids = torch.tensor([99], device="cuda", dtype=torch.int64)
+    positions = torch.tensor([3], device="cuda", dtype=torch.int64)
+    cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    history = torch.tensor([[3, 10, 42]], device="cuda", dtype=torch.int64)
+    # Warm every operation before capture, just as GraphRunner does.
+    hasher.row_ids(input_ids, positions, cu, history)
+    captured = torch.empty((1, len(layout.layer_ids), layout.hashes_per_token),
+                           device="cuda", dtype=torch.int64)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured.copy_(hasher.row_ids(input_ids, positions, cu, history))
+
+    cases = [
+        (7, 4, [10, 42, 99]),
+        (23, 1, [2, 2, 7]),
+    ]
+    for token, position, prefix in cases:
+        input_ids.fill_(token)
+        positions.fill_(position)
+        history.copy_(torch.tensor([prefix], device="cuda"))
+        want = hasher.row_ids(input_ids, positions, cu, history).clone()
+        graph.replay()
+        assert torch.equal(captured, want)
+
+
 def test_ep2_shard_plan_is_exact_and_nonoverlapping():
     plans = [EngramShardPlan.build(384_006_168, 256, rank=r, world_size=2) for r in range(2)]
     assert plans[0].row_start == 0

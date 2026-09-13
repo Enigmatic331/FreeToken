@@ -1153,11 +1153,12 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                     engram_rows=engram_rows,
                 )
         positions = batch.positions.long().view(-1)[: batch.padded_size]
-        if torch.cuda.is_current_stream_capturing():
-            # The capture metadata snapshot is sized to the admitted KV ceiling.
-            # Use that static width so one graph can replay at every live position;
-            # device-side valid counts still mask work beyond the current history.
-            cmp_stage_cap = batch.attn_metadata.stage_width - 1
+        graph_stage_cap = getattr(batch, "dsv41_graph_stage_cap", None)
+        if graph_stage_cap is not None:
+            # GraphRunner chooses a static ceiling whose sparse-attention split
+            # topology matches every live position routed to this graph.  Honor it
+            # in both warmup and capture so Triton compiles before capture begins.
+            cmp_stage_cap = int(graph_stage_cap)
         else:
             cmp_stage_cap = int(positions.max().item())
         with profile_range("DSV41/Batch/Decode"):

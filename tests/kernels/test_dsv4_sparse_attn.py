@@ -186,3 +186,26 @@ def test_cuda_graph_follows_counts(pools, m):
         torch.cuda.synchronize()
         ref = _reference(q, win, cmp, sink, idx, N_WINDOW, scale, counts)
         torch.testing.assert_close(out.float(), ref, **TOL)
+
+
+def test_padding_within_one_split_topology_is_bit_exact(pools):
+    """A position-bucketed graph may pad the index width, but only while its
+    split count matches eager.  In that case the live reduction is bit exact."""
+    win, cmp, sink = pools
+    scale = D ** -0.5
+    q, short_idx, counts = _build(b=1, m=1, n_cmp_cols=24, cmp_valid=[24], seed=19)
+    wide_idx = torch.full(
+        (1, 1, N_WINDOW + 80), -1, dtype=torch.int32, device="cuda"
+    )
+    wide_idx[..., : short_idx.shape[-1]].copy_(short_idx)
+    assert split_count(1, 1, H, short_idx.shape[-1], q.device) == split_count(
+        1, 1, H, wide_idx.shape[-1], q.device
+    )
+
+    eager = sparse_attn_paged(
+        q, win, cmp, sink, short_idx, N_WINDOW, scale, cmp_counts=counts
+    )
+    padded = sparse_attn_paged(
+        q, win, cmp, sink, wide_idx, N_WINDOW, scale, cmp_counts=counts
+    )
+    assert torch.equal(eager, padded)
