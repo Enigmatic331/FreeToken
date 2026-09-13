@@ -60,14 +60,21 @@ def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int | None = None,
+    default_reasoning_effort: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
-    if req.reasoning_effort or thinking_type:
-        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    request_effort = (
+        req.reasoning_effort.strip()
+        if isinstance(req.reasoning_effort, str)
+        else req.reasoning_effort
+    )
+    effective_effort = request_effort or default_reasoning_effort
+    if effective_effort or thinking_type:
+        ctk = effort_toggle_kwargs(effective_effort, ctk, thinking_type=thinking_type)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
@@ -186,6 +193,9 @@ async def handle_chat_completion(
             req,
             model_sampling,
             default_max_tokens=configured_default_max_tokens(state.config),
+            default_reasoning_effort=getattr(
+                state.config, "default_reasoning_effort", None
+            ),
         )
     except ValueError as exc:
         return create_error_response(str(exc))
@@ -683,13 +693,15 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
         profile = await asyncio.to_thread(manager.effort_profile)
     except Exception:  # noqa: BLE001 -- metadata only; the generation path reports real faults
         return None, None
-    from freetoken.tokenizer.effort import effective_efforts
+    from freetoken.tokenizer.effort import effective_efforts, quantize_effort
 
     served = effective_efforts(profile)
     if not served:
         return None, None
     ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
-    return ordered, profile.default
+    configured = getattr(state.config, "default_reasoning_effort", None)
+    default = quantize_effort(configured, profile) if configured else profile.default
+    return ordered, default
 
 
 def _served_model_name(state: Any) -> str:

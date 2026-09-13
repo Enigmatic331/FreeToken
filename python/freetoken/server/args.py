@@ -32,6 +32,10 @@ class ServerArgs(SchedulerConfig):
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
+    # Protocol-level reasoning effort used when a chat request omits one. None preserves the
+    # checkpoint/template default. The tokenizer still projects this onto the vocabulary the
+    # checkpoint actually accepts, and an explicit request value always wins.
+    default_reasoning_effort: str | None = None
     # Report the prefix-cache hit in each response's usage block (OpenAI
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
@@ -356,6 +360,17 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.max_output_tokens,
         help="Default max output tokens for requests that omit one (default 32k).",
+    )
+
+    parser.add_argument(
+        "--default-reasoning-effort",
+        type=lambda value: value.strip().lower(),
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max", "off"),
+        default=ServerArgs.default_reasoning_effort,
+        help=(
+            "Reasoning effort for chat requests that omit one. The checkpoint tokenizer "
+            "maps it onto its supported effort vocabulary; unset preserves the checkpoint default."
+        ),
     )
 
     parser.add_argument(

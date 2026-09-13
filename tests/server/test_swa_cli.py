@@ -16,6 +16,10 @@ def test_swa_full_tokens_ratio_is_exposed_on_the_serve_cli():
     assert _parse("--swa-full-tokens-ratio", "0.28125").swa_full_tokens_ratio == 0.28125
 
 
+def test_default_reasoning_effort_is_exposed_on_the_serve_cli():
+    assert _parse("--default-reasoning-effort", "LOW").default_reasoning_effort == "low"
+
+
 @pytest.mark.parametrize("value", ["0", "-0.1", "1.01", "not-a-number"])
 def test_swa_full_tokens_ratio_rejects_values_outside_open_unit_interval(value: str):
     with pytest.raises(SystemExit):

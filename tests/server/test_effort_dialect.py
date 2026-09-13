@@ -29,12 +29,17 @@ def run(coro):
 
 
 class FakeState:
-    def __init__(self, reasoning_parser: str | None = None) -> None:
+    def __init__(
+        self,
+        reasoning_parser: str | None = None,
+        default_reasoning_effort: str | None = None,
+    ) -> None:
         self.config = SimpleNamespace(
             model_path="/models/unit-model",
             served_model_name="unit-model",
             tool_call_parser="llama3",
             reasoning_parser=reasoning_parser,
+            default_reasoning_effort=default_reasoning_effort,
         )
         self.sent: TokenizeMsg | None = None
 
@@ -99,6 +104,11 @@ def test_explicit_template_kwargs_still_win_wholesale():
     assert ctk == {"enable_thinking": False}
 
 
+def test_enabled_template_kwargs_keep_the_protocol_effort():
+    ctk = effort_toggle_kwargs("low", {"thinking": True})
+    assert ctk == {"thinking": True, "reasoning_effort": "low"}
+
+
 # --------------------------------------------------------------------------- #
 # handle_chat_completion: superset validation and the pre-stream render check.
 # --------------------------------------------------------------------------- #
@@ -156,6 +166,27 @@ def test_empty_effort_is_treated_as_absent():
     )
     assert not isinstance(response, JSONResponse)
     assert state.sent.chat_template_kwargs == {}
+
+
+def test_server_default_effort_is_used_and_an_explicit_request_wins():
+    state = FakeState(reasoning_parser="qwen3", default_reasoning_effort="low")
+    response = run(handle_chat_completion(chat_request(), None, state, {}))
+    assert not isinstance(response, JSONResponse)
+    assert state.sent.chat_template_kwargs == {**ON, "reasoning_effort": "low"}
+
+    state = FakeState(reasoning_parser="qwen3", default_reasoning_effort="low")
+    response = run(
+        handle_chat_completion(chat_request(reasoning_effort="high"), None, state, {})
+    )
+    assert not isinstance(response, JSONResponse)
+    assert state.sent.chat_template_kwargs == {**ON, "reasoning_effort": "high"}
+
+    state = FakeState(reasoning_parser="qwen3", default_reasoning_effort="low")
+    response = run(
+        handle_chat_completion(chat_request(reasoning_effort="off"), None, state, {})
+    )
+    assert not isinstance(response, JSONResponse)
+    assert state.sent.chat_template_kwargs == OFF
 
 
 def test_foreign_thinking_shapes_stay_ignored():
@@ -225,6 +256,21 @@ def test_v1_models_publishes_the_probed_efforts():
     card = _models_payload(state)
     assert card["supported_reasoning_efforts"] == ["xhigh", "medium", "low"]
     assert card["default_reasoning_effort"] == "xhigh"
+
+
+def test_v1_models_publishes_the_configured_default_effort():
+    state = FakeState(default_reasoning_effort="low")
+    state.frontend_tokenizer = lambda: FakeManager(
+        profile=EffortProfile(
+            supported=frozenset({"max", "high", "low"}),
+            default="high",
+            consumes_effort=True,
+            validates=True,
+        )
+    )
+    card = _models_payload(state)
+    assert card["supported_reasoning_efforts"] == ["max", "high", "low"]
+    assert card["default_reasoning_effort"] == "low"
 
 
 def test_v1_models_omits_efforts_without_a_frontend_tokenizer():

@@ -96,14 +96,34 @@ def effort_toggle_kwargs(
     thinking_type: str | None = None,
 ) -> dict:
     """Fold a protocol-level reasoning-effort request into the template kwargs.
-    An explicit thinking-related key wins wholesale; unrelated extras ride along.
+    Explicit template kwargs own the thinking direction and any template-level
+    effort; a separate protocol effort is retained when those kwargs enable
+    thinking but do not provide their own effort. Unrelated extras ride along.
     Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
     effort enables it, forwarded for templates that grade it (quantized against
     the checkpoint's probed vocabulary at render time). ``thinking_type`` is the
     DeepSeek-wire ``thinking: {"type": ...}`` toggle; when present it decides
-    the on/off direction outright, "disabled" winning over any effort."""
+    the on/off direction unless explicit template kwargs already do."""
     ctk = dict(chat_template_kwargs or {})
     if any(key in ctk for key in _THINKING_KWARG_KEYS):
+        # The explicit template kwargs remain authoritative for whether thinking is on or
+        # off, but a separate protocol-level effort still belongs in an enabled template.
+        # This matters for clients that send ``thinking: true`` in chat_template_kwargs and
+        # ``reasoning_effort`` at the OpenAI top level: dropping the latter silently falls
+        # back to the checkpoint's own effort default.
+        explicitly_disabled = (
+            ctk.get("enable_thinking") is False
+            or ctk.get("thinking") is False
+            or str(ctk.get("thinking_mode") or "").lower() in ("chat", "disabled", "off")
+        )
+        normalized = effort.strip().lower() if isinstance(effort, str) else effort
+        if (
+            "reasoning_effort" not in ctk
+            and normalized
+            and normalized not in _DISABLE_EFFORTS
+            and not explicitly_disabled
+        ):
+            ctk["reasoning_effort"] = normalized
         return ctk
     if isinstance(effort, str):
         effort = effort.strip().lower()
