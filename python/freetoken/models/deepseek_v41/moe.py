@@ -11,12 +11,41 @@ from torch import nn
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator
 from freetoken.layers import ExpertParallelOffloadMoELayer
-from freetoken.moe.partition import localize_expert_routes
 
 from .args import DeepseekV41Args
 from .execution import get_execution_plan
 from .layers import Linear
 from .profile import profile_range
+
+
+def _fused_route_prep_enabled() -> bool:
+    return os.getenv("FREETOKEN_DSV41_FUSED_ROUTE_PREP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _prepare_partitioned_routes(
+    weights: torch.Tensor,
+    ids: torch.Tensor,
+    partition,
+    *,
+    fused_cache_safe: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if fused_cache_safe:
+        from freetoken.kernel.triton.dsv41 import fused_localize_cache_safe_routes
+
+        return fused_localize_cache_safe_routes(
+            weights,
+            ids,
+            global_offset=partition.global_offset,
+            local_count=partition.local_count,
+        )
+    from freetoken.moe.partition import localize_expert_routes
+
+    return localize_expert_routes(weights, ids, partition)
 
 
 class Gate(nn.Module):
@@ -134,6 +163,7 @@ class MoE(nn.Module):
         )
         self.experts = RoutedExperts(layer_id, args, self.partition.local_count)
         self.experts.packed_prefill_root = self.execution.backbone_rank
+        self.fused_route_prep = _fused_route_prep_enabled()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.execution.is_expert_worker:
@@ -147,15 +177,30 @@ class MoE(nn.Module):
         if self.execution.uses_authority_transport:
             weights = self._comm.broadcast(weights.float().contiguous(), self.execution.backbone_rank)
             ids = self._comm.broadcast(ids.to(torch.int32).contiguous(), self.execution.backbone_rank)
-        weights, ids = localize_expert_routes(weights, ids, self.partition)
+        fused_cache_safe = (
+            self.fused_route_prep
+            and weights.is_cuda
+            and not get_global_ctx().batch.is_prefill
+        )
+        weights, ids = _prepare_partitioned_routes(
+            weights,
+            ids,
+            self.partition,
+            fused_cache_safe=fused_cache_safe,
+        )
         if not self.execution.tp2_ep2:
             self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         shared = self.shared_experts(hidden)
         if self.execution.tp2_ep2:
             self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
-        routed = self.experts.routed_forward(
-            hidden, weights.float().contiguous(), ids.to(torch.int32).contiguous()
-        )
+        routed_weights = weights.float().contiguous()
+        routed_ids = ids.to(torch.int32).contiguous()
+        if fused_cache_safe:
+            routed = self.experts.routed_decode_cache_safe(
+                hidden, routed_weights, routed_ids
+            )
+        else:
+            routed = self.experts.routed_forward(hidden, routed_weights, routed_ids)
         if self.execution.tp2_ep2 and get_global_ctx().batch.is_prefill:
             if self.execution.rank != self.execution.backbone_rank:
                 routed = torch.empty_like(hidden)
@@ -181,9 +226,26 @@ class MoE(nn.Module):
                 torch.empty(route_shape, dtype=torch.int32, device=device),
                 self.execution.backbone_rank,
             )
-            weights, ids = localize_expert_routes(weights, ids, self.partition)
+            fused_cache_safe = (
+                self.fused_route_prep
+                and weights.is_cuda
+                and not get_global_ctx().batch.is_prefill
+            )
+            weights, ids = _prepare_partitioned_routes(
+                weights,
+                ids,
+                self.partition,
+                fused_cache_safe=fused_cache_safe,
+            )
         with profile_range("DSV41/MoE/WorkerRoutedExpert"):
-            self.experts.routed_forward(hidden, weights.contiguous(), ids.contiguous())
+            if fused_cache_safe:
+                self.experts.routed_decode_cache_safe(
+                    hidden, weights.contiguous(), ids.contiguous()
+                )
+            else:
+                self.experts.routed_forward(
+                    hidden, weights.contiguous(), ids.contiguous()
+                )
 
 
 __all__ = ["Gate", "MoE", "RoutedExperts", "SharedExpert"]

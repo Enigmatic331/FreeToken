@@ -2,12 +2,14 @@
 
 from .engram_gather import engram_gather_rows
 from .fp8_linear import block_fp8_linear_32
+from .route_partition import fused_localize_cache_safe_routes
 from .rope_fp4 import rope_fp4_roundtrip
 from .router import fused_sqrtsoftplus_topk
 
 __all__ = [
     "block_fp8_linear_32",
     "engram_gather_rows",
+    "fused_localize_cache_safe_routes",
     "fused_sqrtsoftplus_topk",
     "rope_fp4_roundtrip",
 ]

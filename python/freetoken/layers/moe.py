@@ -823,6 +823,32 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         routes = self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(routes)
 
+    def routed_decode_cache_safe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode routes whose inactive ids were already made cache-safe.
+
+        DeepSeek-V4.1's fused EP partition kernel combines localization and inactive-id
+        replacement.  Calling the normal EP decode entry point would repeat the latter
+        as a chain of tiny tensor kernels, so this explicit entry point bypasses only
+        that redundant transform and preserves the usual cache/GEMM/reduction path.
+        """
+        if get_global_ctx().batch.is_prefill:
+            raise RuntimeError("cache-safe routed decode is not a prefill entry point")
+        routes = super()._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._maybe_all_reduce(routes)
+
+    def begin_routed_decode_cache_safe(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> RoutedDecodePlan | None:
+        """Queue decode refill for ids already sanitized by fused EP partitioning."""
+        return super().begin_routed_decode(topk_weights, topk_ids)
+
     def _maybe_combine_packed_prefill_routes(
         self,
         routes: torch.Tensor,

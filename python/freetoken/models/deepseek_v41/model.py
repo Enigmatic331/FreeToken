@@ -580,6 +580,9 @@ class MoEState(nn.Module):
         self.decode_refill_overlap = os.getenv(
             "FREETOKEN_DSV41_DECODE_REFILL_OVERLAP", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
+        self.fused_route_prep = os.getenv(
+            "FREETOKEN_DSV41_FUSED_ROUTE_PREP", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def attach_routed_experts(self, layer_id: int, args: DeepseekV41Args) -> None:
         from freetoken.distributed import DistributedCommunicator
@@ -623,10 +626,21 @@ class MoEState(nn.Module):
                 ids = self._comm.broadcast(
                     ids.to(torch.int32).contiguous(), self.execution.backbone_rank
                 )
+        fused_cache_safe = (
+            getattr(self, "fused_route_prep", False)
+            and self.execution.enabled
+            and weights.is_cuda
+            and not get_global_ctx().batch.is_prefill
+        )
         if self.execution.enabled:
-            from freetoken.moe.partition import localize_expert_routes
+            from .moe import _prepare_partitioned_routes
 
-            weights, ids = localize_expert_routes(weights, ids, self.partition)
+            weights, ids = _prepare_partitioned_routes(
+                weights,
+                ids,
+                self.partition,
+                fused_cache_safe=fused_cache_safe,
+            )
         if not self.execution.tp2_ep2:
             with profile_range("DSV41/MoE/PrepareRouted"):
                 self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
@@ -640,9 +654,14 @@ class MoEState(nn.Module):
             and not get_global_ctx().batch.is_prefill
         ):
             with profile_range("DSV41/MoE/DecodeRefillFork"):
-                refill_plan = self.experts.begin_routed_decode(
-                    routed_weights, routed_ids
-                )
+                if fused_cache_safe:
+                    refill_plan = self.experts.begin_routed_decode_cache_safe(
+                        routed_weights, routed_ids
+                    )
+                else:
+                    refill_plan = self.experts.begin_routed_decode(
+                        routed_weights, routed_ids
+                    )
         if not self.execution.attention_tp2_ep2 or (
             self.execution.rank == self.execution.backbone_rank
         ):
@@ -658,9 +677,14 @@ class MoEState(nn.Module):
                 self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         with profile_range("DSV41/MoE/RoutedExpert"):
             if refill_plan is None:
-                routed = self.experts.routed_forward(
-                    hidden, routed_weights, routed_ids
-                )
+                if fused_cache_safe:
+                    routed = self.experts.routed_decode_cache_safe(
+                        hidden, routed_weights, routed_ids
+                    )
+                else:
+                    routed = self.experts.routed_forward(
+                        hidden, routed_weights, routed_ids
+                    )
             else:
                 routed = self.experts.finish_routed_decode(
                     hidden, routed_weights, refill_plan

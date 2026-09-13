@@ -23,6 +23,13 @@ the GEMM. The split is disabled for prefill, CPU/hybrid decode, expert workers,
 and dense-parallel modes. It is CUDA-graph safe but remains opt-in pending
 qualification on each target topology.
 
+Decode route partitioning can be collapsed from the ordinary tensor-operation
+chain into one exact Triton kernel with `FREETOKEN_DSV41_FUSED_ROUTE_PREP=1`.
+The kernel localizes global expert ids, zeros peer-owned weights, and substitutes
+cache-safe ids for inactive routes in one launch. Prefill retains its existing
+sentinel-aware path. This switch is independent of cache hit rate and remains
+opt-in until the target topology passes exact graph-replay and throughput gates.
+
 The fused sqrt-softplus router is likewise retained behind
 `FREETOKEN_DSV41_FUSED_ROUTER=1`. Its standalone CUDA numerical fixture passes,
 but the first full EP2 prefill does not complete, so ordinary serving keeps the
@@ -47,6 +54,7 @@ slower than authority EP; keep it as a profiling/experimentation switch.
 ```bash
 export FREETOKEN_DSV41_CUDA_GRAPH=1
 export FREETOKEN_DSV41_DECODE_REFILL_OVERLAP=1
+export FREETOKEN_DSV41_FUSED_ROUTE_PREP=1
 
 ft serve \
   --model /path/to/DeepSeek-V4.1-Flash \
@@ -73,6 +81,7 @@ geometry:
 ```bash
 export FREETOKEN_DSV41_CUDA_GRAPH=1
 export FREETOKEN_DSV41_DECODE_REFILL_OVERLAP=1
+export FREETOKEN_DSV41_FUSED_ROUTE_PREP=1
 
 ft serve \
   --model /path/to/DeepSeek-V4.1-Flash \
