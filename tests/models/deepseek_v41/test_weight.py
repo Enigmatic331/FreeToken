@@ -107,6 +107,16 @@ def test_official_checkpoint_payload_plan_is_exact():
     assert rank0.tensor_count == rank1.tensor_count == 40 * 192 * 6
     assert rank0.source_bytes == rank1.source_bytes == 144_388_915_200
 
+    rank2 = plan_expert_shard(
+        plan,
+        args,
+        rank=2,
+        world_size=3,
+        shard_counts=(160, 160, 64),
+    )
+    assert (rank2.global_offset, rank2.local_count) == (320, 64)
+    assert rank2.tensor_count == 40 * 64 * 6
+
 
 def test_text_stream_never_materializes_engram_experts_mtp_or_vision(tmp_path):
     tensors = {

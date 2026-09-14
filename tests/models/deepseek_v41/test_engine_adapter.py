@@ -104,6 +104,7 @@ def _engine_config(
     *,
     world_size: int = 2,
     backbone_rank=0,
+    expert_shards: tuple[int, ...] | None = None,
     tp2_ep2: bool = False,
     attention_tp2_ep2: bool = False,
 ) -> ServerArgs:
@@ -116,6 +117,7 @@ def _engine_config(
         moe_backend="offload",
         moe_cache_auto=True,
         dsv41_backbone_rank=backbone_rank,
+        dsv41_expert_shards=expert_shards,
         dsv41_tp2_ep2=tp2_ep2,
         dsv41_attention_tp2_ep2=attention_tp2_ep2,
         max_running_req=4,
@@ -293,12 +295,12 @@ def test_engine_config_can_opt_in_to_ep2_graph_decode(monkeypatch):
         distributed_info._TP_INFO = None
 
 
-def test_engine_config_requires_ep2_and_backbone_rank():
+def test_engine_config_requires_ep_and_backbone_rank():
     from freetoken.engine.engine import _adjust_config
 
     for config, message in (
         (_engine_config(backbone_rank=None), "requires row-sharded Engram/EP"),
-        (_engine_config(world_size=1), "requires --tensor-parallel-size 2"),
+        (_engine_config(world_size=1), "requires --tensor-parallel-size > 1"),
     ):
         try:
             _reset_execution_for_tests()
@@ -309,6 +311,27 @@ def test_engine_config_requires_ep2_and_backbone_rank():
         finally:
             _reset_execution_for_tests()
             distributed_info._TP_INFO = None
+
+
+def test_engine_config_accepts_asymmetric_ep3():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config(world_size=3, expert_shards=(3, 3, 2))
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        plan = configure_execution(
+            config.dsv41_backbone_rank,
+            config.dsv41_expert_shards,
+        )
+        _adjust_config(config)
+        assert plan.partition(8).local_count == 3
+        assert not plan.supports_packed_prefill
+        assert config.model_tp_size == 1
+        assert config.model_config.num_experts == 3
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
 
 
 def test_engram_history_comes_from_tokens_immediately_before_the_forward():

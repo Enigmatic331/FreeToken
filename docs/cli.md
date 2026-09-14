@@ -50,7 +50,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 | `--default-reasoning-effort` | checkpoint default | Named effort or integer 1–100 for chat requests that omit it; this is a model prompt signal, not a hard reasoning-token limit |
 | `--swa-full-tokens-ratio` | model/runtime default | Size the sliding-window KV tier as a fraction of full-token KV capacity |
-| `--dsv41-backbone-rank` | off | DeepSeek-V4.1 heterogeneous EP authority rank; V4.1 currently requires `--tp-size 2 --dsv41-backbone-rank 0` |
+| `--dsv41-backbone-rank` | off | DeepSeek-V4.1 heterogeneous EP authority rank; requires `--tp-size > 1` (the packed-prefill fast path is currently EP2-only) |
 | `--dsv41-expert-shards` | even split | Optional comma-separated rank-local routed-expert counts for DeepSeek-V4.1 EP |
 
 ### Choosing a GPU

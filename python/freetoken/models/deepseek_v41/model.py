@@ -595,7 +595,11 @@ class MoEState(nn.Module):
         self._comm = DistributedCommunicator()
         with self.execution.expert_tp_context():
             self.experts = RoutedExperts(layer_id, args, self.partition.local_count)
-        self.experts.packed_prefill_root = self.execution.backbone_rank
+        self.experts.packed_prefill_root = (
+            self.execution.backbone_rank
+            if self.execution.supports_packed_prefill
+            else None
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.experts is None or self.execution is None:
@@ -1081,7 +1085,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         if not self._execution.enabled:
             raise RuntimeError(
                 "DeepSeek-V4.1 Engram requires heterogeneous EP; pass "
-                "--tensor-parallel-size 2 --dsv41-backbone-rank 0"
+                "--tensor-parallel-size > 1 --dsv41-backbone-rank 0"
             )
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
 

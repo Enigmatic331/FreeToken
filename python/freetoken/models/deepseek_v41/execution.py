@@ -75,6 +75,12 @@ class DeepseekV41ExecutionPlan:
         # Every EP rank owns a row interval even though only one executes dense layers.
         return True
 
+    @property
+    def supports_packed_prefill(self) -> bool:
+        # The optimized point-to-point route gather currently has one peer slot.
+        # Wider EP groups use the exact full-route all-reduce fallback instead.
+        return self.enabled and self.world_size == 2
+
     def partition(self, total_experts: int) -> ExpertPartition:
         return ExpertPartition(
             total_experts,

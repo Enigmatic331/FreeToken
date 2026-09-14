@@ -162,7 +162,11 @@ class MoE(nn.Module):
             None if self.execution.is_expert_worker else SharedExpert(args)
         )
         self.experts = RoutedExperts(layer_id, args, self.partition.local_count)
-        self.experts.packed_prefill_root = self.execution.backbone_rank
+        self.experts.packed_prefill_root = (
+            self.execution.backbone_rank
+            if self.execution.supports_packed_prefill
+            else None
+        )
         self.fused_route_prep = _fused_route_prep_enabled()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

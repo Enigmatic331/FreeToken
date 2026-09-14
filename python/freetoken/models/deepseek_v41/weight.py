@@ -297,12 +297,18 @@ def plan_expert_shard(
     *,
     rank: int,
     world_size: int,
+    shard_counts: tuple[int, ...] | None = None,
 ) -> ExpertShardPlan:
     """Select the exact contiguous main-model expert interval owned by one EP rank."""
 
     from freetoken.moe.partition import ExpertPartition
 
-    partition = ExpertPartition(args.n_routed_experts, world_size=world_size, rank=rank)
+    partition = ExpertPartition(
+        args.n_routed_experts,
+        world_size=world_size,
+        rank=rank,
+        shard_counts=shard_counts,
+    )
     selected = []
     for tensor in checkpoint.tensors:
         match = _EXPERT_RE.match(tensor.name)
@@ -487,6 +493,7 @@ def load_dsfp4_expert_sources(
     *,
     rank: int,
     world_size: int,
+    shard_counts: tuple[int, ...] | None = None,
     layer_sink=None,
 ) -> dict[str, list[torch.Tensor]]:
     """Load only one rank's main-model FP4 experts into per-layer host banks.
@@ -498,7 +505,13 @@ def load_dsfp4_expert_sources(
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
-    shard = plan_expert_shard(inspect_checkpoint(model_path), args, rank=rank, world_size=world_size)
+    shard = plan_expert_shard(
+        inspect_checkpoint(model_path),
+        args,
+        rank=rank,
+        world_size=world_size,
+        shard_counts=shard_counts,
+    )
     host_banks = alloc_layer_banks(_expert_specs(args, shard.local_count), args.n_layers)
     banks = {name: [bank.tensor for bank in per_layer] for name, per_layer in host_banks.items()}
     by_file: dict[str, list[TensorInfo]] = defaultdict(list)
@@ -547,7 +560,7 @@ def setup_offload_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
 ):
-    """Model-owned rank-local DS-FP4 bank provider for the EP2 topology."""
+    """Model-owned rank-local DS-FP4 bank provider for an EP topology."""
 
     if parallel:
         raise NotImplementedError(
@@ -574,6 +587,7 @@ def setup_offload_expert_banks(
             args,
             rank=partition.rank,
             world_size=partition.world_size,
+            shard_counts=partition.shard_counts,
             layer_sink=layer_sink,
         )
     return ExpertBanks(

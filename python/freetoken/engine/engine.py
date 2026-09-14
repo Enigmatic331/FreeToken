@@ -1457,17 +1457,17 @@ def _adjust_config(config: EngineConfig):
     if dsv41_args is not None and dsv41_backbone_rank is None:
         raise ValueError(
             "DeepSeek-V4.1 requires row-sharded Engram/EP execution; pass "
-            "--tensor-parallel-size 2 --dsv41-backbone-rank 0"
+            "--tensor-parallel-size > 1 --dsv41-backbone-rank 0"
         )
     if dsv41_backbone_rank is not None:
         if dsv41_args is None:
             raise ValueError(
                 "--dsv41-backbone-rank is valid only for DeepSeek-V4.1-Flash"
             )
-        if tp_info is None or tp_info.size != 2:
+        if tp_info is None or tp_info.size <= 1:
             raise ValueError(
-                "DeepSeek-V4.1 heterogeneous EP currently requires "
-                "--tensor-parallel-size 2"
+                "DeepSeek-V4.1 heterogeneous EP requires "
+                "--tensor-parallel-size > 1"
             )
         if not 0 <= dsv41_backbone_rank < tp_info.size:
             raise ValueError(
