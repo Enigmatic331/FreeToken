@@ -302,6 +302,20 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Phase-aware EP may store a superset of the experts it owns during
+        # prefill. Copy only that contiguous local interval into the prefill
+        # double buffer; decode continues to address the full stored range.
+        self.prefill_expert_start = 0
+        self.prefill_expert_count = self.num_experts
+
+    def set_prefill_expert_range(self, start: int, count: int) -> None:
+        if start < 0 or count < 0 or start + count > self.num_experts:
+            raise ValueError(
+                f"prefill expert range [{start}, {start + count}) is outside "
+                f"stored experts [0, {self.num_experts})"
+            )
+        self.prefill_expert_start = int(start)
+        self.prefill_expert_count = int(count)
 
     def set_bank_sources(
         self,
@@ -669,8 +683,12 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
+            start = self.prefill_expert_start
+            stop = start + self.prefill_expert_count
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                buffer[buffer_id, start:stop].copy_(
+                    per_layer[layer_id][start:stop], non_blocking=True
+                )
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)

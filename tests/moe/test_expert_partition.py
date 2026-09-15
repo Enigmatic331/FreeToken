@@ -18,8 +18,10 @@ from freetoken.models.qwen4_exp import execution
 from freetoken.models.qwen4_exp.execution import Qwen4ExpExecutionPlan
 from freetoken.moe.partition import (
     ExpertPartition,
+    ExpertStorageRange,
     cache_safe_route_ids,
     localize_expert_routes,
+    localize_expert_routes_to_storage,
 )
 
 
@@ -155,6 +157,30 @@ def test_heterogeneous_partition_validation():
     assert (partition.global_offset, partition.global_stop) == (0, 96)
     with pytest.raises(ValueError, match="must sum"):
         ExpertPartition(512, world_size=2, rank=0, shard_counts=(100, 400))
+
+
+def test_phase_ownership_localizes_into_overlapping_storage():
+    ownership = ExpertPartition(8, world_size=3, rank=1, shard_counts=(4, 4, 0))
+    storage = ExpertStorageRange(8, global_offset=3, local_count=5)
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+    indices = torch.tensor([[3, 4, 7, 1]])
+    local_weights, local_ids = localize_expert_routes_to_storage(
+        weights, indices, ownership, storage
+    )
+    assert torch.equal(local_weights, torch.tensor([[0.0, 0.2, 0.3, 0.0]]))
+    assert torch.equal(local_ids, torch.tensor([[5, 1, 4, 5]]))
+
+
+def test_phase_ownership_cache_safe_ids_use_the_storage_origin():
+    ownership = ExpertPartition(8, world_size=3, rank=1, shard_counts=(4, 4, 0))
+    storage = ExpertStorageRange(8, global_offset=3, local_count=5)
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+    indices = torch.tensor([[3, 4, 7, 1]])
+    local_weights, local_ids = localize_expert_routes_to_storage(
+        weights, indices, ownership, storage
+    )
+    safe_ids = cache_safe_route_ids(local_weights, local_ids)
+    assert torch.equal(safe_ids, torch.tensor([[1, 1, 4, 1]]))
 
 
 def test_qwen_fp8_loader_uses_rank_local_partition(monkeypatch):

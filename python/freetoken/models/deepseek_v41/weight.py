@@ -298,17 +298,26 @@ def plan_expert_shard(
     rank: int,
     world_size: int,
     shard_counts: tuple[int, ...] | None = None,
+    storage_range: tuple[int, int] | None = None,
 ) -> ExpertShardPlan:
     """Select the exact contiguous main-model expert interval owned by one EP rank."""
 
-    from freetoken.moe.partition import ExpertPartition
+    from freetoken.moe.partition import ExpertPartition, ExpertStorageRange
 
-    partition = ExpertPartition(
-        args.n_routed_experts,
-        world_size=world_size,
-        rank=rank,
-        shard_counts=shard_counts,
-    )
+    if storage_range is None:
+        partition = ExpertPartition(
+            args.n_routed_experts,
+            world_size=world_size,
+            rank=rank,
+            shard_counts=shard_counts,
+        )
+        storage = ExpertStorageRange(
+            args.n_routed_experts,
+            partition.global_offset,
+            partition.local_count,
+        )
+    else:
+        storage = ExpertStorageRange(args.n_routed_experts, *storage_range)
     selected = []
     for tensor in checkpoint.tensors:
         match = _EXPERT_RE.match(tensor.name)
@@ -316,16 +325,16 @@ def plan_expert_shard(
             continue
         layer = int(match.group("layer"))
         expert = int(match.group("expert"))
-        if layer < args.n_layers and partition.owns(expert):
+        if layer < args.n_layers and storage.owns(expert):
             selected.append(tensor)
-    expected = args.n_layers * partition.local_count * 6
+    expected = args.n_layers * storage.local_count * 6
     if len(selected) != expected:
         raise ValueError(f"expert shard has {len(selected)} tensors, expected {expected}")
     return ExpertShardPlan(
         rank=rank,
         world_size=world_size,
-        global_offset=partition.global_offset,
-        local_count=partition.local_count,
+        global_offset=storage.global_offset,
+        local_count=storage.local_count,
         tensors=tuple(selected),
     )
 
@@ -494,6 +503,7 @@ def load_dsfp4_expert_sources(
     rank: int,
     world_size: int,
     shard_counts: tuple[int, ...] | None = None,
+    storage_range: tuple[int, int] | None = None,
     layer_sink=None,
 ) -> dict[str, list[torch.Tensor]]:
     """Load only one rank's main-model FP4 experts into per-layer host banks.
@@ -511,6 +521,7 @@ def load_dsfp4_expert_sources(
         rank=rank,
         world_size=world_size,
         shard_counts=shard_counts,
+        storage_range=storage_range,
     )
     host_banks = alloc_layer_banks(_expert_specs(args, shard.local_count), args.n_layers)
     banks = {name: [bank.tensor for bank in per_layer] for name, per_layer in host_banks.items()}
@@ -574,20 +585,20 @@ def setup_offload_expert_banks(
 
     args = model_config.dsv41_args
     execution = get_execution_plan()
-    partition = execution.partition(args.n_routed_experts)
+    storage = execution.storage_partition(args.n_routed_experts)
     if dummy:
         from freetoken.models.deepseek_v4.weight import dummy_dsfp4_expert_sources
 
         banks = dummy_dsfp4_expert_sources(
-            replace(args, n_routed_experts=partition.local_count)
+            replace(args, n_routed_experts=storage.local_count)
         )
     else:
         banks = load_dsfp4_expert_sources(
             model_path,
             args,
-            rank=partition.rank,
-            world_size=partition.world_size,
-            shard_counts=partition.shard_counts,
+            rank=execution.rank,
+            world_size=execution.world_size,
+            storage_range=(storage.global_offset, storage.local_count),
             layer_sink=layer_sink,
         )
     return ExpertBanks(

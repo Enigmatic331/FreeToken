@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from freetoken.attention.base import BaseAttnBackend
 from freetoken.distributed import get_tp_info, override_tp_info
-from freetoken.moe.partition import ExpertPartition
+from freetoken.moe.partition import ExpertPartition, ExpertStorageRange
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +16,9 @@ class DeepseekV41ExecutionPlan:
     world_size: int
     backbone_rank: int | None = None
     expert_shards: tuple[int, ...] | None = None
+    prefill_expert_shards: tuple[int, ...] | None = None
+    expert_storage_ranges: tuple[tuple[int, int], ...] | None = None
+    engram_ranks: tuple[int, ...] | None = None
     tp2_ep2: bool = False
     attention_tp2_ep2: bool = False
 
@@ -41,6 +44,62 @@ class DeepseekV41ExecutionPlan:
             object.__setattr__(self, "expert_shards", shards)
             if len(shards) != self.world_size:
                 raise ValueError("expert_shards must have one entry per rank")
+        if self.prefill_expert_shards is not None:
+            shards = tuple(self.prefill_expert_shards)
+            object.__setattr__(self, "prefill_expert_shards", shards)
+            if len(shards) != self.world_size:
+                raise ValueError("prefill_expert_shards must have one entry per rank")
+            if any(count < 0 for count in shards):
+                raise ValueError("prefill_expert_shards must be non-negative")
+        if self.expert_storage_ranges is not None:
+            ranges = tuple(tuple(item) for item in self.expert_storage_ranges)
+            object.__setattr__(self, "expert_storage_ranges", ranges)
+            if len(ranges) != self.world_size:
+                raise ValueError("expert_storage_ranges must have one range per rank")
+            if any(
+                len(item) != 2 or any(value < 0 for value in item)
+                for item in ranges
+            ):
+                raise ValueError(
+                    "expert_storage_ranges must contain non-negative offset/count pairs"
+                )
+        if (self.prefill_expert_shards is None) != (
+            self.expert_storage_ranges is None
+        ):
+            raise ValueError(
+                "prefill_expert_shards and expert_storage_ranges must be set together"
+            )
+        if self.phase_aware and self.backbone_rank is None:
+            raise ValueError("phase-aware V4.1 EP requires a backbone rank")
+        if self.phase_aware and self.dense_parallel:
+            raise ValueError("phase-aware V4.1 EP requires an authority backbone")
+        if self.phase_aware and self.prefill_expert_shards[self.backbone_rank] == 0:
+            raise ValueError("the backbone rank must participate in prefill")
+        if self.phase_aware and len(self.prefill_active_ranks) != 2:
+            raise ValueError(
+                "phase-aware V4.1 currently requires exactly two active prefill ranks"
+            )
+        if self.engram_ranks is not None:
+            ranks = tuple(self.engram_ranks)
+            object.__setattr__(self, "engram_ranks", ranks)
+            if self.backbone_rank is None:
+                raise ValueError("engram_ranks requires a backbone rank")
+            if not ranks:
+                raise ValueError("engram_ranks must not be empty")
+            if len(set(ranks)) != len(ranks):
+                raise ValueError("engram_ranks must not contain duplicates")
+            if any(rank < 0 or rank >= self.world_size for rank in ranks):
+                raise ValueError("engram_ranks contains a rank outside the EP world")
+            if self.backbone_rank not in ranks:
+                raise ValueError("engram_ranks must include the backbone rank")
+            if self.dense_parallel and set(ranks) != set(range(self.world_size)):
+                raise ValueError("dense-parallel V4.1 requires Engram on every rank")
+            if self.phase_aware and not set(ranks).issubset(
+                self.prefill_active_ranks
+            ):
+                raise ValueError(
+                    "Engram ranks must participate in phase-aware prefill"
+                )
 
     @property
     def enabled(self) -> bool:
@@ -72,22 +131,87 @@ class DeepseekV41ExecutionPlan:
 
     @property
     def participates_in_engram(self) -> bool:
-        # Every EP rank owns a row interval even though only one executes dense layers.
-        return True
+        return self.rank in self.resolved_engram_ranks
+
+    @property
+    def phase_aware(self) -> bool:
+        return self.prefill_expert_shards is not None
+
+    @property
+    def participates_in_prefill(self) -> bool:
+        return (
+            not self.phase_aware
+            or self.prefill_expert_shards[self.rank] > 0
+        )
+
+    @property
+    def prefill_active_ranks(self) -> tuple[int, ...]:
+        if not self.phase_aware:
+            return tuple(range(self.world_size))
+        return tuple(
+            rank
+            for rank, count in enumerate(self.prefill_expert_shards)
+            if count > 0
+        )
+
+    @property
+    def resolved_engram_ranks(self) -> tuple[int, ...]:
+        return self.engram_ranks or tuple(range(self.world_size))
+
+    @property
+    def engram_rank(self) -> int:
+        if not self.participates_in_engram:
+            raise RuntimeError(f"rank {self.rank} does not participate in Engram")
+        return self.resolved_engram_ranks.index(self.rank)
+
+    @property
+    def engram_world_size(self) -> int:
+        return len(self.resolved_engram_ranks)
 
     @property
     def supports_packed_prefill(self) -> bool:
-        # The optimized point-to-point route gather currently has one peer slot.
-        # Wider EP groups use the exact full-route all-reduce fallback instead.
-        return self.enabled and self.world_size == 2
+        # The optimized point-to-point route gather has one active peer slot.
+        # Phase-aware EP may therefore use it in a wider world if exactly two
+        # ranks own prefill experts and the remaining ranks rejoin afterwards.
+        return self.enabled and len(self.prefill_active_ranks) == 2
 
-    def partition(self, total_experts: int) -> ExpertPartition:
+    def partition(
+        self, total_experts: int, *, prefill: bool = False
+    ) -> ExpertPartition:
+        shards = (
+            self.prefill_expert_shards
+            if prefill and self.phase_aware
+            else self.expert_shards
+        )
         return ExpertPartition(
             total_experts,
             world_size=self.world_size if self.enabled else 1,
             rank=self.rank if self.enabled else 0,
-            shard_counts=self.expert_shards if self.enabled else None,
+            shard_counts=shards if self.enabled else None,
         )
+
+    def storage_partition(self, total_experts: int) -> ExpertStorageRange:
+        if not self.enabled or self.expert_storage_ranges is None:
+            owned = self.partition(total_experts)
+            return ExpertStorageRange(
+                total_experts, owned.global_offset, owned.local_count
+            )
+        offset, count = self.expert_storage_ranges[self.rank]
+        storage = ExpertStorageRange(total_experts, offset, count)
+        for phase, owned in (
+            ("prefill", self.partition(total_experts, prefill=True)),
+            ("decode", self.partition(total_experts)),
+        ):
+            if not (
+                storage.global_offset <= owned.global_offset
+                and owned.global_stop <= storage.global_stop
+            ):
+                raise ValueError(
+                    f"rank {self.rank} {phase} ownership "
+                    f"[{owned.global_offset}, {owned.global_stop}) is not contained in "
+                    f"storage [{storage.global_offset}, {storage.global_stop})"
+                )
+        return storage
 
     def model_tp_context(self):
         # Dense weights are whole on the authority; workers build only local expert shells.
@@ -124,18 +248,24 @@ _PLAN: DeepseekV41ExecutionPlan | None = None
 def configure_execution(
     backbone_rank: int | None,
     expert_shards: tuple[int, ...] | None = None,
+    prefill_expert_shards: tuple[int, ...] | None = None,
+    expert_storage_ranges: tuple[tuple[int, int], ...] | None = None,
+    engram_ranks: tuple[int, ...] | None = None,
     tp2_ep2: bool = False,
     attention_tp2_ep2: bool = False,
 ) -> DeepseekV41ExecutionPlan:
     global _PLAN
     info = get_tp_info()
     plan = DeepseekV41ExecutionPlan(
-        info.rank,
-        info.size,
-        backbone_rank,
-        expert_shards,
-        tp2_ep2,
-        attention_tp2_ep2,
+        rank=info.rank,
+        world_size=info.size,
+        backbone_rank=backbone_rank,
+        expert_shards=expert_shards,
+        prefill_expert_shards=prefill_expert_shards,
+        expert_storage_ranges=expert_storage_ranges,
+        engram_ranks=engram_ranks,
+        tp2_ep2=tp2_ep2,
+        attention_tp2_ep2=attention_tp2_ep2,
     )
     if _PLAN is not None and _PLAN != plan:
         raise RuntimeError(f"V4.1 execution already configured as {_PLAN}, got {plan}")

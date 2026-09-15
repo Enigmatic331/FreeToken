@@ -87,6 +87,15 @@ class EngineConfig:
     # backbone; every rank owns a routed-expert shard and an Engram row shard.
     dsv41_backbone_rank: int | None = None
     dsv41_expert_shards: tuple[int, ...] | None = None
+    # Phase-aware heterogeneous EP: prefill ownership may exclude auxiliary
+    # ranks, while overlapping storage ranges retain both prefill and decode
+    # ownership locally. Both options must be supplied together.
+    dsv41_prefill_expert_shards: tuple[int, ...] | None = None
+    dsv41_expert_storage_ranges: tuple[tuple[int, int], ...] | None = None
+    # Optional subset of global EP ranks that owns and reduces Engram rows. This
+    # lets heterogeneous workers contribute experts without forcing their GPU
+    # architecture into the Engram path. The backbone rank must be included.
+    dsv41_engram_ranks: tuple[int, ...] | None = None
     # Experimental hybrid topology: both ranks execute a TP2 dense backbone
     # while retaining EP2 routed experts and row-sharded Engram tables.
     dsv41_tp2_ep2: bool = False

@@ -740,6 +740,18 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     skip_inactive_prefill_routes = _EP_SKIP_INACTIVE_PREFILL_ROUTES
     compact_inactive_prefill_routes = _EP_COMPACT_INACTIVE_PREFILL_ROUTES
 
+    def _packed_prefill_peer(self) -> int:
+        root = getattr(self, "packed_prefill_root", None)
+        info = get_tp_info()
+        peer = getattr(self, "packed_prefill_peer_rank", None)
+        if peer is not None:
+            return int(peer)
+        if root is not None and info.size == 2:
+            return 1 - root
+        raise RuntimeError(
+            "packed prefill needs exactly one configured active peer"
+        )
+
     def prepare_packed_prefill_receive(
         self,
         local_topk_weights: torch.Tensor,
@@ -754,8 +766,6 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             or not _EP_PACKED_PREFILL_OVERLAP
         ):
             return
-        if info.size != 2:
-            raise RuntimeError("packed prefill routes currently require exactly two EP ranks")
         if getattr(self, "_packed_prefill_pending", None) is not None:
             raise RuntimeError("packed prefill receive already pending")
 
@@ -792,8 +802,8 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                 # The native NCCL wrapper has no FP8/uint8 datatype mapping. Four
                 # E4M3 values are therefore carried losslessly as one int32 word.
                 communicator = DistributedCommunicator()
-                communicator.recv(scale, 1 - root)
-                communicator.recv(packed, 1 - root)
+                communicator.recv(scale, self._packed_prefill_peer())
+                communicator.recv(packed, self._packed_prefill_peer())
         else:
             scale = None
             packed = torch.empty(
@@ -802,7 +812,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                 device=local_topk_weights.device,
             )
             with torch.cuda.stream(recv_stream):
-                DistributedCommunicator().recv(packed, 1 - root)
+                DistributedCommunicator().recv(packed, self._packed_prefill_peer())
         self._packed_prefill_pending = (remote_indices, packed, scale, recv_stream)
 
     def routed_forward(
@@ -859,8 +869,6 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             return self._maybe_all_reduce(routes)
 
         info = get_tp_info()
-        if info.size != 2:
-            raise RuntimeError("packed prefill routes currently require exactly two EP ranks")
         if routes.ndim != 3:
             raise RuntimeError(f"expected per-route outputs, got shape {tuple(routes.shape)}")
         if routes.shape[:2] != local_topk_weights.shape:
@@ -903,7 +911,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
             if remote_indices.numel() != 0:
                 packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
-                communicator.recv(packed, 1 - root)
+                communicator.recv(packed, self._packed_prefill_peer())
                 flat_routes.index_copy_(0, remote_indices, packed)
 
         from freetoken.kernel import moe_sum_reduce_triton

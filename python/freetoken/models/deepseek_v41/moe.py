@@ -30,22 +30,40 @@ def _fused_route_prep_enabled() -> bool:
 def _prepare_partitioned_routes(
     weights: torch.Tensor,
     ids: torch.Tensor,
-    partition,
+    ownership,
     *,
     fused_cache_safe: bool,
+    storage=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if fused_cache_safe:
-        from freetoken.kernel.triton.dsv41 import fused_localize_cache_safe_routes
+        if storage is None or storage.global_offset == ownership.global_offset:
+            from freetoken.kernel.triton.dsv41 import fused_localize_cache_safe_routes
 
-        return fused_localize_cache_safe_routes(
-            weights,
-            ids,
-            global_offset=partition.global_offset,
-            local_count=partition.local_count,
+            return fused_localize_cache_safe_routes(
+                weights,
+                ids,
+                global_offset=ownership.global_offset,
+                local_count=ownership.local_count,
+            )
+        # The fused kernel indexes from the ownership offset. If storage starts
+        # earlier, preserve the cache-safe contract through the exact composed
+        # path instead of returning ids relative to the wrong origin.
+        from freetoken.moe.partition import (
+            cache_safe_route_ids,
+            localize_expert_routes_to_storage,
         )
+
+        weights, ids = localize_expert_routes_to_storage(
+            weights, ids, ownership, storage
+        )
+        return weights, cache_safe_route_ids(weights, ids)
+    if storage is not None:
+        from freetoken.moe.partition import localize_expert_routes_to_storage
+
+        return localize_expert_routes_to_storage(weights, ids, ownership, storage)
     from freetoken.moe.partition import localize_expert_routes
 
-    return localize_expert_routes(weights, ids, partition)
+    return localize_expert_routes(weights, ids, ownership)
 
 
 class Gate(nn.Module):
@@ -155,19 +173,48 @@ class MoE(nn.Module):
         super().__init__()
         self.dim = args.dim
         self.execution = get_execution_plan()
-        self.partition = self.execution.partition(args.n_routed_experts)
+        self.decode_partition = self.execution.partition(args.n_routed_experts)
+        self.prefill_partition = self.execution.partition(
+            args.n_routed_experts, prefill=True
+        )
+        self.partition = self.decode_partition
+        self.storage = self.execution.storage_partition(args.n_routed_experts)
         self._comm = DistributedCommunicator()
         self.gate = None if self.execution.is_expert_worker else Gate(args)
         self.shared_experts = (
             None if self.execution.is_expert_worker else SharedExpert(args)
         )
-        self.experts = RoutedExperts(layer_id, args, self.partition.local_count)
+        self.experts = RoutedExperts(layer_id, args, self.storage.local_count)
         self.experts.packed_prefill_root = (
             self.execution.backbone_rank
             if self.execution.supports_packed_prefill
             else None
         )
+        if self.execution.supports_packed_prefill:
+            peers = tuple(
+                rank
+                for rank in self.execution.prefill_active_ranks
+                if rank != self.execution.backbone_rank
+            )
+            if len(peers) != 1:
+                raise RuntimeError("packed prefill requires exactly one active peer")
+            self.experts.packed_prefill_peer_rank = peers[0]
         self.fused_route_prep = _fused_route_prep_enabled()
+
+    def _phase_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
+        root = self.execution.backbone_rank
+        assert root is not None
+        batch = get_global_ctx().batch
+        if not batch.is_prefill or not self.execution.phase_aware:
+            return self._comm.broadcast(tensor, root)
+        if self.execution.rank == root:
+            for peer in self.execution.prefill_active_ranks:
+                if peer != root:
+                    self._comm.send(tensor, peer)
+            return tensor
+        if self.execution.participates_in_prefill:
+            return self._comm.recv(tensor, root)
+        raise RuntimeError("inactive prefill rank attempted a phase broadcast")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.execution.is_expert_worker:
@@ -175,22 +222,28 @@ class MoE(nn.Module):
         shape = x.shape
         hidden = x.view(-1, self.dim)
         if self.execution.uses_authority_transport:
-            hidden = self._comm.broadcast(hidden.contiguous(), self.execution.backbone_rank)
+            hidden = self._phase_broadcast(hidden.contiguous())
         assert self.gate is not None and self.shared_experts is not None
         weights, ids = self.gate(hidden)
         if self.execution.uses_authority_transport:
-            weights = self._comm.broadcast(weights.float().contiguous(), self.execution.backbone_rank)
-            ids = self._comm.broadcast(ids.to(torch.int32).contiguous(), self.execution.backbone_rank)
+            weights = self._phase_broadcast(weights.float().contiguous())
+            ids = self._phase_broadcast(ids.to(torch.int32).contiguous())
         fused_cache_safe = (
             self.fused_route_prep
             and weights.is_cuda
             and not get_global_ctx().batch.is_prefill
         )
+        ownership = (
+            self.prefill_partition
+            if get_global_ctx().batch.is_prefill
+            else self.decode_partition
+        )
         weights, ids = _prepare_partitioned_routes(
             weights,
             ids,
-            self.partition,
+            ownership,
             fused_cache_safe=fused_cache_safe,
+            storage=self.storage,
         )
         if not self.execution.tp2_ep2:
             self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
@@ -217,29 +270,32 @@ class MoE(nn.Module):
         if not self.execution.is_expert_worker:
             raise RuntimeError("worker_forward is valid only on an expert worker")
         with profile_range("DSV41/EP/WorkerReceive"):
-            hidden = self._comm.broadcast(
-                torch.empty(hidden_shape, dtype=torch.bfloat16, device=device),
-                self.execution.backbone_rank,
+            hidden = self._phase_broadcast(
+                torch.empty(hidden_shape, dtype=torch.bfloat16, device=device)
             ).view(-1, self.dim)
             route_shape = (hidden.shape[0], self.experts.top_k)
-            weights = self._comm.broadcast(
-                torch.empty(route_shape, dtype=torch.float32, device=device),
-                self.execution.backbone_rank,
+            weights = self._phase_broadcast(
+                torch.empty(route_shape, dtype=torch.float32, device=device)
             )
-            ids = self._comm.broadcast(
-                torch.empty(route_shape, dtype=torch.int32, device=device),
-                self.execution.backbone_rank,
+            ids = self._phase_broadcast(
+                torch.empty(route_shape, dtype=torch.int32, device=device)
             )
             fused_cache_safe = (
                 self.fused_route_prep
                 and weights.is_cuda
                 and not get_global_ctx().batch.is_prefill
             )
+            ownership = (
+                self.prefill_partition
+                if get_global_ctx().batch.is_prefill
+                else self.decode_partition
+            )
             weights, ids = _prepare_partitioned_routes(
                 weights,
                 ids,
-                self.partition,
+                ownership,
                 fused_cache_safe=fused_cache_safe,
+                storage=self.storage,
             )
         with profile_range("DSV41/MoE/WorkerRoutedExpert"):
             if fused_cache_safe:

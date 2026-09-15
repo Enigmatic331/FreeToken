@@ -3,14 +3,33 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from freetoken.distributed import DistributedCommunicator
 
 from .engram import EngramHostTable
 from .execution import DeepseekV41ExecutionPlan, get_execution_plan
 from .profile import profile_range
+
+
+@dataclass
+class TorchProcessGroupCommunicator:
+    """The Engram collective surface restricted to one NCCL process group."""
+
+    group: dist.ProcessGroup
+
+    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        if dist.get_world_size(self.group) > 1:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.group)
+        return tensor
+
+    def broadcast(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
+        if dist.get_world_size(self.group) > 1:
+            dist.broadcast(tensor, src=src, group=self.group)
+        return tensor
 
 
 class EngramCoordinator:
@@ -42,7 +61,9 @@ class EngramCoordinator:
     def authority_lookup(self, layer_id: int, row_ids: torch.Tensor) -> torch.Tensor:
         if not self.execution.is_backbone:
             raise RuntimeError("authority_lookup called on a V4.1 expert worker")
-        if self.execution.enabled:
+        if not self.execution.participates_in_engram:
+            raise RuntimeError("the V4.1 backbone must participate in Engram")
+        if self.execution.engram_world_size > 1:
             # The native NCCL bridge used by DistributedCommunicator does not
             # register an int64 datatype.  V4.1's largest Engram row id is only
             # ~384M, so int32 is an exact wire representation and is also what
@@ -53,7 +74,7 @@ class EngramCoordinator:
                 )
         return self._table(layer_id).lookup(
             row_ids,
-            reduce=self.execution.enabled,
+            reduce=self.execution.engram_world_size > 1,
             communicator=self.communicator,
         )
 
@@ -67,6 +88,8 @@ class EngramCoordinator:
     ) -> None:
         if not self.execution.is_expert_worker:
             raise RuntimeError("worker_lookup called on the V4.1 backbone authority")
+        if not self.execution.participates_in_engram:
+            raise RuntimeError("worker_lookup called on a non-Engram V4.1 rank")
         row_ids = torch.empty(
             (num_tokens, hashes_per_token), dtype=torch.int32, device=device
         )
@@ -79,4 +102,4 @@ class EngramCoordinator:
         )
 
 
-__all__ = ["EngramCoordinator"]
+__all__ = ["EngramCoordinator", "TorchProcessGroupCommunicator"]

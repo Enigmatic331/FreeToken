@@ -352,10 +352,13 @@ class Engine:
             from freetoken.models.deepseek_v41.execution import configure_execution
 
             self._dsv41_plan = configure_execution(
-                config.dsv41_backbone_rank,
-                config.dsv41_expert_shards,
-                config.dsv41_tp2_ep2,
-                config.dsv41_attention_tp2_ep2,
+                backbone_rank=config.dsv41_backbone_rank,
+                expert_shards=config.dsv41_expert_shards,
+                prefill_expert_shards=config.dsv41_prefill_expert_shards,
+                expert_storage_ranges=config.dsv41_expert_storage_ranges,
+                engram_ranks=config.dsv41_engram_ranks,
+                tp2_ep2=config.dsv41_tp2_ep2,
+                attention_tp2_ep2=config.dsv41_attention_tp2_ep2,
             )
             self._execution_plan = self._dsv41_plan
         else:
@@ -754,6 +757,23 @@ class Engine:
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            if (
+                self._dsv41_plan is not None
+                and self._dsv41_plan.phase_aware
+            ):
+                total_experts = config.model_config.dsv41_args.n_routed_experts
+                storage = self._dsv41_plan.storage_partition(total_experts)
+                prefill = self._dsv41_plan.partition(total_experts, prefill=True)
+                cache.set_prefill_expert_range(
+                    prefill.global_offset - storage.global_offset,
+                    prefill.local_count,
+                )
+                logger.info(
+                    "DeepSeek-V4.1 phase-aware EP rank=%d prefill local storage=[%d,%d)",
+                    config.tp_info.rank,
+                    prefill.global_offset - storage.global_offset,
+                    prefill.global_stop - storage.global_offset,
+                )
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -1398,6 +1418,13 @@ def _adjust_config(config: EngineConfig):
     qwen_expert_shards = getattr(config, "qwen4_exp_expert_shards", None)
     dsv41_backbone_rank = getattr(config, "dsv41_backbone_rank", None)
     dsv41_expert_shards = getattr(config, "dsv41_expert_shards", None)
+    dsv41_prefill_expert_shards = getattr(
+        config, "dsv41_prefill_expert_shards", None
+    )
+    dsv41_expert_storage_ranges = getattr(
+        config, "dsv41_expert_storage_ranges", None
+    )
+    dsv41_engram_ranks = getattr(config, "dsv41_engram_ranks", None)
     dsv41_tp2_ep2 = getattr(config, "dsv41_tp2_ep2", False)
     dsv41_attention_tp2_ep2 = getattr(config, "dsv41_attention_tp2_ep2", False)
     moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
@@ -1444,6 +1471,15 @@ def _adjust_config(config: EngineConfig):
 
     if dsv41_expert_shards is not None and dsv41_backbone_rank is None:
         raise ValueError("--dsv41-expert-shards requires --dsv41-backbone-rank")
+    if dsv41_engram_ranks is not None and dsv41_backbone_rank is None:
+        raise ValueError("--dsv41-engram-ranks requires --dsv41-backbone-rank")
+    if (dsv41_prefill_expert_shards is None) != (
+        dsv41_expert_storage_ranges is None
+    ):
+        raise ValueError(
+            "--dsv41-prefill-expert-shards and "
+            "--dsv41-expert-storage-ranges must be set together"
+        )
     if dsv41_tp2_ep2 and dsv41_backbone_rank is None:
         raise ValueError("--dsv41-tp2-ep2 requires --dsv41-backbone-rank")
     if dsv41_attention_tp2_ep2 and dsv41_backbone_rank is None:
@@ -1480,12 +1516,18 @@ def _adjust_config(config: EngineConfig):
             )
         from freetoken.models.deepseek_v41.execution import get_execution_plan
 
-        partition = get_execution_plan().partition(dsv41_args.n_routed_experts)
-        object.__setattr__(model_config, "num_experts", partition.local_count)
+        plan = get_execution_plan()
+        partition = plan.partition(dsv41_args.n_routed_experts)
+        prefill_partition = plan.partition(
+            dsv41_args.n_routed_experts, prefill=True
+        )
+        storage = plan.storage_partition(dsv41_args.n_routed_experts)
+        object.__setattr__(model_config, "num_experts", storage.local_count)
         if config.distributed_timeout == EngineConfig.distributed_timeout:
             override("distributed_timeout", 1800.0)
         logger.info(
-            "DeepSeek-V4.1 %s rank=%d/%d backbone=%s experts=[%d,%d) local=%d",
+            "DeepSeek-V4.1 %s rank=%d/%d backbone=%s storage=[%d,%d) local=%d "
+            "prefill=[%d,%d) decode=[%d,%d) engram_ranks=%s",
             (
                 "TP2+EP2"
                 if dsv41_tp2_ep2
@@ -1494,9 +1536,14 @@ def _adjust_config(config: EngineConfig):
             tp_info.rank,
             tp_info.size,
             dsv41_backbone_rank,
+            storage.global_offset,
+            storage.global_stop,
+            storage.local_count,
+            prefill_partition.global_offset,
+            prefill_partition.global_stop,
             partition.global_offset,
             partition.global_stop,
-            partition.local_count,
+            plan.resolved_engram_ranks,
         )
 
     if moe_cache_sizes is not None:

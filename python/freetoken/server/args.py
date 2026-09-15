@@ -178,6 +178,26 @@ def parse_args(
             )
         return values
 
+    def _csv_nonnegative_ranges(value: str) -> tuple[tuple[int, int], ...]:
+        try:
+            ranges = tuple(
+                tuple(int(part.strip()) for part in item.split(":"))
+                for item in value.split(",")
+            )
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated OFFSET:COUNT ranges"
+            ) from exc
+        if (
+            not ranges
+            or any(len(item) != 2 for item in ranges)
+            or any(value < 0 for item in ranges for value in item)
+        ):
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated non-negative OFFSET:COUNT ranges"
+            )
+        return ranges
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -338,6 +358,33 @@ def parse_args(
         type=_csv_nonnegative_ints,
         default=ServerArgs.dsv41_expert_shards,
         help="Optional comma-separated whole-expert counts per DeepSeek-V4.1 EP rank.",
+    )
+    parser.add_argument(
+        "--dsv41-prefill-expert-shards",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.dsv41_prefill_expert_shards,
+        help=(
+            "Optional phase-aware prefill ownership counts per DeepSeek-V4.1 "
+            "EP rank; zero-count auxiliary ranks skip prefill."
+        ),
+    )
+    parser.add_argument(
+        "--dsv41-expert-storage-ranges",
+        type=_csv_nonnegative_ranges,
+        default=ServerArgs.dsv41_expert_storage_ranges,
+        help=(
+            "Optional per-rank OFFSET:COUNT expert storage ranges. Must contain "
+            "each rank's prefill and decode ownership."
+        ),
+    )
+    parser.add_argument(
+        "--dsv41-engram-ranks",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.dsv41_engram_ranks,
+        help=(
+            "Optional comma-separated global EP ranks that store and reduce "
+            "DeepSeek-V4.1 Engram rows. Must include the backbone rank."
+        ),
     )
     parser.add_argument(
         "--dsv41-tp2-ep2",

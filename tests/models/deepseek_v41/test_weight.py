@@ -217,6 +217,18 @@ def test_expert_loader_places_only_owned_global_rows(tmp_path):
     assert banks["gate_up_packed"][0][0, 0, 0].item() == 2
     assert banks["gate_up_packed"][1][1, -1, -1].item() == 13
 
+    overlapping = load_dsfp4_expert_sources(
+        str(tmp_path),
+        args,
+        rank=1,
+        world_size=3,
+        storage_range=(1, 3),
+        layer_sink=lambda _layer, _banks: None,
+    )
+    assert overlapping["gate_up_packed"][0].shape == (3, 64, 32)
+    assert overlapping["gate_up_packed"][0][0, 0, 0].item() == 1
+    assert overlapping["gate_up_packed"][1][2, -1, -1].item() == 13
+
 
 def test_dummy_dsfp4_expert_payloads_are_deterministic_zero(monkeypatch):
     import freetoken.moe.host_banks as host_banks

@@ -271,6 +271,35 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     assert torch.equal(cache.bank_caches["down"][:num_experts], down_source[0])
 
 
+def test_prefill_overlap_copies_only_phase_owned_storage_range():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    gate_up_source = list(torch.arange(2 * 4 * 32 * 8, dtype=torch.float32).reshape(
+        8, 32, 8
+    ).split(4))
+    down_source = list(torch.arange(2 * 4 * 8 * 16, dtype=torch.float32).reshape(
+        8, 8, 16
+    ).split(4))
+    cache.set_bank_sources({"gate_up": gate_up_source, "down": down_source})
+    for bank in cache.bank_caches.values():
+        bank.fill_(-1)
+    cache.set_prefill_expert_range(1, 2)
+
+    cache.prefetch_prefill_layer(0)
+
+    assert torch.equal(cache.bank_caches["gate_up"][1:3], gate_up_source[0][1:3])
+    assert torch.equal(cache.bank_caches["down"][1:3], down_source[0][1:3])
+    assert torch.all(cache.bank_caches["gate_up"][[0, 3]] == -1)
+    assert torch.all(cache.bank_caches["down"][[0, 3]] == -1)
+
+
 def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 

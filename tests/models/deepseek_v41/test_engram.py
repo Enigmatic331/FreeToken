@@ -199,6 +199,19 @@ def test_ep2_shard_plan_is_exact_and_nonoverlapping():
     assert sum(p.nbytes for p in plans) == 384_006_168 * (256 + 8)
 
 
+def test_ep3_shard_plan_is_exact_and_nonoverlapping():
+    rows = 384_006_168
+    plans = [
+        EngramShardPlan.build(rows, 256, rank=rank, world_size=3)
+        for rank in range(3)
+    ]
+    assert plans[0].row_start == 0
+    assert all(left.row_end == right.row_start for left, right in zip(plans, plans[1:]))
+    assert plans[-1].row_end == rows
+    assert sum(plan.rows for plan in plans) == rows
+    assert sum(plan.nbytes for plan in plans) == rows * (256 + 8)
+
+
 def _regular_reader(buf, path, *, file_offset, nbytes, dest_offset=0, **_):
     with open(path, "rb") as handle:
         handle.seek(file_offset)
@@ -246,3 +259,50 @@ def test_loader_reads_only_the_owned_rows(tmp_path):
     assert table.plan.row_start == 5
     assert torch.equal(table.weight.view(torch.uint8), weight[5:].view(torch.uint8))
     assert torch.equal(table.scale.view(torch.uint8), scale[5:].view(torch.uint8))
+
+
+def test_ep3_loader_reassembles_the_exact_table(tmp_path):
+    rows, dim, layer = 11, 32, 1
+    weight = (torch.arange(rows * dim, dtype=torch.float32).reshape(rows, dim) % 13).to(
+        torch.float8_e4m3fn
+    )
+    scale_u8 = (torch.arange(rows, dtype=torch.uint8).reshape(rows, 1) + 123).contiguous()
+    scale = scale_u8.view(torch.float8_e8m0fnu)
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    save_file(
+        {
+            f"layers.{layer}.engram.embed.weight": weight,
+            f"layers.{layer}.engram.embed.scale": scale,
+        },
+        shard,
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": shard.stat().st_size},
+                "weight_map": {
+                    f"layers.{layer}.engram.embed.weight": shard.name,
+                    f"layers.{layer}.engram.embed.scale": shard.name,
+                },
+            }
+        )
+    )
+
+    tables = [
+        load_engram_host_table(
+            str(tmp_path),
+            layer_id=layer,
+            num_embeddings=rows,
+            dim=dim,
+            rank=rank,
+            world_size=3,
+            pin=False,
+            collapse=False,
+            reader=_regular_reader,
+        )
+        for rank in range(3)
+    ]
+    got_weight = torch.cat([table.weight.view(torch.uint8) for table in tables])
+    got_scale = torch.cat([table.scale.view(torch.uint8) for table in tables])
+    assert torch.equal(got_weight, weight.view(torch.uint8))
+    assert torch.equal(got_scale, scale.view(torch.uint8))

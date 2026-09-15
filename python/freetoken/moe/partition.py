@@ -73,6 +73,45 @@ class ExpertPartition:
         return global_expert - self.global_offset
 
 
+@dataclass(frozen=True, slots=True)
+class ExpertStorageRange:
+    """One rank's contiguous stored experts, independent of phase ownership."""
+
+    total_experts: int
+    global_offset: int
+    local_count: int
+
+    def __post_init__(self) -> None:
+        if self.total_experts < 0:
+            raise ValueError("total_experts must be non-negative")
+        if self.global_offset < 0 or self.local_count < 0:
+            raise ValueError("expert storage offset/count must be non-negative")
+        if self.global_stop > self.total_experts:
+            raise ValueError(
+                f"expert storage range [{self.global_offset}, {self.global_stop}) "
+                f"exceeds total_experts={self.total_experts}"
+            )
+
+    @property
+    def global_stop(self) -> int:
+        return self.global_offset + self.local_count
+
+    @property
+    def global_range(self) -> range:
+        return range(self.global_offset, self.global_stop)
+
+    def owns(self, global_expert: int) -> bool:
+        return self.global_offset <= global_expert < self.global_stop
+
+    def global_to_local(self, global_expert: int) -> int:
+        if not self.owns(global_expert):
+            raise ValueError(
+                f"global expert {global_expert} is not stored in "
+                f"[{self.global_offset}, {self.global_stop})"
+            )
+        return global_expert - self.global_offset
+
+
 def localize_expert_routes(
     weights: torch.Tensor,
     indices: torch.Tensor,
@@ -81,6 +120,29 @@ def localize_expert_routes(
     local = indices - partition.global_offset
     owned = (local >= 0) & (local < partition.local_count)
     local = torch.where(owned, local, local.new_full((), partition.local_count))
+    weights = torch.where(owned, weights, weights.new_zeros(()))
+    return weights, local
+
+
+def localize_expert_routes_to_storage(
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    ownership: ExpertPartition,
+    storage: ExpertStorageRange,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask by phase ownership and index the owning rank's stored range."""
+
+    if not (
+        storage.global_offset <= ownership.global_offset
+        and ownership.global_stop <= storage.global_stop
+    ):
+        raise ValueError(
+            f"ownership [{ownership.global_offset}, {ownership.global_stop}) is not "
+            f"contained in storage [{storage.global_offset}, {storage.global_stop})"
+        )
+    owned = (indices >= ownership.global_offset) & (indices < ownership.global_stop)
+    local = indices - storage.global_offset
+    local = torch.where(owned, local, local.new_full((), storage.local_count))
     weights = torch.where(owned, weights, weights.new_zeros(()))
     return weights, local
 
@@ -98,4 +160,10 @@ def cache_safe_route_ids(
     return torch.where(active, local_ids, fallback)
 
 
-__all__ = ["ExpertPartition", "cache_safe_route_ids", "localize_expert_routes"]
+__all__ = [
+    "ExpertPartition",
+    "ExpertStorageRange",
+    "cache_safe_route_ids",
+    "localize_expert_routes",
+    "localize_expert_routes_to_storage",
+]

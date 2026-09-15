@@ -105,6 +105,9 @@ def _engine_config(
     world_size: int = 2,
     backbone_rank=0,
     expert_shards: tuple[int, ...] | None = None,
+    prefill_expert_shards: tuple[int, ...] | None = None,
+    expert_storage_ranges: tuple[tuple[int, int], ...] | None = None,
+    engram_ranks: tuple[int, ...] | None = None,
     tp2_ep2: bool = False,
     attention_tp2_ep2: bool = False,
 ) -> ServerArgs:
@@ -118,6 +121,9 @@ def _engine_config(
         moe_cache_auto=True,
         dsv41_backbone_rank=backbone_rank,
         dsv41_expert_shards=expert_shards,
+        dsv41_prefill_expert_shards=prefill_expert_shards,
+        dsv41_expert_storage_ranges=expert_storage_ranges,
+        dsv41_engram_ranks=engram_ranks,
         dsv41_tp2_ep2=tp2_ep2,
         dsv41_attention_tp2_ep2=attention_tp2_ep2,
         max_running_req=4,
@@ -323,12 +329,64 @@ def test_engine_config_accepts_asymmetric_ep3():
         plan = configure_execution(
             config.dsv41_backbone_rank,
             config.dsv41_expert_shards,
+            engram_ranks=config.dsv41_engram_ranks,
         )
         _adjust_config(config)
         assert plan.partition(8).local_count == 3
         assert not plan.supports_packed_prefill
         assert config.model_tp_size == 1
         assert config.model_config.num_experts == 3
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_engine_config_accepts_ep3_with_engram_on_two_ranks():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config(
+        world_size=3, expert_shards=(3, 3, 2), engram_ranks=(0, 1)
+    )
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        plan = configure_execution(
+            config.dsv41_backbone_rank,
+            config.dsv41_expert_shards,
+            engram_ranks=config.dsv41_engram_ranks,
+        )
+        _adjust_config(config)
+        assert plan.resolved_engram_ranks == (0, 1)
+        assert plan.participates_in_engram
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_engine_config_accepts_decode_only_auxiliary_prefill_split():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config(
+        world_size=3,
+        expert_shards=(3, 3, 2),
+        prefill_expert_shards=(4, 4, 0),
+        expert_storage_ranges=((0, 4), (3, 5), (6, 2)),
+        engram_ranks=(0, 1),
+    )
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        plan = configure_execution(
+            backbone_rank=config.dsv41_backbone_rank,
+            expert_shards=config.dsv41_expert_shards,
+            prefill_expert_shards=config.dsv41_prefill_expert_shards,
+            expert_storage_ranges=config.dsv41_expert_storage_ranges,
+            engram_ranks=config.dsv41_engram_ranks,
+        )
+        _adjust_config(config)
+        assert plan.phase_aware
+        assert plan.prefill_active_ranks == (0, 1)
+        assert config.model_config.num_experts == 4
     finally:
         _reset_execution_for_tests()
         distributed_info._TP_INFO = None
@@ -445,6 +503,11 @@ def test_worker_enters_engram_collective_at_the_matching_layer_boundary():
             events.append(("moe", self.layer_id, hidden_shape, device.type))
 
     class Coordinator:
+        execution = SimpleNamespace(
+            participates_in_engram=True,
+            phase_aware=False,
+        )
+
         def worker_lookup(self, layer_id, **kwargs):
             events.append(("engram", layer_id, kwargs["num_tokens"], kwargs["hashes_per_token"]))
 

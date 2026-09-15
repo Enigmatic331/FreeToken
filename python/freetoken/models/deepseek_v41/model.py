@@ -576,6 +576,9 @@ class MoEState(nn.Module):
         self.experts = None
         self.execution = None
         self.partition = None
+        self.prefill_partition = None
+        self.decode_partition = None
+        self.storage = None
         self._comm = None
         self.decode_refill_overlap = os.getenv(
             "FREETOKEN_DSV41_DECODE_REFILL_OVERLAP", "0"
@@ -591,15 +594,47 @@ class MoEState(nn.Module):
         from .moe import RoutedExperts
 
         self.execution = get_execution_plan()
-        self.partition = self.execution.partition(args.n_routed_experts)
+        self.decode_partition = self.execution.partition(args.n_routed_experts)
+        self.prefill_partition = self.execution.partition(
+            args.n_routed_experts, prefill=True
+        )
+        self.partition = self.decode_partition
+        self.storage = self.execution.storage_partition(args.n_routed_experts)
         self._comm = DistributedCommunicator()
         with self.execution.expert_tp_context():
-            self.experts = RoutedExperts(layer_id, args, self.partition.local_count)
+            self.experts = RoutedExperts(layer_id, args, self.storage.local_count)
         self.experts.packed_prefill_root = (
             self.execution.backbone_rank
             if self.execution.supports_packed_prefill
             else None
         )
+        if self.execution.supports_packed_prefill:
+            peers = tuple(
+                rank
+                for rank in self.execution.prefill_active_ranks
+                if rank != self.execution.backbone_rank
+            )
+            if len(peers) != 1:
+                raise RuntimeError("packed prefill requires exactly one active peer")
+            self.experts.packed_prefill_peer_rank = peers[0]
+
+    def _phase_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Exclude decode-only auxiliary ranks from prefill collectives."""
+
+        assert self.execution is not None
+        root = self.execution.backbone_rank
+        assert root is not None
+        batch = get_global_ctx().batch
+        if not batch.is_prefill or not self.execution.phase_aware:
+            return self._comm.broadcast(tensor, root)
+        if self.execution.rank == root:
+            for peer in self.execution.prefill_active_ranks:
+                if peer != root:
+                    self._comm.send(tensor, peer)
+            return tensor
+        if self.execution.participates_in_prefill:
+            return self._comm.recv(tensor, root)
+        raise RuntimeError("inactive prefill rank attempted a phase broadcast")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.experts is None or self.execution is None:
@@ -608,9 +643,7 @@ class MoEState(nn.Module):
         hidden = x.view(-1, self.dim)
         if self.execution.uses_authority_transport:
             with profile_range("DSV41/EP/HiddenBroadcast"):
-                hidden = self._comm.broadcast(
-                    hidden.contiguous(), self.execution.backbone_rank
-                )
+                hidden = self._phase_broadcast(hidden.contiguous())
         if (
             self.execution.attention_tp2_ep2
             and self.execution.rank != self.execution.backbone_rank
@@ -624,12 +657,8 @@ class MoEState(nn.Module):
                 weights, ids = self.gate(hidden)
         if self.execution.uses_authority_transport or self.execution.attention_tp2_ep2:
             with profile_range("DSV41/EP/RouteBroadcast"):
-                weights = self._comm.broadcast(
-                    weights.float().contiguous(), self.execution.backbone_rank
-                )
-                ids = self._comm.broadcast(
-                    ids.to(torch.int32).contiguous(), self.execution.backbone_rank
-                )
+                weights = self._phase_broadcast(weights.float().contiguous())
+                ids = self._phase_broadcast(ids.to(torch.int32).contiguous())
         fused_cache_safe = (
             getattr(self, "fused_route_prep", False)
             and self.execution.enabled
@@ -639,11 +668,17 @@ class MoEState(nn.Module):
         if self.execution.enabled:
             from .moe import _prepare_partitioned_routes
 
+            ownership = (
+                getattr(self, "prefill_partition", self.partition)
+                if get_global_ctx().batch.is_prefill
+                else getattr(self, "decode_partition", self.partition)
+            )
             weights, ids = _prepare_partitioned_routes(
                 weights,
                 ids,
-                self.partition,
+                ownership,
                 fused_cache_safe=fused_cache_safe,
+                storage=getattr(self, "storage", None),
             )
         if not self.execution.tp2_ep2:
             with profile_range("DSV41/MoE/PrepareRouted"):
@@ -1004,17 +1039,24 @@ class DeepseekV41ExpertWorkerModel:
             raise RuntimeError("V4.1 worker has no Engram tables")
         num_tokens = input_ids.numel()
         device = input_ids.device
+        if (
+            self.engram_coordinator.execution.phase_aware
+            and get_global_ctx().batch.is_prefill
+            and not self.engram_coordinator.execution.participates_in_prefill
+        ):
+            return torch.zeros((1, 1), dtype=torch.float32, device=device)
         hidden_shape = (num_tokens, self.args.dim)
         for layer_id, layer in enumerate(self.layers):
             with profile_range(f"DSV41/Layer_{layer_id}/ExpertWorker"):
                 if layer_id in self.args.engram_layer_ids:
-                    with profile_range("DSV41/Engram/Worker"):
-                        self.engram_coordinator.worker_lookup(
-                            layer_id,
-                            num_tokens=num_tokens,
-                            hashes_per_token=self.args.engram_hashes_per_token,
-                            device=device,
-                        )
+                    if self.engram_coordinator.execution.participates_in_engram:
+                        with profile_range("DSV41/Engram/Worker"):
+                            self.engram_coordinator.worker_lookup(
+                                layer_id,
+                                num_tokens=num_tokens,
+                                hashes_per_token=self.args.engram_hashes_per_token,
+                                device=device,
+                            )
                 with profile_range("DSV41/MoE/Worker"):
                     layer.worker_forward(hidden_shape, device)
         return torch.zeros((1, 1), dtype=torch.float32, device=device)
@@ -1038,6 +1080,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         self._engram_hasher = None
         self._engram_tables = None
         self._engram_coordinator = None
+        self._phase_barrier_group = None
 
     def state_dict(self, *, prefix: str = "", result=None):
         result = {} if result is None else result
@@ -1096,19 +1139,39 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                 "original safetensors checkpoint directly"
             )
         from .engram import EngramHasher, EngramLayout, load_engram_host_table
-        from .engram_runtime import EngramCoordinator
+        from .engram_runtime import EngramCoordinator, TorchProcessGroupCommunicator
 
         rank, world = self._execution.rank, self._execution.world_size
+        engram_ranks = self._execution.resolved_engram_ranks
+        engram_group = None
+        if len(engram_ranks) != world:
+            # All global ranks call new_group in the same order. Non-members receive
+            # GroupMember.NON_GROUP_MEMBER and never enter an Engram collective.
+            engram_group = torch.distributed.new_group(
+                ranks=list(engram_ranks), backend="nccl"
+            )
+        if self._execution.phase_aware:
+            # Inactive prefill ranks wait here without submitting an early NCCL
+            # collective ahead of the active ranks' point-to-point route traffic.
+            self._phase_barrier_group = torch.distributed.new_group(backend="gloo")
         args = self._args
         if getattr(engine_config, "use_dummy_weight", False):
-            tables = {
-                layer_id: _ZeroEngramTable(args.engram_head_dim, world)
-                for layer_id in args.engram_layer_ids
-            }
+            tables = (
+                {
+                    layer_id: _ZeroEngramTable(
+                        args.engram_head_dim, self._execution.engram_world_size
+                    )
+                    for layer_id in args.engram_layer_ids
+                }
+                if self._execution.participates_in_engram
+                else {}
+            )
         else:
             tables = {}
             # One NVMe reader at a time prevents two 94-GiB scans from competing.
-            load_order = tuple(r for r in range(world) if r != self._execution.backbone_rank)
+            load_order = tuple(
+                r for r in engram_ranks if r != self._execution.backbone_rank
+            )
             load_order += (self._execution.backbone_rank,)
             for load_rank in load_order:
                 if rank == load_rank:
@@ -1120,12 +1183,17 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                             layer_id=layer_id,
                             num_embeddings=rows,
                             dim=args.engram_head_dim,
-                            rank=rank,
-                            world_size=world,
+                            rank=self._execution.engram_rank,
+                            world_size=self._execution.engram_world_size,
                         )
                 torch.distributed.barrier()
 
-        coordinator = EngramCoordinator(tables, execution=self._execution)
+        communicator = None
+        if self._execution.participates_in_engram and engram_group is not None:
+            communicator = TorchProcessGroupCommunicator(engram_group)
+        coordinator = EngramCoordinator(
+            tables, execution=self._execution, communicator=communicator
+        )
         self._engram_tables = tables
         self._engram_coordinator = coordinator
         if self._execution.is_expert_worker:
@@ -1186,20 +1254,30 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
+
+        def phase_barrier(result: torch.Tensor) -> torch.Tensor:
+            if batch.is_prefill and self._execution.phase_aware:
+                if self._phase_barrier_group is None:
+                    raise RuntimeError("phase-aware prefill barrier was not initialized")
+                torch.distributed.barrier(group=self._phase_barrier_group)
+            return result
+
         if self._execution.is_expert_worker:
             with profile_range("DSV41/Batch/ExpertWorker"):
-                return self._model.forward(batch.input_ids)
+                return phase_barrier(self._model.forward(batch.input_ids))
         self.prepare_for_runtime()
         input_ids = batch.input_ids.long()
         engram_rows = self._engram_rows(batch, input_ids)
         if batch.is_prefill:
             req = batch.reqs[0]
             with profile_range("DSV41/Batch/Prefill"):
-                return self._model.prefill_single(
-                    input_ids.view(1, -1),
-                    start_pos=req.cached_len,
-                    table_idx=req.table_idx,
-                    engram_rows=engram_rows,
+                return phase_barrier(
+                    self._model.prefill_single(
+                        input_ids.view(1, -1),
+                        start_pos=req.cached_len,
+                        table_idx=req.table_idx,
+                        engram_rows=engram_rows,
+                    )
                 )
         positions = batch.positions.long().view(-1)[: batch.padded_size]
         graph_stage_cap = getattr(batch, "dsv41_graph_stage_cap", None)

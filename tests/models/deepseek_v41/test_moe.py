@@ -7,7 +7,8 @@ from torch import nn
 
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 from freetoken.models.deepseek_v41.execution import DeepseekV41ExecutionPlan
-from freetoken.models.deepseek_v41.moe import Gate
+from freetoken.models.deepseek_v41.moe import Gate, _prepare_partitioned_routes
+from freetoken.moe.partition import ExpertPartition, ExpertStorageRange
 
 
 def test_execution_plan_balances_global_experts_and_keeps_workers_in_engram():
@@ -18,6 +19,102 @@ def test_execution_plan_balances_global_experts_and_keeps_workers_in_engram():
     assert (right.global_offset, right.local_count) == (193, 192)
     assert right_plan.is_expert_worker
     assert right_plan.participates_in_engram
+
+
+def test_execution_plan_can_keep_ep3_engram_on_two_ranks():
+    plans = [
+        DeepseekV41ExecutionPlan(
+            rank, 3, backbone_rank=0, engram_ranks=(0, 1)
+        )
+        for rank in range(3)
+    ]
+    assert [plan.participates_in_engram for plan in plans] == [True, True, False]
+    assert plans[0].engram_rank == 0
+    assert plans[1].engram_rank == 1
+    assert plans[2].engram_world_size == 2
+    with pytest.raises(RuntimeError, match="does not participate"):
+        _ = plans[2].engram_rank
+
+
+def test_asymmetric_ep_uses_decode_ownership_for_prefill_without_phase_split():
+    plan = DeepseekV41ExecutionPlan(
+        rank=2,
+        world_size=3,
+        backbone_rank=0,
+        expert_shards=(3, 3, 2),
+    )
+    decode = plan.partition(8)
+    prefill = plan.partition(8, prefill=True)
+    assert (prefill.global_offset, prefill.local_count) == (
+        decode.global_offset,
+        decode.local_count,
+    )
+
+
+def test_execution_plan_rejects_invalid_engram_subsets():
+    for ranks, message in (
+        ((), "must not be empty"),
+        ((1, 2), "include the backbone"),
+        ((0, 1, 1), "duplicates"),
+        ((0, 3), "outside the EP world"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            DeepseekV41ExecutionPlan(
+                0, 3, backbone_rank=0, engram_ranks=ranks
+            )
+
+
+def test_execution_plan_phase_splits_prefill_from_decode_storage():
+    plans = [
+        DeepseekV41ExecutionPlan(
+            rank,
+            3,
+            backbone_rank=0,
+            expert_shards=(3, 3, 2),
+            prefill_expert_shards=(4, 4, 0),
+            expert_storage_ranges=((0, 4), (3, 5), (6, 2)),
+            engram_ranks=(0, 1),
+        )
+        for rank in range(3)
+    ]
+    assert plans[0].prefill_active_ranks == (0, 1)
+    assert all(plan.supports_packed_prefill for plan in plans)
+    assert [plan.participates_in_prefill for plan in plans] == [True, True, False]
+    assert [
+        (plan.storage_partition(8).global_offset, plan.storage_partition(8).local_count)
+        for plan in plans
+    ] == [(0, 4), (3, 5), (6, 2)]
+    assert [plan.partition(8, prefill=True).local_count for plan in plans] == [4, 4, 0]
+    assert [plan.partition(8).local_count for plan in plans] == [3, 3, 2]
+
+
+def test_execution_plan_rejects_storage_that_misses_phase_ownership():
+    plan = DeepseekV41ExecutionPlan(
+        1,
+        3,
+        backbone_rank=0,
+        expert_shards=(3, 3, 2),
+        prefill_expert_shards=(4, 4, 0),
+        expert_storage_ranges=((0, 4), (4, 4), (6, 2)),
+    )
+    with pytest.raises(ValueError, match="decode ownership"):
+        plan.storage_partition(8)
+
+
+def test_fused_cache_safe_fallback_indexes_from_overlapping_storage():
+    ownership = ExpertPartition(8, world_size=2, rank=1, shard_counts=(4, 4))
+    storage = ExpertStorageRange(8, global_offset=3, local_count=5)
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+    indices = torch.tensor([[3, 4, 7, 1]])
+    local_weights, safe_ids = _prepare_partitioned_routes(
+        weights,
+        indices,
+        ownership,
+        fused_cache_safe=True,
+        storage=storage,
+    )
+    assert torch.equal(local_weights, torch.tensor([[0.0, 0.2, 0.3, 0.0]]))
+    assert torch.equal(safe_ids, torch.tensor([[1, 1, 4, 1]]))
 
 
 def test_attention_tp2_plan_keeps_both_backbones_but_root_owns_shared_path():
