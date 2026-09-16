@@ -771,10 +771,12 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import prefill_hit_compact
 
         E = self.num_experts
-        snap = self._prefill_snapshot_np[layer_id]
+        start = self.prefill_expert_start
+        stop = start + self.prefill_expert_count
+        snap = self._prefill_snapshot_np[layer_id, start:stop]
         hit_mask = snap >= 2 * E
         self.prefill_hit_rows += int(hit_mask.sum())
-        self.prefill_total_rows += E
+        self.prefill_total_rows += self.prefill_expert_count
         if self._gather_dst_ptrs is not None:
             prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
@@ -788,7 +790,9 @@ class OffloadMoeCache:
                 self._prefill_hit_num,
                 blocks_per_bank=64,
             )
-        miss = np.nonzero(~hit_mask)[0]
+        # ``miss`` remains in storage-local expert coordinates because both the
+        # pinned sources and the prefill buffer are indexed in that space.
+        miss = np.nonzero(~hit_mask)[0] + start
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
@@ -802,10 +806,15 @@ class OffloadMoeCache:
                 if feat < _SMALL_BANK_FEAT_BYTES:
                     # Whole layer as one entry, EVEN with zero misses: it keeps every
                     # batch entry above the driver's async floor and covers the hit
-                    # rows the gather skips for these banks.
-                    dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
-                    src.append(self._copy_src_ptrs_host[layer_id][b])
-                    nbytes.append(E * feat)
+                    # rows the gather skips for these banks. Phase-aware ranks copy
+                    # their contiguous prefill interval rather than stored-only rows.
+                    if self.prefill_expert_count:
+                        dst.append(
+                            self._copy_dst_ptrs_host[b]
+                            + (buffer_id * E + start) * feat
+                        )
+                        src.append(self._copy_src_ptrs_host[layer_id][b] + start * feat)
+                        nbytes.append(self.prefill_expert_count * feat)
                 elif miss.size:
                     dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
                     src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)

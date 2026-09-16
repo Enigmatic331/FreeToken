@@ -143,22 +143,29 @@ def ensure_experts_hybrid(
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
-    hit = slot_for_id[layer_id][e] >= 2 * num_experts (the double buffer owns the
-    slots below, so those bytes are volatile within a prefill chunk and classify
-    as miss). Writes fixed-shape ``_prefill_hit_dst``/``_prefill_hit_src`` (buffer
-    row / cache slot) and the count into ``_prefill_hit_num``; one launch on the
-    current stream, no host sync. Safe against the concurrent buffer invalidation
-    on the copy stream: that only rewrites entries already below the threshold."""
+    Only the configured phase-local prefill interval is considered. A hit is a
+    row whose slot is beyond the two borrowed full-layer buffers; those lower
+    slots are volatile within a prefill chunk and therefore classify as misses.
+    Writes fixed-shape ``_prefill_hit_dst``/``_prefill_hit_src`` (buffer row /
+    cache slot) and the count into ``_prefill_hit_num``; one launch on the current
+    stream, no host sync. Safe against concurrent buffer invalidation on the copy
+    stream because it only rewrites entries already below the threshold."""
     num_experts = cache.num_experts
+    expert_start = cache.prefill_expert_start
+    expert_count = cache.prefill_expert_count
+    if expert_count == 0:
+        cache._prefill_hit_num.zero_()
+        return
     _prefill_hit_compact_kernel[(1,)](
         cache.slot_for_id[layer_id],
         cache._prefill_hit_dst,
         cache._prefill_hit_src,
         cache._prefill_hit_num,
-        buffer_id * num_experts,
+        buffer_id * num_experts + expert_start,
         2 * num_experts,
-        num_experts,
-        BLOCK=triton.next_power_of_2(num_experts),
+        expert_start,
+        expert_count,
+        BLOCK=triton.next_power_of_2(expert_count),
     )
 
 
@@ -490,20 +497,21 @@ def _ensure_experts_hybrid_kernel(
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
 
 
-@triton.jit(do_not_specialize=["buffer_base"])
+@triton.jit(do_not_specialize=["buffer_base", "expert_start"])
 def _prefill_hit_compact_kernel(
     slot_ptr,     # [num_experts] int32: this layer's slot_for_id row
     dst_ptr,      # [num_experts] int32 out: buffer rows, compacted
     src_ptr,      # [num_experts] int32 out: cache slots, compacted
     num_ptr,      # [1] int64 out: hit count
-    buffer_base,  # buffer_id * num_experts
+    buffer_base,  # buffer_id * num_experts + expert_start
     threshold,    # 2 * num_experts
-    num_experts,
+    expert_start,
+    expert_count,
     BLOCK: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK)
-    lane = offs < num_experts
-    slots = tl.load(slot_ptr + offs, mask=lane, other=-1)
+    lane = offs < expert_count
+    slots = tl.load(slot_ptr + expert_start + offs, mask=lane, other=-1)
     is_hit = lane & (slots >= threshold)
     pos = tl.cumsum(is_hit.to(tl.int32)) - 1
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)

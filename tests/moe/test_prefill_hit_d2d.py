@@ -129,6 +129,55 @@ def test_prefill_hit_d2d_pure_extremes(nhit):
 
 
 @CUDA
+@JIT
+@BATCH_API
+def test_prefill_hit_d2d_respects_phase_local_range():
+    cache, sources = _make_cache()
+    cache.set_prefill_expert_range(2, 4)
+
+    # One in-range resident row is a hit. Two other valid residents lie outside
+    # this rank's prefill interval and must not affect either copying or counters.
+    _seed_resident(cache, sources, layer_id=0, expert_id=3, slot=17)
+    _seed_resident(cache, sources, layer_id=0, expert_id=0, slot=18)
+    _seed_resident(cache, sources, layer_id=0, expert_id=7, slot=19)
+
+    for buffer in cache.prefill_bank_buffers:
+        buffer[0].fill_(-9)
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    views = cache.wait_prefill_layer(0)
+    torch.cuda.synchronize()
+
+    for view, (name, per_layer) in zip(views, sources.items()):
+        assert torch.equal(view[2:6].cpu(), per_layer[0][2:6]), name
+        assert torch.all(view[:2] == -9), name
+        assert torch.all(view[6:] == -9), name
+    assert cache.prefill_hit_rows == 1
+    assert cache.prefill_total_rows == 4
+
+
+@CUDA
+@JIT
+@BATCH_API
+def test_prefill_hit_d2d_allows_empty_phase_local_range():
+    cache, _sources = _make_cache()
+    cache.set_prefill_expert_range(0, 0)
+    for buffer in cache.prefill_bank_buffers:
+        buffer[0].fill_(-9)
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    views = cache.wait_prefill_layer(0)
+    torch.cuda.synchronize()
+
+    for view in views:
+        assert torch.all(view == -9)
+    assert cache.prefill_hit_rows == 0
+    assert cache.prefill_total_rows == 0
+
+
+@CUDA
 def test_prefill_hit_d2d_noop_without_spare_slots():
     dev = torch.device("cuda")
     sources = {
