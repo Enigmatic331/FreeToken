@@ -7,7 +7,11 @@ from torch import nn
 
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 from freetoken.models.deepseek_v41.execution import DeepseekV41ExecutionPlan
-from freetoken.models.deepseek_v41.moe import Gate, _prepare_partitioned_routes
+from freetoken.models.deepseek_v41.moe import (
+    Gate,
+    _broadcast_decode_dispatch,
+    _prepare_partitioned_routes,
+)
 from freetoken.moe.partition import ExpertPartition, ExpertStorageRange
 
 
@@ -166,6 +170,39 @@ def test_router_bias_selects_but_unbiased_score_scales_routes():
     torch.testing.assert_close(got_ids, want_ids)
     torch.testing.assert_close(got_weights, want_weights)
     assert got_ids.tolist() == [[1, 3]]
+
+
+def test_fused_decode_dispatch_preserves_tensor_bits_on_worker():
+    hidden = torch.tensor([[1.5, -2.0, 3.25, 4.5]], dtype=torch.bfloat16)
+    weights = torch.tensor([[0.1, 0.2]], dtype=torch.float32)
+    ids = torch.tensor([[7, 11]], dtype=torch.int32)
+
+    class Wire:
+        payload = None
+
+        def broadcast(self, value, root):
+            assert root == 0
+            if self.payload is None:
+                self.payload = value.clone()
+            else:
+                value.copy_(self.payload)
+            return value
+
+    wire = Wire()
+    root_plan = type("Plan", (), {"rank": 0, "backbone_rank": 0})()
+    worker_plan = type("Plan", (), {"rank": 1, "backbone_rank": 0})()
+    root_values = _broadcast_decode_dispatch(
+        wire, root_plan, hidden, 2, weights, ids
+    )
+    worker_values = _broadcast_decode_dispatch(
+        wire, worker_plan, torch.empty_like(hidden), 2
+    )
+
+    for root_value, worker_value, expected in zip(
+        root_values, worker_values, (hidden, weights, ids), strict=True
+    ):
+        assert torch.equal(root_value, expected)
+        assert torch.equal(worker_value, expected)
 
 
 def test_authority_decode_refill_is_forked_around_shared_expert(monkeypatch):

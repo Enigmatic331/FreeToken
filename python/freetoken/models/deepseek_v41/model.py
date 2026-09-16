@@ -586,6 +586,9 @@ class MoEState(nn.Module):
         self.fused_route_prep = os.getenv(
             "FREETOKEN_DSV41_FUSED_ROUTE_PREP", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
+        from .moe import _fused_decode_dispatch_enabled
+
+        self.fused_decode_dispatch = _fused_decode_dispatch_enabled()
 
     def attach_routed_experts(self, layer_id: int, args: DeepseekV41Args) -> None:
         from freetoken.distributed import DistributedCommunicator
@@ -641,7 +644,12 @@ class MoEState(nn.Module):
             raise RuntimeError("V4.1 routed experts have not been attached")
         shape = x.shape
         hidden = x.view(-1, self.dim)
-        if self.execution.uses_authority_transport:
+        fused_dispatch = (
+            getattr(self, "fused_decode_dispatch", False)
+            and self.execution.uses_authority_transport
+            and not get_global_ctx().batch.is_prefill
+        )
+        if self.execution.uses_authority_transport and not fused_dispatch:
             with profile_range("DSV41/EP/HiddenBroadcast"):
                 hidden = self._phase_broadcast(hidden.contiguous())
         if (
@@ -655,7 +663,19 @@ class MoEState(nn.Module):
             with profile_range("DSV41/MoE/Router"):
                 assert self.gate is not None
                 weights, ids = self.gate(hidden)
-        if self.execution.uses_authority_transport or self.execution.attention_tp2_ep2:
+        if fused_dispatch:
+            from .moe import _broadcast_decode_dispatch
+
+            with profile_range("DSV41/EP/FusedDecodeDispatch"):
+                hidden, weights, ids = _broadcast_decode_dispatch(
+                    self._comm,
+                    self.execution,
+                    hidden,
+                    self.experts.top_k,
+                    weights,
+                    ids,
+                )
+        elif self.execution.uses_authority_transport or self.execution.attention_tp2_ep2:
             with profile_range("DSV41/EP/RouteBroadcast"):
                 weights = self._phase_broadcast(weights.float().contiguous())
                 ids = self._phase_broadcast(ids.to(torch.int32).contiguous())

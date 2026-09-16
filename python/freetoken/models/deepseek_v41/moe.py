@@ -27,6 +27,58 @@ def _fused_route_prep_enabled() -> bool:
     }
 
 
+def _fused_decode_dispatch_enabled() -> bool:
+    return os.getenv(
+        "FREETOKEN_DSV41_FUSED_DECODE_DISPATCH", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _broadcast_decode_dispatch(
+    communicator,
+    execution,
+    hidden: torch.Tensor,
+    top_k: int,
+    weights: torch.Tensor | None = None,
+    ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Broadcast BF16 hidden state and FP32/int32 routes as one exact payload."""
+
+    root = execution.backbone_rank
+    if root is None:
+        raise RuntimeError("fused decode dispatch requires an authority root")
+    if hidden.dtype != torch.bfloat16 or hidden.numel() % 2:
+        raise RuntimeError(
+            "fused decode dispatch requires an even BF16 hidden-state size"
+        )
+    route_shape = (hidden.shape[0], top_k)
+    route_elements = hidden.shape[0] * top_k
+    hidden_words = hidden.numel() // 2
+    wire = torch.empty(
+        hidden_words + 2 * route_elements,
+        dtype=torch.int32,
+        device=hidden.device,
+    )
+    wire_hidden = wire[:hidden_words].view(torch.bfloat16).view_as(hidden)
+    wire_weights = wire[
+        hidden_words : hidden_words + route_elements
+    ].view(torch.float32).view(route_shape)
+    wire_ids = wire[hidden_words + route_elements :].view(route_shape)
+    if execution.rank == root:
+        if weights is None or ids is None:
+            raise RuntimeError("authority must provide decode routing tensors")
+        if weights.shape != route_shape or ids.shape != route_shape:
+            raise RuntimeError(
+                "decode route shape does not match hidden state: "
+                f"weights={tuple(weights.shape)} ids={tuple(ids.shape)} "
+                f"expected={route_shape}"
+            )
+        wire_hidden.copy_(hidden)
+        wire_weights.copy_(weights)
+        wire_ids.copy_(ids)
+    wire = communicator.broadcast(wire, root)
+    return wire_hidden, wire_weights, wire_ids
+
+
 def _prepare_partitioned_routes(
     weights: torch.Tensor,
     ids: torch.Tensor,
@@ -165,6 +217,10 @@ class RoutedExperts(ExpertParallelOffloadMoELayer):
         )
         self.swiglu_limit = args.swiglu_limit
 
+    def _maybe_all_reduce(self, routes: torch.Tensor) -> torch.Tensor:
+        with profile_range("DSV41/EP/RouteAllReduce"):
+            return super()._maybe_all_reduce(routes)
+
 
 class MoE(nn.Module):
     """Authority computes router/shared expert; all ranks compute owned routes."""
@@ -200,6 +256,7 @@ class MoE(nn.Module):
                 raise RuntimeError("packed prefill requires exactly one active peer")
             self.experts.packed_prefill_peer_rank = peers[0]
         self.fused_route_prep = _fused_route_prep_enabled()
+        self.fused_decode_dispatch = _fused_decode_dispatch_enabled()
 
     def _phase_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         root = self.execution.backbone_rank
@@ -221,11 +278,26 @@ class MoE(nn.Module):
             raise RuntimeError("V4.1 expert workers must call worker_forward")
         shape = x.shape
         hidden = x.view(-1, self.dim)
-        if self.execution.uses_authority_transport:
+        fused_dispatch = (
+            self.fused_decode_dispatch
+            and self.execution.uses_authority_transport
+            and not get_global_ctx().batch.is_prefill
+        )
+        if self.execution.uses_authority_transport and not fused_dispatch:
             hidden = self._phase_broadcast(hidden.contiguous())
         assert self.gate is not None and self.shared_experts is not None
         weights, ids = self.gate(hidden)
-        if self.execution.uses_authority_transport:
+        if fused_dispatch:
+            with profile_range("DSV41/EP/FusedDecodeDispatch"):
+                hidden, weights, ids = _broadcast_decode_dispatch(
+                    self._comm,
+                    self.execution,
+                    hidden,
+                    self.experts.top_k,
+                    weights,
+                    ids,
+                )
+        elif self.execution.uses_authority_transport:
             weights = self._phase_broadcast(weights.float().contiguous())
             ids = self._phase_broadcast(ids.to(torch.int32).contiguous())
         fused_cache_safe = (
@@ -270,16 +342,23 @@ class MoE(nn.Module):
         if not self.execution.is_expert_worker:
             raise RuntimeError("worker_forward is valid only on an expert worker")
         with profile_range("DSV41/EP/WorkerReceive"):
-            hidden = self._phase_broadcast(
-                torch.empty(hidden_shape, dtype=torch.bfloat16, device=device)
-            ).view(-1, self.dim)
-            route_shape = (hidden.shape[0], self.experts.top_k)
-            weights = self._phase_broadcast(
-                torch.empty(route_shape, dtype=torch.float32, device=device)
-            )
-            ids = self._phase_broadcast(
-                torch.empty(route_shape, dtype=torch.int32, device=device)
-            )
+            hidden = torch.empty(hidden_shape, dtype=torch.bfloat16, device=device)
+            if self.fused_decode_dispatch and not get_global_ctx().batch.is_prefill:
+                hidden, weights, ids = _broadcast_decode_dispatch(
+                    self._comm,
+                    self.execution,
+                    hidden,
+                    self.experts.top_k,
+                )
+            else:
+                hidden = self._phase_broadcast(hidden).view(-1, self.dim)
+                route_shape = (hidden.shape[0], self.experts.top_k)
+                weights = self._phase_broadcast(
+                    torch.empty(route_shape, dtype=torch.float32, device=device)
+                )
+                ids = self._phase_broadcast(
+                    torch.empty(route_shape, dtype=torch.int32, device=device)
+                )
             fused_cache_safe = (
                 self.fused_route_prep
                 and weights.is_cuda
