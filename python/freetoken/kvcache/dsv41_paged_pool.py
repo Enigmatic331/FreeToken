@@ -75,8 +75,8 @@ class DSV41PagedKVCache(DSV4PagedKVCache):
             raise ValueError("Not enough memory for the V4.1 KV cache")
         real = dsv41_pool_bytes(sizes, args, config.max_running_req + 1)
         logger.info(
-            f"Allocating {num_pages * P} tokens for DSV4.1 KV cache "
-            f"({sizes.n_win_pages} window pages), total = {mem_GB(real)}"
+            f"Resolved {num_pages * P}-token DSV4.1 KV geometry "
+            f"({sizes.n_win_pages} window pages); authority payload = {mem_GB(real)}"
         )
         return int(num_pages)
 
@@ -237,4 +237,98 @@ class DSV41PagedKVCache(DSV4PagedKVCache):
         )
 
 
-__all__ = ["DSV41PagedKVCache"]
+class DSV41ExpertWorkerKVCache(DSV41PagedKVCache):
+    """Logical DSV4.1 page/SWA state for an authority-EP expert-only rank.
+
+    Every EP scheduler must make byte-identical admission, prefix-cache, and page-allocation
+    decisions.  Expert workers therefore retain the small full->window address map and the
+    window free-list, but they never execute attention and do not need window/cmp/idx/state
+    payload tensors.  Keeping this as the same pool duck type lets the generic CacheManager run
+    unchanged while avoiding a full 256K attention-cache replica on every expert-only GPU.
+    """
+
+    needs_rebind_on_rebuild = False
+
+    def _alloc_buffers(self) -> None:
+        sizes, device = self.sizes, self._device
+        self.full_to_window = torch.full(
+            (sizes.full_token + 1,), -1, dtype=torch.int64, device=device
+        )
+        if not hasattr(self, "full_loc_map"):
+            self.full_loc_map: torch.Tensor | None = None
+
+        # Preserve the shape-bearing attributes used by rebuild/telemetry, but allocate no
+        # attention payload.  Any accidental attention access below fails loudly.
+        self.window_pool: list[torch.Tensor] = []
+        self.cmp_pool: list[torch.Tensor | None] = [None] * self._n_layers
+        self.idx_pool: list[torch.Tensor | None] = [None] * self._n_layers
+        self.state_ring: list[CompressStateRing | None] = [None] * self._n_layers
+        self.indexer_state_ring: list[CompressStateRing | None] = [None] * self._n_layers
+        self.cmp_scratch_base: list[int | None] = [None] * self._n_layers
+        self.idx_scratch_base: list[int | None] = [None] * self._n_layers
+
+    def unit_bytes(self) -> tuple[int, int]:
+        # This rank owns only logical scheduler metadata, not KV payload capacity.
+        return 0, 0
+
+    def validate_rebuild(
+        self,
+        config,
+        *,
+        num_pages: int | None,
+        target_moe: int,
+        per_expert_bytes: int,
+        baseline_free: int,
+        weights_bytes: int,
+        current_num_pages: int,
+        extra_fixed_bytes: int = 0,
+        extra_note: str = "",
+        num_swa_pages: int | None = None,
+        **targets,
+    ) -> None:
+        from freetoken.engine.cache_budget import net_cache_budget_bytes
+        from freetoken.utils import mem_GB
+
+        from .base import CacheRebuildRejected
+        from .dsv4_cost_model import _dsv4_window_floor_pages
+        from .dsv41_cost_model import _dsv41_pool_sizes
+
+        args = self._args(config)
+        target_pages = num_pages if num_pages is not None else current_num_pages
+        floor = _dsv4_window_floor_pages(config, args.window_size)
+        if target_pages < floor:
+            raise CacheRebuildRejected(
+                f"num_pages {target_pages} is below the DSV4.1 window working-set "
+                f"floor {floor} (max_running_req={config.max_running_req})"
+            )
+
+        sizes = (
+            _dsv41_pool_sizes(config, target_pages + 1, num_swa_pages=num_swa_pages)
+            if num_pages is not None or num_swa_pages is not None
+            else self.sizes
+        )
+        # The logical full->window map is the only size-dependent payload.  Include its exact
+        # bytes and the tiny window-page free-list upper bound in the fit check.
+        metadata_bytes = (sizes.full_token + 1) * 8 + max(0, sizes.n_win_pages - 1) * 8
+        budget = net_cache_budget_bytes(
+            config.memory_ratio, baseline_free, weights_bytes, extra_fixed_bytes
+        )
+        need = target_moe * per_expert_bytes + metadata_bytes
+        if need > budget:
+            raise CacheRebuildRejected(
+                f"requested expert-worker cache (moe={target_moe} slots, "
+                f"logical-kv={target_pages} pages{extra_note}) needs {mem_GB(need)} > "
+                f"budget {mem_GB(budget)}; old cache kept, still serving"
+            )
+
+    def k_cache(self, index: int) -> torch.Tensor:
+        raise RuntimeError("expert-only DSV4.1 rank has no attention KV payload")
+
+    def v_cache(self, index: int) -> torch.Tensor:
+        raise RuntimeError("expert-only DSV4.1 rank has no attention KV payload")
+
+    def store_kv(self, k, v, out_loc, layer_id) -> None:
+        raise RuntimeError("expert-only DSV4.1 rank cannot execute attention")
+
+
+__all__ = ["DSV41ExpertWorkerKVCache", "DSV41PagedKVCache"]

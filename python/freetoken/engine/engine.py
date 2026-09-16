@@ -444,7 +444,14 @@ class Engine:
         num_tokens = self.num_pages * config.page_size
         with self._execution_plan.model_tp_context():
             self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-                config, self.num_pages, device=self.device, dtype=self.dtype
+                config,
+                self.num_pages,
+                device=self.device,
+                dtype=self.dtype,
+                expert_worker=(
+                    self._dsv41_plan is not None
+                    and self._execution_plan.is_expert_worker
+                ),
             )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================

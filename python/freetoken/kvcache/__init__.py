@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
-from freetoken.utils import Registry
+from freetoken.utils import Registry, init_logger
 
 if TYPE_CHECKING:
     import torch
@@ -22,6 +22,7 @@ class CacheManagerCreator(Protocol):
 
 
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
+logger = init_logger(__name__)
 
 
 def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
@@ -78,7 +79,14 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(
+    config,
+    num_pages: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    expert_worker: bool = False,
+):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
@@ -90,8 +98,10 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     model_config = config.model_config
     if resolve_pool_class(model_config) is DSV41PagedKVCache:
         from .dsv41_cost_model import _dsv41_pool_sizes
+        from .dsv41_paged_pool import DSV41ExpertWorkerKVCache
 
-        pool = DSV41PagedKVCache(
+        pool_cls = DSV41ExpertWorkerKVCache if expert_worker else DSV41PagedKVCache
+        pool = pool_cls(
             sizes=_dsv41_pool_sizes(config, num_pages + 1),
             args=model_config.dsv41_args,
             device=device,
@@ -100,6 +110,20 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             n_scratch=config.max_running_req + 1,
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        if expert_worker:
+            logger.info(
+                "Using metadata-only DSV4.1 KV pool on expert-only rank: "
+                "%d logical tokens, %.2f MiB metadata",
+                num_pages * model_config.dsv41_args.window_size,
+                pool.total_bytes() / (1 << 20),
+            )
+        else:
+            logger.info(
+                "Allocated physical DSV4.1 KV pool on attention authority: "
+                "%d tokens, %.2f GiB",
+                num_pages * model_config.dsv41_args.window_size,
+                pool.total_bytes() / (1 << 30),
+            )
         return pool
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is

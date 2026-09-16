@@ -13,7 +13,10 @@ from freetoken.kvcache.dsv41_cost_model import (
     dsv41_solve_num_pages,
     dsv41_window_unit_bytes,
 )
-from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
+from freetoken.kvcache.dsv41_paged_pool import (
+    DSV41ExpertWorkerKVCache,
+    DSV41PagedKVCache,
+)
 from freetoken.models.deepseek_v41.args import load_args
 
 
@@ -32,6 +35,74 @@ def _engine_config(args, *, num_page_override=None):
         num_page_override=num_page_override,
         memory_ratio=1.0,
     )
+
+
+def _tiny_args():
+    return SimpleNamespace(
+        n_layers=4,
+        head_dim=32,
+        index_head_dim=16,
+        compress_ratios=(0, 1, 0, 2),
+        kv_source_layers=(1, 3),
+        window_size=128,
+    )
+
+
+def test_expert_worker_pool_keeps_logical_swa_state_without_attention_payload():
+    from freetoken.kvcache import create_kv_pool
+
+    args = _tiny_args()
+    config = _engine_config(args, num_page_override=16)
+    config.model_config.dsv4_args = args
+    pool = create_kv_pool(
+        config,
+        num_pages=16,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        expert_worker=True,
+    )
+
+    assert isinstance(pool, DSV41ExpertWorkerKVCache)
+    assert pool.unit_bytes() == (0, 0)
+    assert pool.total_bytes() < 1 << 20
+    assert pool.swa_available_size() == pool.swa_num_tokens - 1
+    assert pool.window_pool == []
+    assert all(item is None for item in pool.cmp_pool)
+    with pytest.raises(RuntimeError, match="no attention KV payload"):
+        pool.k_cache(0)
+
+    full_page = torch.arange(128, dtype=torch.int32)
+    before = pool.swa_available_size()
+    pool.alloc_swa(full_page)
+    assert pool.swa_available_size() == before - 128
+    assert torch.all(pool.translate_loc_from_full_to_swa(full_page) >= 0)
+    pool.free_swa(full_page)
+    assert pool.swa_available_size() == before
+    assert torch.all(pool.translate_loc_from_full_to_swa(full_page) == -1)
+
+    pool.rebuild_from_config(config, num_pages=20)
+    assert pool.sizes.full_token == 21 * args.window_size
+    assert pool.window_pool == []
+    assert pool.total_bytes() < 1 << 20
+    assert pool.swa_available_size() == pool.swa_num_tokens - 1
+
+
+def test_regular_dsv41_pool_factory_still_allocates_attention_payload():
+    from freetoken.kvcache import create_kv_pool
+
+    args = _tiny_args()
+    config = _engine_config(args, num_page_override=16)
+    config.model_config.dsv4_args = args
+    pool = create_kv_pool(
+        config,
+        num_pages=16,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    assert type(pool) is DSV41PagedKVCache
+    assert len(pool.window_pool) == args.n_layers
+    assert pool.total_bytes() > 100 << 10
 
 
 @pytest.mark.skipif(not os.path.exists(MODEL_PATH), reason="official checkpoint absent")
