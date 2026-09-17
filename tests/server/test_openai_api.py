@@ -476,6 +476,14 @@ _DSV4_TOOL_BLOCK = (
     f"</{DSML_TOKEN}invoke>\n"
     f"</{DSML_TOKEN}tool_calls>"
 )
+_DSV41_TOOL_BLOCK = (
+    f"<{DSML_TOKEN} calls>\n"
+    f'<{DSML_TOKEN} invoke name="get_weather">\n'
+    f'<{DSML_TOKEN} parameter name="city" string="true">Paris'
+    f"</{DSML_TOKEN} parameter>\n"
+    f"</{DSML_TOKEN} invoke>\n"
+    f"</{DSML_TOKEN} calls>"
+)
 
 
 def _dsv4_state(replies):
@@ -510,6 +518,21 @@ def test_dsv4_non_stream_missing_end_token_before_tool_block():
     assert choice["message"]["reasoning_content"] == "Looking it up now."
     assert choice["message"]["content"] == ""
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_dsv41_non_stream_parses_official_dsml_dialect():
+    output = f"Looking it up now.\n\n{_DSV41_TOOL_BLOCK}"
+    state = _dsv4_state([UserReply(uid=42, incremental_output=output, finished=True)])
+
+    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+
+    choice = response["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["reasoning_content"] == "Looking it up now."
+    assert choice["message"]["content"] == ""
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "get_weather"
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": "Paris"}
 
 
 def test_dsv4_non_stream_reasoning_without_tools():
@@ -597,6 +620,40 @@ def test_dsv4_stream_emits_reasoning_then_tool_calls():
         if choice.get("finish_reason")
     ]
     assert finish_reasons == ["tool_calls"]
+
+
+def test_dsv41_stream_emits_official_dsml_as_tool_calls():
+    chunks = ["Looking ", "it up.", "\n\n", _DSV41_TOOL_BLOCK]
+    replies = [
+        UserReply(uid=42, incremental_output=chunk, finished=(index == len(chunks) - 1))
+        for index, chunk in enumerate(chunks)
+    ]
+    state = _dsv4_state(replies)
+
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state))))
+
+    tool_names = [
+        tool_call["function"]["name"]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        for tool_call in choice.get("delta", {}).get("tool_calls", [])
+        if tool_call.get("function", {}).get("name")
+    ]
+    assert tool_names == ["get_weather"]
+    assert all(
+        DSML_TOKEN not in choice.get("delta", {}).get("content", "")
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+    )
+    assert [
+        choice["finish_reason"]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ] == ["tool_calls"]
 
 
 # --------------------------------------------------------------- gpt-oss harmony

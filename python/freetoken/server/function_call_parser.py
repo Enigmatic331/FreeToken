@@ -78,6 +78,8 @@ TOOLS_TAG_LIST = [
     "<｜DSML｜function_calls>",
     "<｜DSML｜tool_calls>",
     "<｜DSML｜invoke",
+    "<｜DSML｜ calls>",
+    "<｜DSML｜ invoke",
     "<atem:function_calls>",
 ]
 
@@ -1539,7 +1541,7 @@ class Glm47Detector(BaseFormatDetector):
 
 class DeepSeekV32Detector(BaseFormatDetector):
     """
-    Detector for DeepSeek V3.2 model function call format using DSML
+    Detector for DeepSeek V3.2 and V4.1 function call formats using DSML
     (DeepSeek Markup Language).
 
     Format Structure:
@@ -1552,6 +1554,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
     </｜DSML｜function_calls>
     ```
 
+    V4.1 uses leading-space tag names instead:
+    ``<｜DSML｜ calls>``, ``<｜DSML｜ invoke>`` and
+    ``<｜DSML｜ parameter>``. Both dialects remain accepted because the parser
+    name is also selected for older DeepSeek checkpoints.
+
     Key Components:
     - Function Calls Block: `<｜DSML｜function_calls>` ... `</｜DSML｜function_calls>`
     - Individual Invocation: `<｜DSML｜invoke name="func">` ... `</｜DSML｜invoke>`
@@ -1560,7 +1567,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
       - string="false": value is JSON (numbers, booleans, arrays, objects)
     - Supports multiple parallel tool calls
 
-    Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3.2
+    References:
+    - https://huggingface.co/deepseek-ai/DeepSeek-V3.2
+    - DeepSeek-V4.1 ``encoding/encoding.py`` shipped with the checkpoint
     """
 
     def __init__(self):
@@ -1570,30 +1579,46 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.eot_token = f"</{self.dsml_token}function_calls>"
         self.alt_bot_token = f"<{self.dsml_token}tool_calls>"
         self.alt_eot_token = f"</{self.dsml_token}tool_calls>"
+        self.v41_bot_token = f"<{self.dsml_token} calls>"
+        self.v41_eot_token = f"</{self.dsml_token} calls>"
+        self.bot_tokens = (self.bot_token, self.alt_bot_token, self.v41_bot_token)
+        self.eot_tokens = (self.eot_token, self.alt_eot_token, self.v41_eot_token)
         self.invoke_start_prefix = f"<{self.dsml_token}invoke"
         self.invoke_end_token = f"</{self.dsml_token}invoke>"
         self.param_end_token = f"</{self.dsml_token}parameter>"
+        self.v41_invoke_start_prefix = f"<{self.dsml_token} invoke"
+        self.v41_invoke_end_token = f"</{self.dsml_token} invoke>"
+        self.v41_param_open_token = f"<{self.dsml_token} parameter"
+        self.v41_param_end_token = f"</{self.dsml_token} parameter>"
+        self.invoke_start_prefixes = (self.invoke_start_prefix, self.v41_invoke_start_prefix)
+        self.invoke_end_tokens = (self.invoke_end_token, self.v41_invoke_end_token)
+        self.param_open_tokens = (
+            f"<{self.dsml_token}parameter",
+            self.v41_param_open_token,
+        )
+        self.param_end_tokens = (self.param_end_token, self.v41_param_end_token)
 
         # Regex for complete invoke extraction
         _de = re.escape(self.dsml_token)
         self.invoke_regex = re.compile(
-            rf'<{_de}invoke\s+name="([^"]+)"\s*>(.*?)</{_de}invoke>',
+            rf'<{_de} ?invoke\s+name="([^"]+)"\s*>(.*?)</{_de} ?invoke>',
             re.DOTALL,
         )
         # Regex for parameter extraction
         self.param_regex = re.compile(
-            rf'<{_de}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</{_de}parameter>',
+            rf'<{_de} ?parameter\s+name="([^"]+)"'
+            rf'(?:\s+string="(true|false)")?\s*>(.*?)</{_de} ?parameter>',
             re.DOTALL,
         )
         # Regex for partial invoke (name known, body still streaming)
         self.partial_invoke_regex = re.compile(
-            rf'<{_de}invoke\s+name="([^"]+)"\s*>(.*)',
+            rf'<{_de} ?invoke\s+name="([^"]+)"\s*>(.*)',
             re.DOTALL,
         )
         # Streaming state machine tag regexes (anchored matches over the buffer).
-        self.invoke_open_regex = re.compile(rf'<{_de}invoke\s+name="([^"]+)"\s*>')
+        self.invoke_open_regex = re.compile(rf'<{_de} ?invoke\s+name="([^"]+)"\s*>')
         self.param_open_regex = re.compile(
-            rf'<{_de}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>'
+            rf'<{_de} ?parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>'
         )
 
         self._last_arguments = ""
@@ -1607,10 +1632,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._param_lead = "{"
 
     def block_close_tokens(self) -> tuple:
-        return (self.eot_token, self.alt_eot_token)
+        return self.eot_tokens
 
     def has_tool_call(self, text: str) -> bool:
-        return self.bot_token in text or self.alt_bot_token in text
+        return any(token in text for token in self.bot_tokens)
 
     def _param_fragment(self, index: int, name: str, is_str: str, value: str) -> str:
         """Prefix-stable arguments fragment for one closed DSML parameter: the
@@ -1647,7 +1672,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-time parsing for DSML format tool calls."""
-        idx = _first_existing_pos(text, [self.bot_token, self.alt_bot_token])
+        idx = _first_existing_pos(text, self.bot_tokens)
         normal_text = text[:idx].strip() if idx != -1 else text
         if idx == -1:
             return StreamingParseResult(normal_text=normal_text, calls=[])
@@ -1687,8 +1712,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         normal_parts: List[str] = []
         calls: List[ToolCallItem] = []
-        param_open_token = f"<{self.dsml_token}parameter"
-
         def _emit_args(fragment: str) -> None:
             if fragment:
                 self.streamed_args_for_tool[self.current_tool_id] += fragment
@@ -1717,15 +1740,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if self._ds_mode == "idle":
                 if calls:
                     break  # text after a call defers to the next step (wire order)
-                pos = _first_existing_pos(buf, [self.bot_token, self.alt_bot_token])
+                pos = _first_existing_pos(buf, self.bot_tokens)
                 if pos == -1:
-                    hold = max(
-                        self._ends_with_partial_token(buf, self.bot_token),
-                        self._ends_with_partial_token(buf, self.alt_bot_token),
-                    )
+                    hold = max(self._ends_with_partial_token(buf, token) for token in self.bot_tokens)
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
-                        for e_token in (self.eot_token, self.alt_eot_token, self.invoke_end_token):
+                        for e_token in (*self.eot_tokens, *self.invoke_end_tokens):
                             if e_token in release:
                                 release = release.replace(e_token, "")
                         if release:
@@ -1736,21 +1756,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     normal_parts.append(buf[:pos])
                     self._buffer = buf[pos:]
                     continue
-                opener = self.bot_token if buf.startswith(self.bot_token) else self.alt_bot_token
+                opener = next(token for token in self.bot_tokens if buf.startswith(token))
                 self._buffer = buf[len(opener):]
                 self._in_function_calls = True
                 self._ds_mode = "block"
                 continue
 
             if self._ds_mode == "block":
-                inv = buf.find(self.invoke_start_prefix)
-                close = _first_existing_pos(buf, [self.eot_token, self.alt_eot_token])
+                inv = _first_existing_pos(buf, self.invoke_start_prefixes)
+                close = _first_existing_pos(buf, self.eot_tokens)
                 if close != -1 and (inv == -1 or close < inv):
-                    matched = (
-                        self.eot_token
-                        if buf[close : close + len(self.eot_token)] == self.eot_token
-                        else self.alt_eot_token
-                    )
+                    matched = next(token for token in self.eot_tokens if buf.startswith(token, close))
                     self._buffer = buf[close + len(matched):]
                     self._in_function_calls = False
                     self._ds_mode = "idle"
@@ -1784,17 +1800,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self._ds_mode = "invoke_skip"
                     continue
                 hold = max(
-                    self._ends_with_partial_token(buf, self.invoke_start_prefix),
-                    self._ends_with_partial_token(buf, self.eot_token),
-                    self._ends_with_partial_token(buf, self.alt_eot_token),
+                    self._ends_with_partial_token(buf, token)
+                    for token in (*self.invoke_start_prefixes, *self.eot_tokens)
                 )
                 if len(buf) - hold > 0:
                     self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
                 break
 
             if self._ds_mode in ("invoke", "invoke_skip"):
-                p = buf.find(param_open_token)
-                e = buf.find(self.invoke_end_token)
+                p = _first_existing_pos(buf, self.param_open_tokens)
+                e = _first_existing_pos(buf, self.invoke_end_tokens)
                 if e != -1 and (p == -1 or e < p):
                     if self._ds_mode == "invoke":
                         _emit_args("}" if self._args_started else "{}")
@@ -1802,7 +1817,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.current_tool_id += 1
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
-                    self._buffer = buf[e + len(self.invoke_end_token):]
+                    matched = next(
+                        token for token in self.invoke_end_tokens if buf.startswith(token, e)
+                    )
+                    self._buffer = buf[e + len(matched):]
                     self._ds_mode = "block"
                     continue
                 if p != -1:
@@ -1824,30 +1842,36 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self._ds_mode = "pbuf"
                     continue
                 hold = max(
-                    self._ends_with_partial_token(buf, param_open_token),
-                    self._ends_with_partial_token(buf, self.invoke_end_token),
+                    self._ends_with_partial_token(buf, token)
+                    for token in (*self.param_open_tokens, *self.invoke_end_tokens)
                 )
                 if len(buf) - hold > 0:
                     self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
                 break
 
             if self._ds_mode == "pstr":
-                end = buf.find(self.param_end_token)
+                end = _first_existing_pos(buf, self.param_end_tokens)
                 if end == -1:
-                    hold = self._ends_with_partial_token(buf, self.param_end_token)
+                    hold = max(
+                        self._ends_with_partial_token(buf, token)
+                        for token in self.param_end_tokens
+                    )
                     emit_len = len(buf) - hold
                     if emit_len > 0:
                         _emit_args(json.dumps(buf[:emit_len], ensure_ascii=False)[1:-1])
                         self._buffer = buf[emit_len:]
                     break
                 _emit_args(json.dumps(buf[:end], ensure_ascii=False)[1:-1] + '"')
-                self._buffer = buf[end + len(self.param_end_token):]
+                matched = next(
+                    token for token in self.param_end_tokens if buf.startswith(token, end)
+                )
+                self._buffer = buf[end + len(matched):]
                 _update_prev_args()
                 self._ds_mode = "invoke"
                 continue
 
             if self._ds_mode in ("pbuf", "pskip"):
-                end = buf.find(self.param_end_token)
+                end = _first_existing_pos(buf, self.param_end_tokens)
                 if end == -1:
                     break  # hold the whole value until the parameter closes
                 if self._ds_mode == "pbuf":
@@ -1863,7 +1887,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         + json.dumps(parsed, ensure_ascii=False)
                     )
                     _update_prev_args()
-                self._buffer = buf[end + len(self.param_end_token):]
+                matched = next(
+                    token for token in self.param_end_tokens if buf.startswith(token, end)
+                )
+                self._buffer = buf[end + len(matched):]
                 self._ds_mode = "invoke" if self._ds_mode == "pbuf" else "invoke_skip"
                 continue
 
@@ -1875,7 +1902,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._in_function_calls = False
         if mode != "idle" or self.has_tool_call(residual):
             return ""
-        for e_token in (self.eot_token, self.alt_eot_token, self.invoke_end_token):
+        for e_token in (*self.eot_tokens, *self.invoke_end_tokens):
             if e_token in residual:
                 residual = residual.replace(e_token, "")
         if self.prev_tool_call_arr and residual.strip() == "":

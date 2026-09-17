@@ -247,6 +247,15 @@ def test_gpt_oss_parser_accepts_namespaced_tool_name():
             "read",
             {"filePath": "/tmp/test_calc.py"},
         ),
+        (
+            "deepseekv32",
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"read\">"
+            "<｜DSML｜ parameter name=\"filePath\" string=\"true\">"
+            "/tmp/test_calc.py</｜DSML｜ parameter>"
+            "</｜DSML｜ invoke></｜DSML｜ calls>",
+            "read",
+            {"filePath": "/tmp/test_calc.py"},
+        ),
     ],
 )
 def test_parser_accepts_family_specific_tool_call_shapes(
@@ -334,6 +343,83 @@ def test_dsv32_streaming_multi_param_args_prefix_stable():
     assert json.loads(parser.unstreamed_arguments(named[0].tool_index)) == {
         "pattern": "*.py",
         "path": "/src",
+    }
+
+
+def test_dsv41_streaming_official_dsml_dialect():
+    """V4.1's official encoder uses leading-space DSML tag names."""
+    parser = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="deepseekv32")
+    block = (
+        "I will inspect it.\n\n"
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="glob">\n'
+        '<｜DSML｜ parameter name="pattern" string="true">*.py</｜DSML｜ parameter>\n'
+        '<｜DSML｜ parameter name="path" string="true">/src</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+    chunks = [block[i : i + 5] for i in range(0, len(block), 5)]
+
+    texts, calls = _feed(parser, chunks)
+
+    assert "".join(texts).rstrip() == "I will inspect it."
+    named = [call for call in calls if call.name]
+    assert len(named) == 1 and named[0].name == "glob"
+    joined = "".join(call.parameters for call in calls if call.name is None)
+    assert json.loads(joined) == {"pattern": "*.py", "path": "/src"}
+    assert parser.finish_stream() == ""
+
+
+def test_dsv41_non_stream_parses_multiple_production_style_calls():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                },
+            },
+        },
+    ]
+    response = (
+        "Let me pull the primary sources.\n\n"
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="fetch_url">\n'
+        '<｜DSML｜ parameter name="url" string="true">https://example.com/release'
+        "</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        '<｜DSML｜ invoke name="search_web">\n'
+        '<｜DSML｜ parameter name="count" string="false">10</｜DSML｜ parameter>\n'
+        '<｜DSML｜ parameter name="query" string="true">release notes storage migration'
+        "</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+    parser = FunctionCallParser(tools, tool_call_parser="deepseekv32")
+
+    result = parser.parse_non_stream(response)
+
+    assert result.normal_text == "Let me pull the primary sources."
+    assert [call.name for call in result.calls] == ["fetch_url", "search_web"]
+    assert json.loads(result.calls[0].parameters) == {"url": "https://example.com/release"}
+    assert json.loads(result.calls[1].parameters) == {
+        "count": 10,
+        "query": "release notes storage migration",
     }
 
 
