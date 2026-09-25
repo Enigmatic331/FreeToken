@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -602,6 +603,80 @@ class OffloadMoeCache:
         if n is None:
             return tuple(cache for _, cache in self.banks)
         return tuple(cache[:n] for _, cache in self.banks)
+
+    def full_resident_slots_required(self) -> int:
+        """Slots needed to keep every local expert-layer row resident.
+
+        Prefill overlap owns the first two full-layer buffers, so those slots may
+        not be used for persistent decode rows even though they share the same
+        bank allocation.
+        """
+        reserve = 2 * self.num_experts if self.prefill_overlap else 0
+        return reserve + self.num_layers * self.num_experts
+
+    def preload_full(self) -> bool:
+        """Preload every locally owned expert-layer row into deterministic slots.
+
+        This is intended for a fully resident GPU decode rank.  It is a no-op when
+        the rank cannot fit the complete local bank, when any layer is CPU-backed,
+        or for CPU/hybrid decode.  The deterministic map prevents the first real
+        requests from paying thousands of lazy PCIe fills.
+        """
+        assert self.banks, "set_bank_sources must register the banks first"
+        required = self.full_resident_slots_required()
+        if (
+            self.decode_target != "gpu"
+            or self._unpinned_layers
+            or required > self.cache_size
+        ):
+            logger.info(
+                "Skipping full MoE preload: decode_target=%s unpinned_layers=%d "
+                "required_slots=%d cache_size=%d",
+                self.decode_target,
+                len(self._unpinned_layers),
+                required,
+                self.cache_size,
+            )
+            return False
+
+        reserve = 2 * self.num_experts if self.prefill_overlap else 0
+        resident = self.num_layers * self.num_experts
+        started = time.monotonic()
+        bytes_copied = 0
+        for per_layer, cache in self.banks:
+            for layer_id, source in enumerate(per_layer):
+                lo = reserve + layer_id * self.num_experts
+                hi = lo + self.num_experts
+                cache[lo:hi].copy_(source, non_blocking=self.device.type == "cuda")
+                bytes_copied += source.numel() * source.element_size()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+        # Publish the complete map only after every bank copy has finished.
+        self.slot_for_id.fill_(-1)
+        self.id_of_slot.fill_(-1)
+        self.usage.zero_()
+        slots = torch.arange(
+            reserve, reserve + resident, dtype=torch.int32, device=self.device
+        )
+        self.slot_for_id.copy_(slots.view(self.num_layers, self.num_experts))
+        self.id_of_slot[reserve : reserve + resident].copy_(
+            torch.arange(resident, dtype=torch.int32, device=self.device)
+        )
+        self.usage[reserve : reserve + resident].fill_(1)
+        self.step.fill_(1)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        logger.info(
+            "Full MoE preload complete: rows=%d slots=[%d,%d) bytes=%.3f GiB "
+            "elapsed=%.3fs",
+            resident,
+            reserve,
+            reserve + resident,
+            bytes_copied / (1024**3),
+            time.monotonic() - started,
+        )
+        return True
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"

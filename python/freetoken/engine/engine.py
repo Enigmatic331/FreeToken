@@ -548,6 +548,14 @@ class Engine:
             # needs representative expert rows resident before the first request,
             # including when auto attention selected qsa_sparse.
             self._warmup_prefill()
+        # Graph capture and the synthetic prefill warmup intentionally mutate/reset
+        # the slot map. Publish a full-resident map only after both are finished.
+        if (
+            self.moe_offload_cache is not None
+            and os.getenv("FREETOKEN_MOE_PRELOAD_FULL", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            self.moe_offload_cache.preload_full()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1080,6 +1088,13 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+
+        if (
+            self.moe_offload_cache is not None
+            and os.getenv("FREETOKEN_MOE_PRELOAD_FULL", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            self.moe_offload_cache.preload_full()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream

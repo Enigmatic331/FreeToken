@@ -221,6 +221,57 @@ def test_offload_moe_cache_prefill_overlap_requires_two_layer_slots():
         )
 
 
+def test_full_preload_skips_when_complete_local_bank_does_not_fit():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=3,
+        cache_size=5,
+        device=torch.device("cpu"),
+    )
+    cache.set_bank_sources({
+        "gate_up": [torch.randn(3, 4, 2) for _ in range(2)],
+        "down": [torch.randn(3, 2, 2) for _ in range(2)],
+    })
+
+    assert cache.full_resident_slots_required() == 6
+    assert cache.preload_full() is False
+    assert torch.all(cache.slot_for_id == -1)
+    assert torch.all(cache.id_of_slot == -1)
+
+
+def test_full_preload_preserves_prefill_buffers_and_maps_all_decode_rows():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    num_layers = 2
+    num_experts = 3
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=13,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    gate_up = list(torch.arange(2 * 3 * 4 * 2, dtype=torch.float32).reshape(6, 4, 2).split(3))
+    down = list(torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(6, 2, 2).split(3))
+    cache.set_bank_sources({"gate_up": gate_up, "down": down})
+
+    assert cache.full_resident_slots_required() == 12
+    assert cache.preload_full() is True
+
+    reserve = 2 * num_experts
+    assert cache.slot_for_id.tolist() == [[6, 7, 8], [9, 10, 11]]
+    assert cache.id_of_slot.tolist() == [-1] * reserve + list(range(6)) + [-1]
+    assert cache.usage.tolist() == [0] * reserve + [1] * 6 + [0]
+    assert int(cache.step.item()) == 1
+    for layer_id in range(num_layers):
+        lo = reserve + layer_id * num_experts
+        hi = lo + num_experts
+        assert torch.equal(cache.bank_caches["gate_up"][lo:hi], gate_up[layer_id])
+        assert torch.equal(cache.bank_caches["down"][lo:hi], down[layer_id])
+
+
 def test_offload_moe_cache_marlin_rejects_slot_count_beyond_kernel_limit():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
