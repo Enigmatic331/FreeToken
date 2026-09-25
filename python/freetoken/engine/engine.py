@@ -76,6 +76,24 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
         )
 
 
+def _rank_moe_prefill_overlap_enabled(
+    requested: bool, dsv41_plan: Any | None, total_experts: int
+) -> bool:
+    """Reserve prefill staging slots only on ranks that execute prefill experts.
+
+    Phase-aware DSV4.1 can use decode-only auxiliary ranks.  Those ranks join the
+    phase barrier but never materialize a prefill expert, so reserving the normal
+    two expert layers there only reduces the capacity of a static decode bank.
+    """
+    if not requested:
+        return False
+    return not (
+        dsv41_plan is not None
+        and dsv41_plan.phase_aware
+        and dsv41_plan.partition(total_experts, prefill=True).local_count == 0
+    )
+
+
 def _flashinfer_available() -> bool:
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -753,6 +771,22 @@ class Engine:
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            phase_storage = None
+            phase_prefill = None
+            total_experts = config.model_config.num_experts
+            if self._dsv41_plan is not None and self._dsv41_plan.phase_aware:
+                total_experts = config.model_config.dsv41_args.n_routed_experts
+                phase_storage = self._dsv41_plan.storage_partition(total_experts)
+                phase_prefill = self._dsv41_plan.partition(total_experts, prefill=True)
+            cache_prefill_overlap = _rank_moe_prefill_overlap_enabled(
+                config.moe_prefill_overlap, self._dsv41_plan, total_experts
+            )
+            if config.moe_prefill_overlap and not cache_prefill_overlap:
+                logger.info(
+                    "DeepSeek-V4.1 phase-aware EP rank=%d is decode-only; "
+                    "disabling its unused MoE prefill overlap reserve",
+                    config.tp_info.rank,
+                )
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -761,7 +795,7 @@ class Engine:
                 cache_size=config.moe_cache_size,
                 device=self.device,
                 cache_policy=config.moe_cache_policy,
-                prefill_overlap=config.moe_prefill_overlap,
+                prefill_overlap=cache_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 sparse_prefill_max_tokens=config.moe_sparse_prefill_max_tokens,
                 quant_format=banks.quant_format,
@@ -772,22 +806,21 @@ class Engine:
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
-            if (
-                self._dsv41_plan is not None
-                and self._dsv41_plan.phase_aware
-            ):
-                total_experts = config.model_config.dsv41_args.n_routed_experts
-                storage = self._dsv41_plan.storage_partition(total_experts)
-                prefill = self._dsv41_plan.partition(total_experts, prefill=True)
+            if phase_storage is not None and phase_prefill is not None:
+                prefill_local_start = (
+                    phase_prefill.global_offset - phase_storage.global_offset
+                    if phase_prefill.local_count
+                    else 0
+                )
                 cache.set_prefill_expert_range(
-                    prefill.global_offset - storage.global_offset,
-                    prefill.local_count,
+                    prefill_local_start,
+                    phase_prefill.local_count,
                 )
                 logger.info(
                     "DeepSeek-V4.1 phase-aware EP rank=%d prefill local storage=[%d,%d)",
                     config.tp_info.rank,
-                    prefill.global_offset - storage.global_offset,
-                    prefill.global_stop - storage.global_offset,
+                    prefill_local_start,
+                    prefill_local_start + phase_prefill.local_count,
                 )
         else:
             cache = cache_factory(config, self.device)

@@ -392,6 +392,59 @@ def test_engine_config_accepts_decode_only_auxiliary_prefill_split():
         distributed_info._TP_INFO = None
 
 
+def test_decode_only_phase_rank_does_not_reserve_prefill_overlap_slots():
+    from freetoken.engine.engine import _rank_moe_prefill_overlap_enabled
+
+    try:
+        for rank, expected in ((0, True), (1, True), (2, False)):
+            _reset_execution_for_tests()
+            distributed_info._TP_INFO = DistributedInfo(rank, 3)
+            plan = configure_execution(
+                backbone_rank=0,
+                expert_shards=(3, 3, 2),
+                prefill_expert_shards=(4, 4, 0),
+                expert_storage_ranges=((0, 4), (3, 5), (6, 2)),
+                engram_ranks=(0, 1),
+            )
+            assert _rank_moe_prefill_overlap_enabled(True, plan, 8) is expected
+            assert not _rank_moe_prefill_overlap_enabled(False, plan, 8)
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_engine_config_accepts_phase_aware_ep4_with_two_decode_only_ranks():
+    from freetoken.engine.engine import _adjust_config
+
+    try:
+        for rank, stored_experts in enumerate((4, 6, 2, 2)):
+            config = _engine_config(
+                world_size=4,
+                expert_shards=(2, 2, 2, 2),
+                prefill_expert_shards=(4, 4, 0, 0),
+                expert_storage_ranges=((0, 4), (2, 6), (4, 2), (6, 2)),
+                engram_ranks=(0, 1),
+            )
+            object.__setattr__(config, "tp_info", DistributedInfo(rank, 4))
+            _reset_execution_for_tests()
+            distributed_info._TP_INFO = config.tp_info
+            plan = configure_execution(
+                backbone_rank=config.dsv41_backbone_rank,
+                expert_shards=config.dsv41_expert_shards,
+                prefill_expert_shards=config.dsv41_prefill_expert_shards,
+                expert_storage_ranges=config.dsv41_expert_storage_ranges,
+                engram_ranks=config.dsv41_engram_ranks,
+            )
+            _adjust_config(config)
+            assert plan.phase_aware
+            assert plan.prefill_active_ranks == (0, 1)
+            assert plan.supports_packed_prefill
+            assert config.model_config.num_experts == stored_experts
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
 def test_engram_history_comes_from_tokens_immediately_before_the_forward():
     class CapturingHasher:
         def row_ids(self, input_ids, positions, cu, history):

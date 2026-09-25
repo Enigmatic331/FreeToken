@@ -202,6 +202,12 @@ class DeepseekV41ExecutionPlan:
             ("prefill", self.partition(total_experts, prefill=True)),
             ("decode", self.partition(total_experts)),
         ):
+            # A phase-inactive rank owns no experts and therefore imposes no
+            # storage requirement.  Its partition offset is merely the prefix
+            # sum of earlier shards and need not fall inside this rank's
+            # unrelated decode-storage interval.
+            if owned.local_count == 0:
+                continue
             if not (
                 storage.global_offset <= owned.global_offset
                 and owned.global_stop <= storage.global_stop
