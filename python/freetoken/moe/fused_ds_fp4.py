@@ -104,6 +104,7 @@ def routed_experts_fp4(
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
     return_route_outputs: bool = False,
+    activation_block_size: int = 128,
 ) -> torch.Tensor:
     """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
@@ -117,15 +118,23 @@ def routed_experts_fp4(
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
 
-    x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
+    x = act_quant_fp8_roundtrip(
+        x, activation_block_size
+    )  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = _grouped_decode(
         x, gate_up_packed, gate_up_scale, slots, None,
         a_row_is_route=False, mul_routed_weight=False,
     )  # [T, top_k, 2I]
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
+    # SwiGLU writes independent storage.  End the larger gate/up tensor's
+    # lifetime before allocating the down projection so the caching allocator
+    # can reuse this block instead of overlapping both route-output buffers.
+    del gate_up
 
     act = act.reshape(T * top_k, I)
-    act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
+    act_quant_fp8_inplace(
+        act, activation_block_size
+    )  # down activation -> FP8 round-trip
     down = _grouped_decode(
         act, down_packed, down_scale, slots, topk_weights,
         a_row_is_route=True, mul_routed_weight=True,
@@ -193,6 +202,7 @@ def routed_experts_fp4_prefill(
     swiglu_limit: float,
     num_rows: int,
     return_route_outputs: bool = False,
+    activation_block_size: int = 128,
 ) -> torch.Tensor:
     """Grouped-GEMM counterpart of :func:`routed_experts_fp4` for dense prefill
     chunks: one moe_align sort shared by both GEMMs, each expert's weights
@@ -205,6 +215,7 @@ def routed_experts_fp4_prefill(
             x, slots, topk_weights,
             gate_up_packed, gate_up_scale, down_packed, down_scale, swiglu_limit,
             return_route_outputs=return_route_outputs,
+            activation_block_size=activation_block_size,
         )
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
@@ -220,7 +231,9 @@ def routed_experts_fp4_prefill(
     sorted_ids, expert_ids, ntpp = moe_align_block_size(slots, cfg["BLOCK_SIZE_M"], num_rows)
     tw = topk_weights.reshape(-1).contiguous()
 
-    x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
+    x = act_quant_fp8_roundtrip(
+        x, activation_block_size
+    )  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = torch.empty((T, top_k, two_I), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         x, gate_up_packed, gate_up_scale, gate_up, tw,
@@ -229,8 +242,21 @@ def routed_experts_fp4_prefill(
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
 
     act = act.reshape(routes, I)
-    act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
-    down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
+    act_quant_fp8_inplace(
+        act, activation_block_size
+    )  # down activation -> FP8 round-trip
+    down_numel = T * top_k * H
+    if gate_up.numel() >= down_numel:
+        # The gate/up result is dead after SwiGLU and, at DSV4 geometry, is
+        # wider than the down result.  Reinterpret its storage instead of
+        # asking the fragmented long-prefill allocator for another ~480 MiB
+        # block.  Both kernels use the same CUDA stream, so the down write is
+        # ordered after SwiGLU's final read from this storage.
+        down = gate_up.reshape(-1)[:down_numel].view(T, top_k, H)
+        del gate_up
+    else:
+        del gate_up
+        down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         act, down_packed, down_scale, down, tw,
         sorted_ids, expert_ids, ntpp, routes, 1, True, cfg,

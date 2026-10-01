@@ -76,9 +76,90 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     tokenize_worker(**kwargs)
 
 
+def _vision_owner_rank(args: ServerArgs) -> int:
+    """Resolve the one model authority that may load an auxiliary vision tower."""
+    configured = {
+        rank
+        for rank in (args.dsv41_backbone_rank, args.qwen4_exp_backbone_rank)
+        if rank is not None
+    }
+    if len(configured) > 1:
+        raise ValueError(
+            "rank-local CUDA visibility requires the configured model backbone ranks to agree"
+        )
+    return next(iter(configured), 0)
+
+
+def _normalize_vision_device_spec(spec: str) -> str:
+    """Convert torch's ``cuda:N`` spelling to the GPU-selector spelling."""
+    value = spec.strip()
+    if value.lower().startswith("cuda:"):
+        value = value.split(":", 1)[1]
+    if not value:
+        raise ValueError("--vision-device needs a CUDA ordinal or GPU UUID")
+    return value
+
+
+def _apply_rank_local_cuda_visibility(args: ServerArgs) -> ServerArgs:
+    """Narrow one spawned scheduler before torch/CUDA imports and remap devices."""
+    if not args.rank_local_cuda_visibility:
+        return args
+    if args.gpu_assigned is None:
+        raise RuntimeError(
+            "--rank-local-cuda-visibility requires parent-resolved --gpu UUIDs"
+        )
+
+    from freetoken.gpu_select import rank_local_cuda_plan
+
+    visible, vision_ordinal = rank_local_cuda_plan(
+        rank=args.tp_info.rank,
+        text_uuids=args.gpu_assigned,
+        vision_uuid=args.vision_device_assigned,
+        vision_owner_rank=_vision_owner_rank(args),
+        auxiliary_uuids=(
+            (args.dspark_device_assigned,)
+            if args.dspark_device_assigned is not None
+            else ()
+        ),
+        text_peer_visibility=args.rank_local_cuda_peer_visibility,
+    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
+    if vision_ordinal is None:
+        os.environ.pop("FREETOKEN_LOAD_VISION", None)
+        local_vision = None
+    else:
+        os.environ["FREETOKEN_LOAD_VISION"] = "1"
+        local_vision = str(vision_ordinal)
+
+    logger = init_logger(__name__)
+    local_dspark = None
+    if args.tp_info.rank == _vision_owner_rank(args) and args.dspark_device_assigned:
+        local_dspark = str(
+            next(
+                i
+                for i, uuid in enumerate(visible)
+                if uuid.upper() == args.dspark_device_assigned.upper()
+            )
+        )
+    logger.info(
+        "Rank-local CUDA visibility: global_rank=%d visible_uuids=%s "
+        "text_device=cuda:0 text_peer_visibility=%s vision_device=%s dspark_device=%s",
+        args.tp_info.rank,
+        ",".join(visible),
+        args.rank_local_cuda_peer_visibility,
+        "none" if local_vision is None else f"cuda:{local_vision}",
+        "none" if local_dspark is None else f"cuda:{local_dspark}",
+    )
+    return replace(args, vision_device=local_vision, dspark_device=local_dspark)
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
+
+    # A spawned child owns its environment, so this cannot alter the frontend or
+    # tokenizer visibility.  It must happen before importing torch/Scheduler.
+    args = _apply_rank_local_cuda_visibility(args)
 
     # published (not bound) here: the engine binds it after the allocator setup
     from freetoken.gpu_select import set_assigned_gpu
@@ -174,6 +255,62 @@ def launch_server(
         logger.info(
             f"--gpu {','.join(server_args.gpu)} -> "
             f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
+        )
+
+    if server_args.rank_local_cuda_visibility:
+        if not server_args.gpu or server_args.gpu_assigned is None:
+            raise SystemExit(
+                f"{prog or 'ft serve'}: error: --rank-local-cuda-visibility requires "
+                "--gpu entries that NVML can resolve to UUIDs"
+            )
+        vision_uuid = None
+        if server_args.vision_device is not None:
+            from freetoken.gpu_select import resolve_gpu_uuids
+
+            try:
+                resolved = resolve_gpu_uuids(
+                    [_normalize_vision_device_spec(server_args.vision_device)]
+                )
+            except ValueError as exc:
+                raise SystemExit(
+                    f"{prog or 'ft serve'}: error: cannot resolve --vision-device: {exc}"
+                ) from exc
+            if resolved is None:
+                raise SystemExit(
+                    f"{prog or 'ft serve'}: error: --rank-local-cuda-visibility requires "
+                    "NVML to resolve --vision-device"
+                )
+            vision_uuid = resolved[0]
+        dspark_uuid = None
+        if server_args.dspark_device is not None:
+            from freetoken.gpu_select import resolve_gpu_uuids
+
+            try:
+                resolved = resolve_gpu_uuids(
+                    [_normalize_vision_device_spec(server_args.dspark_device)]
+                )
+            except ValueError as exc:
+                raise SystemExit(
+                    f"{prog or 'ft serve'}: error: cannot resolve --dspark-device: {exc}"
+                ) from exc
+            if resolved is None:
+                raise SystemExit(
+                    f"{prog or 'ft serve'}: error: --rank-local-cuda-visibility requires "
+                    "NVML to resolve --dspark-device"
+                )
+            dspark_uuid = resolved[0]
+        server_args = replace(
+            server_args,
+            vision_device_assigned=vision_uuid,
+            dspark_device_assigned=dspark_uuid,
+        )
+        logger.info(
+            "Rank-local CUDA visibility enabled: text=%s text_peers=%s vision=%s dspark=%s owner_rank=%d",
+            ",".join(server_args.gpu_assigned),
+            server_args.rank_local_cuda_peer_visibility,
+            vision_uuid or "none",
+            dspark_uuid or "none",
+            _vision_owner_rank(server_args),
         )
 
     def start_subprocess() -> "BackendHandle":

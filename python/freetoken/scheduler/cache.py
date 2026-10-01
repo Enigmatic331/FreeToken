@@ -274,6 +274,30 @@ class CacheManager:
         if self.swa_pool is not None and len(indices) > 0:
             self.swa_pool.free_swa(indices)
 
+    def release_speculative_tail(self, req: Req, committed_len: int) -> None:
+        """Return whole pages allocated only for a rejected proposal suffix.
+
+        Speculation allocates against the maximum verify width before target
+        acceptance is known. ``committed_len`` is the exclusive KV frontier,
+        not the logical length including the newly sampled target bonus: that
+        bonus has not been forwarded yet and therefore owns no KV page.  Call
+        this before lowering ``req.device_len`` so pages strictly above the
+        committed frontier do not leak.  A following decode allocation will
+        reacquire the bonus token's page when it crosses a page boundary.
+        """
+
+        first_page = div_ceil(committed_len, self.page_size)
+        last_page = div_ceil(req.device_len, self.page_size)
+        if last_page <= first_page or req.table_idx < 0:
+            return
+        slots = self.page_table[
+            req.table_idx,
+            first_page * self.page_size : last_page * self.page_size,
+        ].clone()
+        if self.swa_paged:
+            self._free_swa(slots)
+        self.free_slots = torch.cat([self.free_slots, slots[:: self.page_size]])
+
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []

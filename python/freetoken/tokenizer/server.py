@@ -220,7 +220,9 @@ def tokenize_worker(
                         finished=msg.finished,
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
-                        completion_tokens_delta=1,
+                        completion_tokens_delta=(
+                            len(msg.token_ids) if msg.token_ids is not None else 1
+                        ),
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
                         mamba_used_slots=msg.mamba_used_slots,
@@ -280,6 +282,7 @@ def tokenize_worker(
                                     mrope_position_delta=encoded.mrope_position_delta,
                                     is_multimodal=encoded.is_multimodal,
                                     image_cache_keys=encoded.image_cache_keys,
+                                    image_token_spans=encoded.image_token_spans,
                                     image_inputs=encoded.image_inputs,
                                 )
                             )

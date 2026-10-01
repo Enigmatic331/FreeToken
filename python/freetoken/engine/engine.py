@@ -216,8 +216,14 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
 
     model_config = config.model_config
     if getattr(config, "vision_device", None) is not None:
-        if getattr(model_config, "qwen4_args", None) is None:
-            raise ValueError("--vision-device currently supports Qwen3.8/Qwen4Exp checkpoints")
+        if (
+            getattr(model_config, "qwen4_args", None) is None
+            and getattr(model_config, "dsv41_args", None) is None
+        ):
+            raise ValueError(
+                "--vision-device currently supports Qwen3.8/Qwen4Exp and "
+                "DeepSeek-V4.1 checkpoints"
+            )
         if not model_config.is_multimodal:
             raise ValueError(
                 "--vision-device was set, but this checkpoint has no compatible vision_config"
@@ -410,7 +416,13 @@ class Engine:
                 spec = config.vision_device
                 vision_device = torch.device(f"cuda:{spec}" if spec.isdecimal() else spec)
                 self.model.set_vision_device(vision_device)
+            if hasattr(self.model, "set_dspark_device") and config.dspark_device is not None:
+                spec = config.dspark_device
+                dspark_device = torch.device(f"cuda:{spec}" if spec.isdecimal() else spec)
+                self.model.set_dspark_device(dspark_device)
             self.model.load_state_dict(self._load_weight_state_dict(config))
+            if hasattr(self.model, "load_auxiliary_weights"):
+                self.model.load_auxiliary_weights(config)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -421,6 +433,42 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self._spec_accepted = 0
+        self._spec_drafted = 0
+        self._spec_reported_drafted = 0
+        self._spec_rounds = 0
+        self._spec_accepted_per_position: list[int] = []
+        self._spec_proposed_per_position: list[int] = []
+        self._spec_verification_lengths: dict[int, int] = {}
+        self._spec_accepted_by_length: dict[int, int] = {}
+        self._spec_drafted_by_length: dict[int, int] = {}
+        self._spec_report_interval = max(config.dspark_fallback_min_drafted, 1)
+        self._dspark_fallback = None
+        self._dspark_fallback_uid: int | None = None
+        if config.speculative_dspark and config.dspark_fallback_acceptance > 0:
+            from freetoken.models.deepseek_v41.dspark import DSparkAcceptanceFallback
+
+            self._dspark_fallback = DSparkAcceptanceFallback(
+                config.dspark_fallback_acceptance,
+                config.dspark_fallback_min_drafted,
+                config.dspark_fallback_steps,
+            )
+        self._dspark_adaptive = None
+        self._dspark_adaptive_uid: int | None = None
+        self._dspark_next_verification_length: int | None = None
+        self._dspark_verification_schedule = config.dspark_verification_schedule
+        self._dspark_schedule_index = 0
+        self._dspark_schedule_uid: int | None = None
+        self._dspark_scheduled_length: int | None = None
+        if config.speculative_dspark and config.dspark_adaptive_verification:
+            from freetoken.models.deepseek_v41.dspark import (
+                DSparkAdaptiveVerification,
+            )
+
+            assert config.dspark_adaptive_costs_ms is not None
+            self._dspark_adaptive = DSparkAdaptiveVerification(
+                config.dspark_adaptive_costs_ms
+            )
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -450,6 +498,8 @@ class Engine:
                 self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        if config.speculative_dspark:
+            self._warmup_dspark_moe_kernels(config)
 
         # ======================= KV cache initialization ========================
         new_free_pair = self._sync_get_memory()
@@ -575,6 +625,104 @@ class Engine:
         ):
             self.moe_offload_cache.preload_full()
 
+    @torch.inference_mode()
+    def _warmup_dspark_moe_kernels(self, config: EngineConfig) -> None:
+        """Load every local decode-MoE module DSpark can need before NCCL traffic.
+
+        A speculative target pass has ``1 + gamma`` rows while ordinary decode has
+        one.  Triton's LRU admission kernel specializes on the next-power-of-two
+        route count, so graph warmup for a one-row decode does not load the modules
+        used by the 2..6-row DSpark passes.  Loading one of those modules after an
+        NCCL kernel has been submitted can context-synchronize behind the collective
+        and deadlock all ranks.  Exercise only the rank-local admission/copy/GEMV
+        path here, before requests exist, then restore a cold cache.
+        """
+
+        cache = self.moe_offload_cache
+        args = getattr(config.model_config, "dsv41_args", None)
+        if cache is None or args is None:
+            return
+        iter_layers = getattr(self.model, "_iter_offload_moe_layers", None)
+        if iter_layers is None:
+            return
+        gpu_layer = next(
+            (
+                layer
+                for layer in iter_layers()
+                if not cache.is_cpu_layer(int(layer.layer_id))
+            ),
+            None,
+        )
+        if gpu_layer is None:
+            return
+
+        from freetoken.kernel.triton.dsv41 import (
+            fused_localize_cache_safe_routes,
+        )
+
+        top_k = int(gpu_layer.top_k)
+        max_rows = int(args.dspark_block_size) + 1
+        layer_id = int(gpu_layer.layer_id)
+        started = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        started.record(self.stream)
+        for rows in range(1, max_rows + 1):
+            cache.reset()
+            hidden = torch.zeros(
+                (rows, int(args.dim)), dtype=self.dtype, device=self.device
+            )
+            weights = torch.zeros(
+                (rows, top_k), dtype=torch.float32, device=self.device
+            )
+            weights[:, 0] = 1.0
+            global_ids = torch.zeros(
+                (rows, top_k), dtype=torch.int32, device=self.device
+            )
+            weights, local_ids = fused_localize_cache_safe_routes(
+                weights,
+                global_ids,
+                global_offset=0,
+                local_count=int(cache.num_experts),
+            )
+            cache.ensure_experts(layer_id, local_ids)
+            cache.copy_missing()
+            route_outputs = gpu_layer._expert_gemm(
+                cache,
+                hidden,
+                weights,
+                local_ids,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(layer_id),
+                is_prefill=False,
+            )
+            # EP reduces the per-route tensor with NCCL before loading this
+            # Triton reduction.  If its first module load happens after the
+            # collective is queued, cuModuleLoadData can context-synchronize
+            # behind that collective.  Load the exact post-collective geometry
+            # locally while no communicator work is in flight.
+            if route_outputs.ndim == 3:
+                from freetoken.kernel import moe_sum_reduce_triton
+
+                reduced = torch.empty(
+                    (rows, int(args.dim)),
+                    dtype=route_outputs.dtype,
+                    device=self.device,
+                )
+                moe_sum_reduce_triton(route_outputs, reduced)
+            torch.cuda.synchronize(self.device)
+        cache.reset()
+        torch.cuda.synchronize(self.device)
+        ended.record(self.stream)
+        torch.cuda.synchronize(self.device)
+        logger.info_rank0(
+            "DSpark MoE kernel warmup complete for target rows 1..%d in %.3f s",
+            max_rows,
+            started.elapsed_time(ended) / 1000.0,
+        )
+        if self._execution_plan.enabled:
+            torch.distributed.barrier(group=self.tp_cpu_group)
+
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
@@ -597,6 +745,10 @@ class Engine:
                 world_size=config.tp_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
+                # Under rank-local CUDA visibility every worker's assigned text
+                # GPU is cuda:0.  Binding the process group prevents NCCL from
+                # guessing a (now invalid) visible ordinal from the global rank.
+                device_id=self.device,
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
@@ -1129,18 +1281,362 @@ class Engine:
         ):
             self.moe_offload_cache.preload_full()
 
+    def should_speculate(self, req: Req) -> bool:
+        """Apply the request-local low-acceptance circuit breaker."""
+
+        # The V4.1 DSpark checkpoint is text-only.  A multimodal prompt can still
+        # use the native target vision path, but feeding its soft-token prefill
+        # through the auxiliary context catch-up is both unsupported and very
+        # expensive on the auxiliary GPU.  Keep these requests target-only.
+        if req.is_multimodal:
+            return False
+        fallback = self._dspark_fallback
+        if fallback is None:
+            return True
+        if self._dspark_fallback_uid != req.uid:
+            fallback.reset()
+            self._dspark_fallback_uid = req.uid
+        return fallback.should_speculate()
+
+    def speculation_length(self, req: Req, max_length: int) -> int:
+        """Return the already-decided verification length for this decode step."""
+
+        adaptive = self._dspark_adaptive
+        if adaptive is None:
+            schedule = self._dspark_verification_schedule
+            if schedule is None:
+                return int(max_length)
+            if self._dspark_schedule_uid != req.uid:
+                self._dspark_schedule_uid = req.uid
+                self._dspark_scheduled_length = schedule[
+                    self._dspark_schedule_index % len(schedule)
+                ]
+                self._dspark_schedule_index += 1
+            assert self._dspark_scheduled_length is not None
+            if self._dspark_scheduled_length > max_length:
+                raise RuntimeError(
+                    f"scheduled DSpark length {self._dspark_scheduled_length} "
+                    f"exceeds block {max_length}"
+                )
+            return int(self._dspark_scheduled_length)
+        if adaptive.max_length != max_length:
+            raise RuntimeError(
+                f"DSpark adaptive controller has {adaptive.max_length} costs for "
+                f"a {max_length}-token block"
+            )
+        if self._dspark_adaptive_uid != req.uid:
+            self._dspark_adaptive_uid = req.uid
+            self._dspark_next_verification_length = adaptive.initial_length()
+        if self._dspark_next_verification_length is None:
+            raise RuntimeError("DSpark adaptive verification has no next length")
+        return int(self._dspark_next_verification_length)
+
+    def _record_dspark_acceptance(
+        self, req: Req, accepted: int, drafted: int
+    ) -> None:
+        self._spec_accepted += int(accepted)
+        self._spec_drafted += int(drafted)
+        self._spec_rounds += 1
+        if len(self._spec_accepted_per_position) < drafted:
+            self._spec_accepted_per_position.extend(
+                [0] * (drafted - len(self._spec_accepted_per_position))
+            )
+            self._spec_proposed_per_position.extend(
+                [0] * (drafted - len(self._spec_proposed_per_position))
+            )
+        for position in range(int(drafted)):
+            self._spec_proposed_per_position[position] += 1
+        for position in range(min(int(accepted), int(drafted))):
+            self._spec_accepted_per_position[position] += 1
+        self._spec_verification_lengths[int(drafted)] = (
+            self._spec_verification_lengths.get(int(drafted), 0) + 1
+        )
+        self._spec_accepted_by_length[int(drafted)] = (
+            self._spec_accepted_by_length.get(int(drafted), 0) + int(accepted)
+        )
+        self._spec_drafted_by_length[int(drafted)] = (
+            self._spec_drafted_by_length.get(int(drafted), 0) + int(drafted)
+        )
+        if (
+            self._spec_drafted - self._spec_reported_drafted
+            >= self._spec_report_interval
+        ):
+            self._spec_reported_drafted = self._spec_drafted
+            positional = ", ".join(
+                f"{accepted_at_position / proposed_at_position:.1%}"
+                for accepted_at_position, proposed_at_position in zip(
+                    self._spec_accepted_per_position,
+                    self._spec_proposed_per_position,
+                    strict=True,
+                )
+            )
+            lengths = ", ".join(
+                f"{length}:{self._spec_accepted_by_length[length]}/"
+                f"{self._spec_drafted_by_length[length]} in {count} rounds"
+                for length, count in sorted(self._spec_verification_lengths.items())
+            )
+            logger.info_rank0(
+                f"DSpark accepted {self._spec_accepted}/{self._spec_drafted} "
+                f"proposals ({self._spec_accepted / self._spec_drafted:.1%}); "
+                f"per-position [{positional}] over {self._spec_rounds} rounds; "
+                f"verification lengths [{lengths}]"
+            )
+        fallback = self._dspark_fallback
+        if fallback is None:
+            return
+        if self._dspark_fallback_uid != req.uid:
+            fallback.reset()
+            self._dspark_fallback_uid = req.uid
+        rate = fallback.record(accepted, drafted)
+        if rate is not None:
+            logger.warning_rank0(
+                f"DSpark acceptance {rate:.1%} fell below "
+                f"{fallback.threshold:.1%}; bypassing the drafter for "
+                f"{fallback.cooldown_steps} decode steps"
+            )
+
+    def draft_into_batch(self, batch: Batch) -> torch.Tensor | None:
+        """Replace DSpark noise placeholders with the checkpoint proposal."""
+
+        if not batch.speculative:
+            raise ValueError("draft_into_batch requires a speculative batch")
+        batch.spec_carry_states = {}
+        if self._execution_plan.is_expert_worker:
+            # Workers need only the target verify's row count and collectives.
+            # The authority owns the target embedding/head and auxiliary drafter.
+            return None
+        drafter = getattr(self.model, "draft", None)
+        if drafter is None:
+            raise RuntimeError("DSpark was scheduled without a model drafter")
+        with self.ctx.forward_batch(batch):
+            out = drafter([req.sampling_params for req in batch.reqs])
+        if out is None:
+            raise RuntimeError("DSpark was scheduled without loaded auxiliary weights")
+        proposed, q, confidence = out
+        gamma = batch.spec_block
+        if len(batch.reqs) != 1 or proposed.numel() < gamma:
+            raise RuntimeError(
+                f"V4.1 DSpark proposed {proposed.numel()} tokens for "
+                f"{len(batch.reqs)} requests; expected at least one "
+                f"{gamma}-token block"
+            )
+        span = 1 + gamma
+        if batch.input_ids.numel() != span:
+            raise RuntimeError(
+                f"V4.1 DSpark verify has {batch.input_ids.numel()} rows, expected {span}"
+            )
+        proposed = proposed[:gamma]
+        q = q[:gamma]
+        batch.input_ids[1:span].copy_(proposed.to(batch.input_ids.dtype))
+        batch.draft_tokens = proposed
+        batch.draft_probs = q
+        return confidence
+
+    def _restore_speculative_carry(self, batch: Batch, selected_row: int) -> None:
+        """Restore every ratio-2 compressor to the accepted target row."""
+
+        req = batch.reqs[0]
+        position = int(batch.positions[selected_row].item())
+        window_slot = int(
+            self.attn_backend.window_slots_of(
+                req.table_idx, position, position + 1
+            )[0].item()
+        )
+        if batch.dsv41_spec_graph_replayed:
+            restore = getattr(self.model, "restore_dspark_graph_carry", None)
+            if restore is None:
+                raise RuntimeError(
+                    "DSpark CUDA graph has no compressor rollback adapter"
+                )
+            restore(selected_row, window_slot)
+            return
+        journal = batch.spec_carry_states
+        if not journal:
+            raise RuntimeError("DSpark target verify produced no compressor carry journal")
+        for (layer_id, tier, ring_size), pieces in journal.items():
+            if len(pieces) != batch.input_ids.numel():
+                raise RuntimeError(
+                    f"DSpark carry journal layer {layer_id}/{tier} has "
+                    f"{len(pieces)} rows, expected {batch.input_ids.numel()}"
+                )
+            self.attn_backend.write_carry(
+                layer_id,
+                tier,
+                window_slot,
+                ring_size,
+                pieces[selected_row][0],
+            )
+
+    def _commit_dspark_target_features(self, features) -> None:
+        if features is None:
+            return
+        catch_up = getattr(self.model, "catch_up_draft_context", None)
+        if catch_up is not None:
+            catch_up(features)
+
+    def _finish_speculative(
+        self, batch: Batch, logits: torch.Tensor, target_features
+    ) -> ForwardOutput:
+        """Commit the exact target-accepted prefix and one target bonus token."""
+
+        from freetoken.models.deepseek_v41.dspark import (
+            accepted_prefix,
+            rejection_accept_device,
+            sampling_probs,
+        )
+
+        if len(batch.reqs) != 1:
+            raise RuntimeError("V4.1 auxiliary DSpark currently supports one request")
+        req = batch.reqs[0]
+        gamma = batch.spec_block
+        root = self._execution_plan.backbone_rank or 0
+        authority = not self._execution_plan.is_expert_worker
+        # accepted count, target bonus, next verification length, proposal prefix
+        decision = torch.zeros(gamma + 3, dtype=torch.int32, device=self.device)
+        if authority:
+            expected = gamma + 1
+            if logits.shape[0] != expected:
+                raise RuntimeError(
+                    f"DSpark verify produced {logits.shape[0]} logits rows, "
+                    f"expected {expected}"
+                )
+            proposed = batch.draft_tokens
+            if proposed is None or proposed.numel() != gamma:
+                raise RuntimeError("DSpark verify is missing its proposal block")
+            params = req.sampling_params
+            if params.is_greedy:
+                target = logits.argmax(dim=-1).to(torch.int32)
+                n_acc, bonus = accepted_prefix(proposed, target)
+            else:
+                if batch.draft_probs is None:
+                    raise RuntimeError(
+                        "sampled DSpark verification is missing draft probabilities"
+                    )
+                p = sampling_probs(
+                    logits,
+                    params.temperature,
+                    params.top_p,
+                    params.top_k,
+                )
+                n_acc, bonus = rejection_accept_device(
+                    proposed, batch.draft_probs, p
+                )
+            adaptive = self._dspark_adaptive
+            decision[2] = gamma
+            if adaptive is not None:
+                confidence = batch.draft_confidence
+                if confidence is None:
+                    raise RuntimeError(
+                        "adaptive DSpark verification is missing confidence logits"
+                    )
+                decision[2].copy_(adaptive.choose_tensor(confidence))
+            decision[0] = n_acc
+            decision[1] = bonus
+            decision[3:].copy_(proposed.to(torch.int32))
+        if self._execution_plan.enabled:
+            decision = DistributedCommunicator().broadcast(decision, root)
+        host = decision.to("cpu", non_blocking=False)
+        n_acc, bonus, next_length = int(host[0]), int(host[1]), int(host[2])
+        proposed_cpu = host[3:].to(req.input_ids.dtype)
+        if not 0 <= n_acc <= gamma:
+            raise RuntimeError(f"DSpark accepted invalid prefix length {n_acc}")
+        if self._dspark_adaptive is not None:
+            if not 1 <= next_length <= self._dspark_adaptive.max_length:
+                raise RuntimeError(
+                    f"DSpark selected invalid verification length {next_length}"
+                )
+            self._dspark_adaptive_uid = req.uid
+            self._dspark_next_verification_length = next_length
+
+        start = req.input_ids.numel() - gamma
+        keep = start + n_acc
+        req.input_ids = req._ids_buf[:start]
+        if n_acc:
+            req.append_host(proposed_cpu[:n_acc])
+        req.append_host(torch.tensor([bonus], dtype=req.input_ids.dtype))
+        release_tail = getattr(batch, "release_tail", None)
+        if release_tail is not None:
+            # Only [0, keep) has computed KV. The target bonus at `keep` is a
+            # logical live token and receives a page on the next decode step;
+            # retaining a speculative-only page here leaks it when the request
+            # finishes exactly on a page boundary.
+            release_tail(req, keep)
+        req.cached_len, req.device_len = keep, keep + 1
+        emitted = torch.cat(
+            [proposed_cpu[:n_acc].to(torch.int32), host[1:2].to(torch.int32)]
+        )
+        batch.spec_emitted = [emitted]
+        self._record_dspark_acceptance(req, n_acc, gamma)
+
+        if authority:
+            self._restore_speculative_carry(batch, n_acc)
+            if target_features is None:
+                raise RuntimeError("DSpark verify returned no target hidden features")
+            if target_features.hidden.shape[0] != gamma + 1:
+                raise RuntimeError(
+                    f"DSpark target returned {target_features.hidden.shape[0]} "
+                    f"feature rows, expected {gamma + 1}"
+                )
+            from freetoken.models.deepseek_v41.model import DSparkTargetFeatures
+
+            committed = DSparkTargetFeatures(
+                target_features.hidden[: n_acc + 1],
+                target_features.positions[: n_acc + 1],
+            )
+            self._commit_dspark_target_features(committed)
+
+        last_cpu = host[1:2].to(torch.int32)
+        last_gpu = last_cpu.to(self.device, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record(self.stream)
+        return ForwardOutput(last_gpu, last_cpu, done)
+
+    def _fence_dspark_worker_before_decision(self, batch: Batch) -> None:
+        """Keep expert workers from posting the next NCCL op too early.
+
+        V4.1 expert-only ranks can enqueue every target MoE collective before the
+        authority has finished the attention/compressor work between those
+        collectives.  If a worker then posts the speculative-decision broadcast,
+        an authority-side CUDA synchronization inside the compressor can wait on
+        that future broadcast while the broadcast waits for the authority: a
+        circular wait.
+
+        Synchronizing only the worker's model stream drains the already-matched
+        target collectives before it may enter the decision broadcast.  The
+        authority does not need a fence, and no CPU/Gloo collective is added to
+        the steady-state path.
+        """
+
+        if (
+            batch.speculative
+            and self.config.speculative_dspark
+            and self._execution_plan.is_expert_worker
+        ):
+            self.stream.synchronize()
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        target_features = None
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+            get_features = getattr(self.model, "dspark_target_features", None)
+            if get_features is not None and not any(
+                req.is_multimodal for req in batch.reqs
+            ):
+                target_features = get_features()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
+        self._fence_dspark_worker_before_decision(batch)
+        if batch.speculative:
+            return self._finish_speculative(batch, logits, target_features)
+
+        self._commit_dspark_target_features(target_features)
         for req in batch.reqs:
             req.complete_one()
 
@@ -1482,6 +1978,15 @@ def _adjust_config(config: EngineConfig):
     dsv41_engram_ranks = getattr(config, "dsv41_engram_ranks", None)
     dsv41_tp2_ep2 = getattr(config, "dsv41_tp2_ep2", False)
     dsv41_attention_tp2_ep2 = getattr(config, "dsv41_attention_tp2_ep2", False)
+    speculative_dspark = getattr(config, "speculative_dspark", False)
+    dspark_verification_length = getattr(
+        config, "dspark_verification_length", None
+    )
+    dspark_verification_schedule = getattr(
+        config, "dspark_verification_schedule", None
+    )
+    dspark_adaptive = getattr(config, "dspark_adaptive_verification", False)
+    dspark_adaptive_costs = getattr(config, "dspark_adaptive_costs_ms", None)
     moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
     tp_info = getattr(config, "tp_info", None)
 
@@ -1600,6 +2105,106 @@ def _adjust_config(config: EngineConfig):
             partition.global_stop,
             plan.resolved_engram_ranks,
         )
+
+    if speculative_dspark:
+        if dsv41_args is None:
+            raise ValueError(
+                "--speculative-dspark is currently implemented for DeepSeek-V4.1-Flash"
+            )
+        if not dsv41_args.has_dspark:
+            raise ValueError(
+                "--speculative-dspark: this checkpoint does not declare a usable MTP stack"
+            )
+        if config.max_running_req != 1:
+            raise ValueError(
+                "DeepSeek-V4.1 auxiliary DSpark currently requires "
+                "--max-running-requests 1"
+            )
+        if (
+            config.dspark_device is None
+            and tp_info.rank == dsv41_backbone_rank
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 DSpark requires --dspark-device; its 7.4-GiB resident "
+                "MTP payload must not consume the target EP ranks' expert-cache headroom"
+            )
+        block_size = dsv41_args.dspark_block_size
+        if (
+            dspark_verification_length is not None
+            and dspark_verification_length > block_size
+        ):
+            raise ValueError(
+                "--dspark-verification-length cannot exceed the checkpoint "
+                f"block size {block_size}"
+            )
+        if dspark_verification_schedule is not None and any(
+            length > block_size for length in dspark_verification_schedule
+        ):
+            raise ValueError(
+                "--dspark-verification-schedule values cannot exceed the "
+                f"checkpoint block size {block_size}"
+            )
+        selected_policies = sum(
+            (
+                dspark_verification_length is not None,
+                dspark_verification_schedule is not None,
+                dspark_adaptive,
+            )
+        )
+        if selected_policies > 1:
+            raise ValueError(
+                "--dspark-verification-length, --dspark-verification-schedule, "
+                "and --dspark-adaptive-verification are mutually exclusive"
+            )
+        if dspark_adaptive:
+            if dspark_adaptive_costs is None:
+                raise ValueError(
+                    "--dspark-adaptive-verification requires "
+                    "--dspark-adaptive-costs-ms"
+                )
+            if len(dspark_adaptive_costs) != block_size:
+                raise ValueError(
+                    "--dspark-adaptive-costs-ms needs one value per verification "
+                    f"length: expected {block_size}, got {len(dspark_adaptive_costs)}"
+                )
+        elif dspark_adaptive_costs is not None:
+            raise ValueError(
+                "--dspark-adaptive-costs-ms requires "
+                "--dspark-adaptive-verification"
+            )
+        dsv41_args.dspark_enabled = True
+        # Ordinary one-token decode graphs copy the three target taps into a
+        # graph-stable output buffer for DSpark context catch-up. Verification
+        # batches remain eager because they are represented as multi-row prefills.
+        logger.info_rank0(
+            "DeepSeek-V4.1 DSpark enabled: %d stages, block=%d, verify=%s, "
+            "schedule=%s, adaptive=%s, device=%s",
+            dsv41_args.n_mtp_layers,
+            dsv41_args.dspark_block_size,
+            dspark_verification_length or dsv41_args.dspark_block_size,
+            dspark_verification_schedule,
+            dspark_adaptive,
+            config.dspark_device,
+        )
+    else:
+        if config.dspark_device is not None:
+            raise ValueError("--dspark-device requires --speculative-dspark")
+        if dspark_verification_length is not None:
+            raise ValueError(
+                "--dspark-verification-length requires --speculative-dspark"
+            )
+        if dspark_verification_schedule is not None:
+            raise ValueError(
+                "--dspark-verification-schedule requires --speculative-dspark"
+            )
+        if dspark_adaptive:
+            raise ValueError(
+                "--dspark-adaptive-verification requires --speculative-dspark"
+            )
+        if dspark_adaptive_costs is not None:
+            raise ValueError(
+                "--dspark-adaptive-costs-ms requires --speculative-dspark"
+            )
 
     if moe_cache_sizes is not None:
         if not getattr(model_config, "is_moe", False):

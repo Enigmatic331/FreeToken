@@ -70,7 +70,7 @@ def per_token_group_quant_fp8(x: torch.Tensor, block: int = _BLOCK):
     if not x2d.is_contiguous():
         x2d = x2d.contiguous()
     M = x2d.shape[0]
-    y = torch.empty((M, K), dtype=e4m3_act_dtype(), device=x.device)
+    y = torch.empty((M, K), dtype=e4m3_act_dtype(x.device), device=x.device)
     s = torch.empty((M, K // block), dtype=torch.float32, device=x.device)
     BLOCK_M = 32
     grid = (triton.cdiv(M, BLOCK_M), K // block)

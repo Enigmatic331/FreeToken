@@ -341,7 +341,7 @@ def fp8_pertensor_linear(
     SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores."""
     *lead, K = x.shape
     N = weight.shape[0]
-    w8a8 = input_scale is not None and e4m3_native()
+    w8a8 = input_scale is not None and e4m3_native(weight.device)
     segments = None
     if w8a8 and not uniform_scale and not rowwise_scaled_mm_ok():
         segments = scale_segments if scale_segments is not None else weight_scale_segments(weight_scale)

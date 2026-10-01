@@ -8,7 +8,9 @@ Three device-id namespaces, converted explicitly:
 The parent resolves --gpu entries to full UUIDs via NVML (resolve_gpu_uuids) and fails fast on a typo.
 Each worker publishes its own entry (set_assigned_gpu / assign_gpu) and binds it when CUDA comes up (bind_assigned_gpu) by matching the UUID against CUDA's visible devices.
 One process runs on one GPU. Binding is unconditional: a process that publishes nothing binds a default ordinal and records it, so assigned_visible_gpu() names that card in every case.
-No process mutates CUDA_VISIBLE_DEVICES, and the UUID match holds under any CUDA_DEVICE_ORDER.
+The ordinary path does not mutate CUDA_VISIBLE_DEVICES. ``ft serve`` can opt into
+rank-local visibility before importing torch; UUID matching still identifies the
+text device as local ordinal zero under any CUDA_DEVICE_ORDER.
 
 Stdlib only (torch is imported lazily); not under freetoken.utils, which imports transformers.
 """
@@ -163,6 +165,61 @@ def resolve_gpu_uuids(specs: Sequence[str]) -> "tuple[str, ...] | None":
     if len(set(resolved)) != len(resolved):
         raise ValueError(f"--gpu {','.join(specs)}: the same GPU appears twice")
     return tuple(resolved)
+
+
+def rank_local_cuda_plan(
+    *,
+    rank: int,
+    text_uuids: Sequence[str],
+    vision_uuid: str | None,
+    vision_owner_rank: int,
+    auxiliary_uuids: Sequence[str] = (),
+    text_peer_visibility: bool = False,
+) -> tuple[tuple[str, ...], int | None]:
+    """Return this rank's UUID visibility mask and local vision ordinal.
+
+    The assigned text GPU is always first, hence local ``cuda:0``.  Only the
+    vision owner can see the auxiliary vision GPU; when text and vision share a
+    physical GPU its ordinal is also zero and the UUID is not duplicated.  With
+    ``text_peer_visibility``, the other text GPUs follow the assigned GPU.  This
+    preserves the local workload on ``cuda:0`` while giving NCCL a complete
+    text topology for per-pair P2P validation.
+
+    This helper is deliberately stdlib-only and side-effect free.  The spawned
+    scheduler applies the returned mask before importing torch, leaving the
+    parent/frontend/tokenizer environment untouched.
+    """
+    if not 0 <= rank < len(text_uuids):
+        raise ValueError(f"rank {rank} has no text GPU in {tuple(text_uuids)!r}")
+    if not 0 <= vision_owner_rank < len(text_uuids):
+        raise ValueError(
+            f"vision owner rank {vision_owner_rank} is outside world size {len(text_uuids)}"
+        )
+    if not all(is_gpu_uuid(uuid) for uuid in text_uuids):
+        raise ValueError("rank-local CUDA visibility requires resolved GPU UUIDs")
+    if vision_uuid is not None and not is_gpu_uuid(vision_uuid):
+        raise ValueError("rank-local CUDA visibility requires a resolved vision GPU UUID")
+    if not all(is_gpu_uuid(uuid) for uuid in auxiliary_uuids):
+        raise ValueError("rank-local CUDA visibility requires resolved auxiliary GPU UUIDs")
+
+    text_uuid = text_uuids[rank]
+    visible = [text_uuid]
+    if text_peer_visibility:
+        visible.extend(
+            uuid for index, uuid in enumerate(text_uuids) if index != rank
+        )
+    vision_ordinal = None
+    if rank == vision_owner_rank and vision_uuid is not None:
+        if vision_uuid.upper() != text_uuid.upper():
+            visible.append(vision_uuid)
+        vision_ordinal = len(visible) - 1
+    if rank == vision_owner_rank:
+        known = {uuid.upper() for uuid in visible}
+        for uuid in auxiliary_uuids:
+            if uuid.upper() not in known:
+                visible.append(uuid)
+                known.add(uuid.upper())
+    return tuple(visible), vision_ordinal
 
 
 def _preset_entry(spec: str, preset: "list[str]", preset_raw: str) -> str:

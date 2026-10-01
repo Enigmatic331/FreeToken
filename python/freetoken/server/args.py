@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -51,6 +52,16 @@ class ServerArgs(SchedulerConfig):
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
     gpu_assigned: "tuple[str, ...] | None" = None
+    # Opt-in process isolation: each spawned scheduler sees only its assigned text
+    # GPU, except the vision owner which also sees the auxiliary vision GPU.
+    rank_local_cuda_visibility: bool = False
+    # Preserve the assigned text GPU as cuda:0, but expose the other configured
+    # text GPUs as topology-only peers.  This lets NCCL validate/select P2P per
+    # pair while auxiliary devices such as the vision GPU remain owner-only.
+    rank_local_cuda_peer_visibility: bool = False
+    # Parent-resolved physical vision UUID used only to construct child masks.
+    vision_device_assigned: str | None = None
+    dspark_device_assigned: str | None = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -175,6 +186,34 @@ def parse_args(
         if not values or any(item < 0 for item in values):
             raise argparse.ArgumentTypeError(
                 "must be comma-separated non-negative integers"
+            )
+        return values
+
+    def _csv_positive_ints(value: str) -> tuple[int, ...]:
+        try:
+            values = tuple(int(part.strip()) for part in value.split(","))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated positive integers"
+            ) from exc
+        if not values or any(item < 1 for item in values):
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated positive integers"
+            )
+        return values
+
+    def _csv_positive_floats(value: str) -> tuple[float, ...]:
+        try:
+            values = tuple(float(part.strip()) for part in value.split(","))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated positive numbers"
+            ) from exc
+        if not values or any(
+            not math.isfinite(number) or number <= 0 for number in values
+        ):
+            raise argparse.ArgumentTypeError(
+                "must be comma-separated positive numbers"
             )
         return values
 
@@ -330,6 +369,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--rank-local-cuda-visibility",
+        action="store_true",
+        default=ServerArgs.rank_local_cuda_visibility,
+        help=(
+            "Before CUDA initialization, restrict each scheduler rank to its assigned GPU. "
+            "The backbone rank additionally sees --vision-device when configured. Requires "
+            "NVML-resolved --gpu UUIDs."
+        ),
+    )
+    parser.add_argument(
+        "--rank-local-cuda-peer-visibility",
+        action="store_true",
+        default=ServerArgs.rank_local_cuda_peer_visibility,
+        help=(
+            "With --rank-local-cuda-visibility, keep the assigned text GPU as cuda:0 "
+            "but also expose the other configured text GPUs so NCCL can select P2P "
+            "per physical pair. Auxiliary GPUs remain visible only to their owner."
+        ),
+    )
+
+    parser.add_argument(
         "--qwen4-exp-backbone-rank",
         type=int,
         default=ServerArgs.qwen4_exp_backbone_rank,
@@ -414,6 +474,82 @@ def parse_args(
         help=(
             "Load the multimodal vision encoder on this CUDA device (for example 2 or "
             "cuda:2). The device may be outside --gpu and is used only by the backbone rank."
+        ),
+    )
+
+    parser.add_argument(
+        "--speculative-dspark",
+        action="store_true",
+        default=ServerArgs.speculative_dspark,
+        help=(
+            "Enable checkpoint-native DeepSeek DSpark/MTP block speculation. "
+            "The feature is opt-in because it loads an additional routed-expert stack."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-device",
+        type=str,
+        default=ServerArgs.dspark_device,
+        help=(
+            "Auxiliary CUDA device for the DeepSeek-V4.1 MTP stack. The 7.4-GiB "
+            "drafter stays resident here instead of evicting target experts."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-fallback-acceptance",
+        type=_parse_moe_cache_rate,
+        default=ServerArgs.dspark_fallback_acceptance,
+        help=(
+            "Temporarily bypass DSpark when observed proposal acceptance falls below "
+            "this rate; 0 disables the circuit breaker."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-fallback-min-drafted",
+        type=_positive_int,
+        default=ServerArgs.dspark_fallback_min_drafted,
+        help="Minimum drafted tokens before evaluating the DSpark circuit breaker.",
+    )
+    parser.add_argument(
+        "--dspark-fallback-steps",
+        type=_positive_int,
+        default=ServerArgs.dspark_fallback_steps,
+        help="Ordinary decode steps to run before probing DSpark again.",
+    )
+    parser.add_argument(
+        "--dspark-verification-length",
+        type=_positive_int,
+        default=ServerArgs.dspark_verification_length,
+        help=(
+            "Verify only this many DSpark proposals (1 through the checkpoint block "
+            "size). Intended for static cost profiling; the default verifies all."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-verification-schedule",
+        type=_csv_positive_ints,
+        default=ServerArgs.dspark_verification_schedule,
+        help=(
+            "Benchmark-only comma-separated fixed lengths, assigned to successive "
+            "requests without reloading the model."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-adaptive-verification",
+        action="store_true",
+        default=ServerArgs.dspark_adaptive_verification,
+        help=(
+            "Choose the next DSpark verification prefix from checkpoint confidence "
+            "and measured per-length step costs. Single-request only."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-adaptive-costs-ms",
+        type=_csv_positive_floats,
+        default=ServerArgs.dspark_adaptive_costs_ms,
+        help=(
+            "Comma-separated measured total step milliseconds for DSpark verification "
+            "lengths 1..N; required by --dspark-adaptive-verification."
         ),
     )
 
@@ -885,6 +1021,13 @@ def parse_args(
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
+        )
+    if (
+        kwargs["rank_local_cuda_peer_visibility"]
+        and not kwargs["rank_local_cuda_visibility"]
+    ):
+        parser.error(
+            "--rank-local-cuda-peer-visibility requires --rank-local-cuda-visibility"
         )
 
     # resolve some arguments

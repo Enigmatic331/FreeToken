@@ -29,6 +29,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
     next_token: int
     finished: bool
+    # One speculative target pass may accept several ordered tokens. Keep
+    # next_token as the last token for wire compatibility and carry the whole
+    # block here so incremental decoding advances each token exactly once.
+    token_ids: list[int] | None = None
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
     # and everything after it from the final output.

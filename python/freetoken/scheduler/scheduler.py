@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+_TRACE_COLLECTIVES = os.getenv("FREETOKEN_DSV41_TRACE_COLLECTIVES", "0") == "1"
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -89,6 +91,7 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        self._speculative = _speculative_config(config)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
@@ -272,6 +275,14 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
+        # A speculative step advances by a target-decided 1..gamma+1 tokens.
+        # The next batch cannot be scheduled until that frontier is committed.
+        if self._speculative is not None and last_data is not None:
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            last_data = None
+
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
         # engine stream in ``_forward``). Without this, a request that reuses a just-freed
@@ -296,8 +307,9 @@ class Scheduler(SchedulerIOMixin):
         # full_to_window INSIDE the captured graph, so an unordered drain can redirect an
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
-        self._process_last_data(last_data)
-        self._flush_abort_acks()
+        if last_data is not None:
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -384,37 +396,61 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
+                spec_emitted = getattr(batch, "spec_emitted", None)
+                if spec_emitted is not None:
+                    reply_tokens = spec_emitted[i]
+                    next_token = int(reply_tokens[-1].item())
+                else:
+                    next_token_tensor = next_tokens_cpu[i]
+                    req.append_host(next_token_tensor.unsqueeze(0))
+                    next_token = int(next_token_tensor.item())
+                    reply_tokens = None
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+                block = (
+                    [int(token) for token in reply_tokens]
+                    if reply_tokens is not None
+                    else [next_token]
                 )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
+                block_start = req.input_ids.numel() - len(block)
+                visible_tokens: list[int] = []
+                finished = False
+                finish_reason = None
+                matched_stop = None
+                for pos, token in enumerate(block):
+                    visible_len = block_start + pos + 1
+                    hit_length = not req.can_decode and pos == len(block) - 1
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos
+                        and token in self.eos_token_ids
+                    )
+                    matched_stop = (
+                        self._match_stop_str(req, end_len=visible_len)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        "stop" if (hit_eos or matched_stop is not None) else "length"
+                    ) if finished else None
+                    if (
+                        token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = visible_len
+                    visible_tokens.append(token)
+                    if finished:
+                        break
+                next_token = visible_tokens[-1]
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
                         next_token=next_token,
                         finished=finished,
+                        token_ids=(
+                            visible_tokens if len(visible_tokens) > 1 else None
+                        ),
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
@@ -467,17 +503,18 @@ class Scheduler(SchedulerIOMixin):
         )
         self.send_result(reply)
 
-    def _match_stop_str(self, req: Req) -> str | None:
+    def _match_stop_str(self, req: Req, end_len: int | None = None) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
         only a short suffix (bounded by the longest stop string's char length, so a stop of
         N chars spans at most N tokens) to keep the per-step cost small."""
         stop_strs = req.sampling_params.stop_strs
         prompt_len = req.max_device_len - req.output_len
-        if len(req.input_ids) <= prompt_len:
+        end_len = len(req.input_ids) if end_len is None else end_len
+        if end_len <= prompt_len:
             return None
         max_chars = max(len(s) for s in stop_strs)
-        tail_start = max(prompt_len, len(req.input_ids) - (max_chars + 1))
-        tail = self.tokenizer.decode(req.input_ids[tail_start:].tolist())
+        tail_start = max(prompt_len, end_len - (max_chars + 1))
+        tail = self.tokenizer.decode(req.input_ids[tail_start:end_len].tolist())
         for s in stop_strs:
             if s in tail:
                 return s
@@ -559,9 +596,19 @@ class Scheduler(SchedulerIOMixin):
                                         "vision-feature cache miss has no pixels or image fallback"
                                     )
                                 if self._vision_fallback_processor is None:
-                                    from freetoken.multimodal.qwen_vl import QwenVLProcessor
+                                    if self.config.model_config.dsv41_args is not None:
+                                        from freetoken.multimodal.deepseek_v41 import (
+                                            DeepseekV41Processor,
+                                        )
 
-                                    self._vision_fallback_processor = QwenVLProcessor(
+                                        processor_cls = DeepseekV41Processor
+                                    else:
+                                        from freetoken.multimodal.qwen_vl import (
+                                            QwenVLProcessor,
+                                        )
+
+                                        processor_cls = QwenVLProcessor
+                                    self._vision_fallback_processor = processor_cls(
                                         self.config.model_path
                                     )
                                 pixels, grid, reconstructed_keys = (
@@ -601,7 +648,7 @@ class Scheduler(SchedulerIOMixin):
                     ok = torch.tensor(
                         int(vision_error is None), dtype=torch.int32, device="cpu"
                     )
-                    self.tp_cpu_group.broadcast(ok, root=0).wait()
+                    self._cpu_broadcast(ok, "vision_ready")
                     vision_ok = bool(ok.item())
                 else:
                     vision_ok = vision_error is None
@@ -621,19 +668,45 @@ class Scheduler(SchedulerIOMixin):
                         )
                     return
                 if msg.image_cache_keys:
+                    identity_error: Exception | None = None
                     try:
                         cache_ids = self.multimodal_cache_keys.cache_ids(
                             msg.input_ids,
                             self.config.model_config.image_token_id,
                             msg.image_cache_keys,
+                            msg.image_token_spans,
                         )
                     except Exception as exc:  # noqa: BLE001 -- request-local validation
+                        identity_error = exc
+                        if _TRACE_COLLECTIVES:
+                            logger.warning(
+                                "DSV41 image cache identity rejected rank=%d uid=%d: %r",
+                                self.config.tp_info.rank,
+                                msg.uid,
+                                exc,
+                            )
+                    if self.config.tp_info.size > 1:
+                        identity_ok_count = torch.tensor(
+                            int(identity_error is None), dtype=torch.int32, device="cpu"
+                        )
+                        self._cpu_all_reduce_sum(
+                            identity_ok_count, "image_cache_identity"
+                        )
+                        identity_ok = (
+                            int(identity_ok_count.item()) == self.config.tp_info.size
+                        )
+                    else:
+                        identity_ok = identity_error is None
+                    if not identity_ok:
                         if self.config.tp_info.is_primary():
                             self.send_result(
                                 [
                                     ErrorReplyMsg(
                                         uid=msg.uid,
-                                        error=f"invalid image cache identity: {exc}",
+                                        error=(
+                                            "invalid image cache identity: "
+                                            f"{identity_error or 'validation failed on another rank'}"
+                                        ),
                                         code="invalid_value",
                                     )
                                 ]
@@ -670,6 +743,16 @@ class Scheduler(SchedulerIOMixin):
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
             self.prefill_manager.add_one_req(msg, cache_ids=cache_ids)
+            if _TRACE_COLLECTIVES:
+                logger.info(
+                    "DSV41 request admitted rank=%d uid=%d input_tokens=%d "
+                    "multimodal=%s mm_embeds=%s",
+                    self.config.tp_info.rank,
+                    msg.uid,
+                    input_len,
+                    msg.is_multimodal,
+                    None if msg.mm_embeds is None else tuple(msg.mm_embeds.shape),
+                )
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)
@@ -961,6 +1044,10 @@ class Scheduler(SchedulerIOMixin):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
+        elif batch.speculative and self.engine.graph_runner.can_use_spec_graph(batch):
+            # A speculative span has T token mappings for one request.  Its
+            # captured verifier snapshots exactly that one page-table row.
+            batch.active_table_idx = input_mapping[0][:1]
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -1006,9 +1093,49 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        self._maybe_make_speculative(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _maybe_make_speculative(self, batch: Batch) -> None:
+        """Replace an eligible one-token decode with anchor + gamma verification."""
+
+        spec = getattr(self, "_speculative", None)
+        if spec is None or not batch.is_decode:
+            return
+        should_speculate = getattr(self.engine, "should_speculate", None)
+        if should_speculate is not None and any(
+            not should_speculate(req) for req in batch.reqs
+        ):
+            return
+        gamma = spec.block_size
+        verification_length = getattr(self.engine, "speculation_length", None)
+        if verification_length is not None:
+            lengths = {
+                int(verification_length(req, spec.block_size)) for req in batch.reqs
+            }
+            if len(lengths) != 1:
+                raise RuntimeError(
+                    "DSpark adaptive verification produced unequal batch lengths"
+                )
+            gamma = lengths.pop()
+        if gamma < 1:
+            return
+        # The emitted result is up to gamma accepted proposals plus one target
+        # bonus. Near the output limit, take the ordinary one-token path.
+        if any(req.remain_len < gamma + 1 for req in batch.reqs):
+            return
+        noise = torch.full(
+            (gamma,), spec.noise_token_id, dtype=self.token_pool.dtype
+        )
+        for req in batch.reqs:
+            req.append_host(noise)
+            req.device_len += gamma
+        batch.phase = "prefill"
+        batch.speculative = True
+        batch.spec_block = gamma
+        batch.release_tail = self.cache_manager.release_speculative_tail
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -1038,10 +1165,52 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if getattr(batch, "speculative", False):
+            batch.draft_confidence = self.engine.draft_into_batch(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if getattr(batch, "speculative", False):
+            rows = torch.tensor(
+                [req.table_idx for req in batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            positions = torch.tensor(
+                [req.device_len - 1 for req in batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.token_pool[rows, positions] = forward_output.next_tokens_gpu
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+class _SpeculativeConfig(NamedTuple):
+    block_size: int
+    noise_token_id: int
+
+
+def _speculative_config(config) -> "_SpeculativeConfig | None":
+    args = getattr(config.model_config, "dsv41_args", None)
+    if args is None:
+        args = getattr(config.model_config, "dsv4_args", None)
+    if args is None or not getattr(args, "dspark_enabled", False):
+        return None
+    if not args.has_dspark:
+        return None
+    return _SpeculativeConfig(
+        block_size=(
+            config.dspark_verification_length
+            if (
+                getattr(config, "dspark_verification_length", None) is not None
+                and getattr(config, "dspark_verification_schedule", None) is None
+                and not getattr(config, "dspark_adaptive_verification", False)
+            )
+            else args.dspark_block_size
+        ),
+        noise_token_id=args.dspark_noise_token_id,
+    )
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

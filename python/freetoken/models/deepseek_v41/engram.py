@@ -239,6 +239,9 @@ class EngramHasher:
         positions: torch.Tensor,
         cu_seqlens: torch.Tensor,
         history: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+        history_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Hash a ragged forward.
 
@@ -255,6 +258,12 @@ class EngramHasher:
             raise ValueError("cu_seqlens does not describe input_ids/history")
         if cu.device.type == "cpu" and int(cu[-1]) != input_ids.numel():
             raise ValueError("cu_seqlens does not describe input_ids/history")
+        if token_mask is None:
+            token_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        if history_mask is None:
+            history_mask = torch.ones_like(history, dtype=torch.bool)
+        if token_mask.shape != input_ids.shape or history_mask.shape != history.shape:
+            raise ValueError("Engram token masks do not match token/history shapes")
         token_row = torch.arange(input_ids.numel(), device=input_ids.device)
         req = torch.searchsorted(cu[1:], token_row, right=True)
         offset = token_row - cu[req]
@@ -265,7 +274,13 @@ class EngramHasher:
         hist_col = (n - 2 - (shifts.unsqueeze(0) - offset.unsqueeze(1) - 1)).clamp(0, n - 2)
         from_history = history.long()[req].gather(1, hist_col)
         tokens = torch.where(from_batch, from_input, from_history)
-        blocked = positions.long().unsqueeze(1) < shifts
+        input_is_text = token_mask.bool()[batch_index]
+        history_is_text = history_mask.bool()[req].gather(1, hist_col)
+        source_is_text = torch.where(from_batch, input_is_text, history_is_text)
+        blocked = (positions.long().unsqueeze(1) < shifts) | ~source_is_text
+        # An image is an n-gram boundary: once any nearer lookback is blocked,
+        # every longer n-gram for this token is blocked as well.
+        blocked = blocked.to(torch.int8).cummax(dim=1).values.bool()
         return compute_engram_hash_ids(
             tokens,
             blocked,

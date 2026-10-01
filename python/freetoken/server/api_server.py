@@ -84,12 +84,22 @@ def _terminate_backend_workers(processes: List[Any]) -> None:
             continue
 
 
+def _hard_exit_after_backend_death() -> None:
+    """Exit nonzero so the service manager can restart a fatally broken backend.
+
+    A graceful SIGTERM is insufficient here: uvicorn waits for active requests, but those
+    requests can never complete after a scheduler dies.  That leaves the listener closed while
+    the parent remains alive and prevents ``Restart=on-failure`` from firing.
+    """
+    if _SHUTTING_DOWN.is_set():
+        return  # an external stop got here first
+    logger.error("Backend worker is gone and cannot be restarted; exiting for service restart")
+    os._exit(1)
+
+
 def _exit_after_backend_death(grace_s: float) -> threading.Timer:
     def _stop() -> None:
-        if _SHUTTING_DOWN.is_set():
-            return  # an external stop got here first
-        logger.error("Backend worker is gone and cannot be restarted; stopping the API server")
-        os.kill(os.getpid(), signal.SIGTERM)
+        _hard_exit_after_backend_death()
 
     timer = threading.Timer(grace_s, _stop)
     timer.daemon = True

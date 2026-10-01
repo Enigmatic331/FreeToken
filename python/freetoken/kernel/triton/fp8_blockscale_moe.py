@@ -303,7 +303,7 @@ def _silu_and_quant_sorted_routes(ic1, sorted_ids, ntpp, num_valid_routes):
     inter = two_i // 2
     assert inter % 128 == 0
     output = torch.empty(
-        (rows, inter), dtype=e4m3_act_dtype(), device=ic1.device
+        (rows, inter), dtype=e4m3_act_dtype(ic1.device), device=ic1.device
     )
     scales = torch.empty(
         (rows, inter // 128), dtype=torch.float32, device=ic1.device

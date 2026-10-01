@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from freetoken.core import get_global_ctx
+
 from .args import DeepseekV41Args
 from .layers import Linear, RMSNorm
 
@@ -32,6 +34,20 @@ class Compressor(nn.Module):
             )
         else:
             self.wgate = None
+        # Address-stable rejection journal for the captured DSpark verifier.
+        # V4.1 ships at most ``dspark_block_size + 1`` target rows.  Ratio-1 has
+        # no rolling state, but keeping a zero-size buffer makes the interface
+        # uniform and costs no storage.
+        journal_shape = (
+            int(args.dspark_block_size) + 1,
+            self.compress_ratio if self.compress_ratio > 1 else 0,
+            2 * args.head_dim,
+        )
+        self.register_buffer(
+            "spec_graph_journal",
+            torch.empty(journal_shape, dtype=torch.float32),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
         batch, seqlen, _ = x.shape
@@ -86,12 +102,68 @@ class Compressor(nn.Module):
         if x.shape[0] != 1:
             raise ValueError("V4.1 paged prefill currently requires one request")
         ratio = self.compress_ratio
-        if start_pos % ratio:
+        try:
+            active_batch = get_global_ctx().batch
+        except AssertionError:
+            # The compressor is also exercised as a standalone numerical unit.
+            active_batch = None
+        speculative = bool(getattr(active_batch, "speculative", False))
+        if start_pos % ratio and not speculative:
             raise ValueError(
                 f"paged prefill start {start_pos} is not ratio-{ratio} aligned"
             )
         if ratio == 1:
             latent = self.norm(self.wkv(x))
+        elif speculative:
+            # A DSpark verify resumes at the live decode frontier, which can be at
+            # either parity, and then walks anchor + proposals in one short prefill.
+            # Advance the request's page-local carry exactly as repeated decode
+            # steps would.  Save the complete carry after every input row so target
+            # rejection can restore the state selected by its accepted prefix.
+            assert self.wgate is not None
+            values, scores = self.wkv(x.float()), self.wgate(x.float())
+            completed_values = []
+            block_starts = []
+            journal = active_batch.spec_carry_states
+            if journal is None:
+                raise RuntimeError("DSpark verify has no compressor carry journal")
+            pieces = journal.setdefault((layer_id, "attn", ratio), [])
+            last_window_page = None
+            block = None
+            for row in range(x.shape[1]):
+                pos = start_pos + row
+                window_slot = int(window_slots[row].item())
+                window_page = window_slot // backend.window_size
+                # A window page owns its own carry block. Read it when entering a
+                # page; subsequent rows in that page advance the local clone.
+                if window_page != last_window_page:
+                    block = backend.read_carry(
+                        layer_id, "attn", window_slot, ratio
+                    ).clone()
+                    last_window_page = window_page
+                assert block is not None
+                slot = pos % ratio
+                block[slot, : self.head_dim] = values[0, row]
+                block[slot, self.head_dim :] = scores[0, row]
+                backend.write_carry(
+                    layer_id, "attn", window_slot, ratio, block
+                )
+                pieces.append(block.unsqueeze(0).clone())
+                if slot == ratio - 1:
+                    pooled = (
+                        block[:, : self.head_dim]
+                        * block[:, self.head_dim :].softmax(0)
+                    ).sum(0)
+                    completed_values.append(pooled)
+                    block_starts.append(pos + 1 - ratio)
+            if completed_values:
+                latent = self.norm(
+                    torch.stack(completed_values, dim=0)
+                    .to(x.dtype)
+                    .unsqueeze(0)
+                )
+            else:
+                latent = x.new_empty((1, 0, self.head_dim))
         else:
             assert self.wgate is not None
             values, scores = self.wkv(x.float()), self.wgate(x.float())
@@ -122,9 +194,12 @@ class Compressor(nn.Module):
                     ratio,
                     block,
                 )
-        starts = start_pos + torch.arange(
-            0, latent.shape[1] * ratio, ratio, device=x.device
-        )
+        if speculative and ratio > 1:
+            starts = torch.tensor(block_starts, dtype=torch.long, device=x.device)
+        else:
+            starts = start_pos + torch.arange(
+                0, latent.shape[1] * ratio, ratio, device=x.device
+            )
         rows = backend.compress_rows_of(table_idx, starts, ratio)
         return latent, rows
 
@@ -173,6 +248,80 @@ class Compressor(nn.Module):
             completed,
         )
         return latent, destinations, completed
+
+    def verify_paged(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        window_slots: torch.Tensor,
+        *,
+        layer_id: int,
+        backend,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Graph-safe compressor pass over one fixed speculative span.
+
+        ``x`` is ``[1, T, dim]``.  Ratio-2 advances its carry in query order,
+        snapshots every post-row state into a persistent device journal, and
+        routes incomplete groups to the pool's discard row.  The graph caller
+        rejects spans crossing a window page, so one initial carry read and one
+        final write exactly match eager row-by-row progression.
+        """
+
+        ratio = self.compress_ratio
+        if ratio == 1:
+            latent = self.norm(self.wkv(x))[0]
+            completed = torch.ones_like(positions, dtype=torch.bool)
+        else:
+            assert self.wgate is not None and ratio == 2
+            values = self.wkv(x.float())[0]
+            scores = self.wgate(x.float())[0]
+            block = backend.read_carry_blocks(
+                layer_id, "attn", window_slots[:1], ratio
+            )[0].clone()
+            pooled_rows = []
+            completed_rows = []
+            for row in range(x.shape[1]):
+                slot = torch.remainder(positions[row : row + 1], ratio)
+                value_score = torch.cat(
+                    [values[row : row + 1], scores[row : row + 1]], dim=-1
+                )
+                block.index_copy_(0, slot, value_score)
+                self.spec_graph_journal[row].copy_(block)
+                pooled_rows.append(
+                    (
+                        block[:, : self.head_dim]
+                        * block[:, self.head_dim :].softmax(0)
+                    ).sum(0)
+                )
+                completed_rows.append(slot[0] == ratio - 1)
+            backend.write_carry_blocks(
+                layer_id,
+                "attn",
+                window_slots[-1:],
+                ratio,
+                block.unsqueeze(0),
+            )
+            latent = self.norm(torch.stack(pooled_rows).to(x.dtype))
+            completed = torch.stack(completed_rows)
+        destinations = backend.verify_compress_rows(
+            positions, ratio, layer_id, "attn", completed
+        )
+        return latent, destinations, completed
+
+    def restore_graph_carry(
+        self, selected_row: int, window_slot: int, *, layer_id: int, backend
+    ) -> None:
+        """Roll a captured ratio-2 verify back to its accepted target row."""
+
+        if self.compress_ratio == 1:
+            return
+        backend.write_carry(
+            layer_id,
+            "attn",
+            window_slot,
+            self.compress_ratio,
+            self.spec_graph_journal[selected_row],
+        )
 
 
 __all__ = ["Compressor"]

@@ -75,9 +75,9 @@ class DeepseekV41ExecutionPlan:
             raise ValueError("phase-aware V4.1 EP requires an authority backbone")
         if self.phase_aware and self.prefill_expert_shards[self.backbone_rank] == 0:
             raise ValueError("the backbone rank must participate in prefill")
-        if self.phase_aware and len(self.prefill_active_ranks) != 2:
+        if self.phase_aware and len(self.prefill_active_ranks) < 2:
             raise ValueError(
-                "phase-aware V4.1 currently requires exactly two active prefill ranks"
+                "phase-aware V4.1 requires at least two active prefill ranks"
             )
         if self.engram_ranks is not None:
             ranks = tuple(self.engram_ranks)
@@ -155,6 +155,12 @@ class DeepseekV41ExecutionPlan:
         )
 
     @property
+    def uses_prefill_subgroup(self) -> bool:
+        """Whether prefill must exclude one or more decode-only ranks."""
+
+        return self.phase_aware and len(self.prefill_active_ranks) < self.world_size
+
+    @property
     def resolved_engram_ranks(self) -> tuple[int, ...]:
         return self.engram_ranks or tuple(range(self.world_size))
 
@@ -170,13 +176,15 @@ class DeepseekV41ExecutionPlan:
 
     @property
     def supports_packed_prefill(self) -> bool:
-        # The optimized point-to-point route gather has one active peer slot.
-        # Phase-aware EP may therefore use it in a wider world if exactly two
-        # ranks own prefill experts and the remaining ranks rejoin afterwards.
-        return self.enabled and len(self.prefill_active_ranks) == 2
+        return self.enabled and len(self.prefill_active_ranks) >= 2
 
     def partition(
         self, total_experts: int, *, prefill: bool = False
+    ) -> ExpertPartition:
+        return self.partition_for_rank(total_experts, self.rank, prefill=prefill)
+
+    def partition_for_rank(
+        self, total_experts: int, rank: int, *, prefill: bool = False
     ) -> ExpertPartition:
         shards = (
             self.prefill_expert_shards
@@ -186,7 +194,7 @@ class DeepseekV41ExecutionPlan:
         return ExpertPartition(
             total_experts,
             world_size=self.world_size if self.enabled else 1,
-            rank=self.rank if self.enabled else 0,
+            rank=rank if self.enabled else 0,
             shard_counts=shards if self.enabled else None,
         )
 

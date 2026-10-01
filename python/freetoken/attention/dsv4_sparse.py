@@ -124,6 +124,33 @@ class DSV4AttnMetadata(BaseAttnMetadata):
         ).view(bs, 1, win)
         return window_slots, prev_window_slots, window_slots_topk
 
+    def verify_window_ctx(
+        self, positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tensor-driven causal window rows for one speculative request.
+
+        The verification span is represented as one request with ``T`` query
+        rows, unlike decode's ``T`` independent requests.  Keep the query axis
+        in dimension one and read every absolute position from snapshot row 0.
+        Graph eligibility excludes only the special position-zero prefill and
+        page crossings; padding short histories with ``-1`` keeps the valid
+        columns in the same chronological order as eager prefill.
+        """
+
+        snap = self.full_snapshot()[0]
+        translate = get_global_ctx().kv_cache.translate_full_to_window
+        j = self.window_ar
+        assert j is not None, "verification window needs capture metadata"
+        win = j.shape[0]
+        start = (positions[0] - win + 1).clamp_min(0)
+        first = torch.maximum(positions[:, None] - win + 1, start)
+        candidate_pos = first + j[None, :]
+        valid = (candidate_pos >= 0) & (candidate_pos <= positions[:, None])
+        slots = translate(snap[candidate_pos.clamp_min(0)])
+        rows = torch.where(valid, slots, torch.full_like(slots, -1))
+        current = translate(snap[positions])
+        return current, rows.unsqueeze(0)
+
 
 @dataclass
 class DSV4CaptureData:
@@ -241,6 +268,19 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
             full_at = self.snapshot()[rows[:, None, None], safe * ratio]
         g = self.pool.cmp_rows(full_at, ratio)
         return torch.where(blocks < 0, torch.full_like(g, -1), g)
+
+    def verify_blocks_to_global(
+        self, blocks: torch.Tensor, ratio: int
+    ) -> torch.Tensor:
+        """Map ``[T, K]`` block ids for snapshot request row zero."""
+
+        safe = blocks.clamp_min(0)
+        full_at = self.snapshot()[0, safe * ratio]
+        global_rows = self.pool.cmp_rows(full_at, ratio)
+        global_rows = torch.where(
+            blocks < 0, torch.full_like(global_rows, -1), global_rows
+        )
+        return global_rows.unsqueeze(0)
 
     def store_window(self, kv: torch.Tensor, layer_id: int, window_slots: torch.Tensor) -> None:
         self.pool.store_window(kv, layer_id, window_slots)

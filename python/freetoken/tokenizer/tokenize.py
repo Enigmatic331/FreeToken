@@ -83,7 +83,19 @@ class TokenizeManager:
                     )
                     if not model_path:
                         raise ValueError("tokenizer does not expose its checkpoint path")
-                    self._multimodal_processor = QwenVLProcessor(str(model_path))
+                    if (
+                        self._dsv4_encoder is not None
+                        and hasattr(self._dsv4_encoder, "IMAGE_PLACEHOLDER")
+                    ):
+                        from freetoken.multimodal.deepseek_v41 import (
+                            DeepseekV41Processor,
+                        )
+
+                        self._multimodal_processor = DeepseekV41Processor(
+                            str(model_path)
+                        )
+                    else:
+                        self._multimodal_processor = QwenVLProcessor(str(model_path))
                 results.append(self._multimodal_processor.process(prompt, msg.text))
                 continue
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None

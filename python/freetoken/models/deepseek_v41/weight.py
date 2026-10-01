@@ -21,6 +21,7 @@ import safetensors
 import torch
 
 from freetoken.models.loader import drop_page_cache
+from freetoken.models.config import vision_load_enabled
 
 from .args import DeepseekV41Args
 
@@ -114,6 +115,13 @@ def _payload(name: str) -> Payload:
 def _is_baseline_resident(tensor: TensorInfo) -> bool:
     # bias_vl is the only vision-only tensor nested inside the text layers.
     return tensor.payload == "text_resident" and not tensor.name.endswith(".ffn.gate.bias_vl")
+
+
+def _is_vision_resident(tensor: TensorInfo) -> bool:
+    return tensor.payload == "vision" or (
+        tensor.payload == "text_resident"
+        and tensor.name.endswith(".ffn.gate.bias_vl")
+    )
 
 
 def _read_header(path: str) -> tuple[dict, int]:
@@ -401,7 +409,7 @@ def iter_weights(
     include_moe_experts: bool = True,
     include_non_moe: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Stream the text-only resident state without Engram tables or MTP.
+    """Stream resident text state and, when opted in, native vision state.
 
     Routed experts have their own row-sharded host-bank loader and are never part
     of the GPU state dict. ``wo_a`` is expanded to BF16 under its parameter name,
@@ -418,10 +426,16 @@ def iter_weights(
     if execution.is_expert_worker:
         return
 
+    include_vision = vision_load_enabled() and (
+        not execution.enabled or execution.rank == execution.backbone_rank
+    )
+
     plan = inspect_checkpoint(model_path)
     by_shard: dict[str, list[TensorInfo]] = defaultdict(list)
     for tensor in plan.tensors:
-        if _is_baseline_resident(tensor):
+        if _is_baseline_resident(tensor) or (
+            include_vision and _is_vision_resident(tensor)
+        ):
             by_shard[tensor.shard].append(tensor)
 
     for shard in sorted(by_shard):

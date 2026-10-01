@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Final, List
 
+import msgpack
 import torch
 from freetoken.message import (
     BaseBackendMsg,
@@ -11,12 +13,15 @@ from freetoken.message import (
     BatchTokenizerMsg,
     UserMsg,
 )
-from freetoken.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
+from freetoken.utils import ZmqPullQueue, ZmqPushQueue, init_logger
 
 if TYPE_CHECKING:
     from .config import SchedulerConfig
 
 logger = init_logger(__name__)
+_MAX_RANK_MESSAGE_BYTES = 256 << 20
+_RANK_IDLE_HEARTBEAT_MS = 1000
+_TRACE_COLLECTIVES = os.getenv("FREETOKEN_DSV41_TRACE_COLLECTIVES", "0") == "1"
 
 
 def _without_vision_pixels(msg: BaseBackendMsg) -> tuple[BaseBackendMsg, bool]:
@@ -58,6 +63,8 @@ class SchedulerIOMixin:
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        self._rank_wire_rank = tp_info.rank
+        self._rank_wire_sequence = 0
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -80,17 +87,9 @@ class SchedulerIOMixin:
         if tp_info.size > 1:
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
-                self._send_into_ranks: Final = ZmqPubQueue(
-                    config.zmq_scheduler_broadcast_addr, create=True, encoder=BaseBackendMsg.encoder
-                )
             else:
                 recv = self._recv_msg_multi_rank1
                 send = self._reply_tokenizer_rank1
-                self._recv_from_rank0: Final = ZmqSubQueue(
-                    config.zmq_scheduler_broadcast_addr,
-                    create=False,
-                    decoder=BaseBackendMsg.decoder,
-                )
 
         self.receive_msg = recv
         self.send_result = send
@@ -105,7 +104,72 @@ class SchedulerIOMixin:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:
+        self._cpu_barrier("scheduler_sync")
+
+    def _cpu_broadcast(self, tensor: torch.Tensor, label: str) -> torch.Tensor:
+        sequence = getattr(self, "_rank_wire_sequence", 0)
+        if _TRACE_COLLECTIVES:
+            logger.info(
+                "DSV41 CPU collective enter rank=%d seq=%d op=broadcast "
+                "label=%s shape=%s dtype=%s",
+                getattr(self, "_rank_wire_rank", 0),
+                sequence,
+                label,
+                tuple(tensor.shape),
+                tensor.dtype,
+            )
+        self.tp_cpu_group.broadcast(tensor, root=0).wait()
+        if _TRACE_COLLECTIVES:
+            logger.info(
+                "DSV41 CPU collective exit rank=%d seq=%d op=broadcast label=%s",
+                getattr(self, "_rank_wire_rank", 0),
+                sequence,
+                label,
+            )
+        self._rank_wire_sequence = sequence + 1
+        return tensor
+
+    def _cpu_barrier(self, label: str) -> None:
+        sequence = getattr(self, "_rank_wire_sequence", 0)
+        if _TRACE_COLLECTIVES:
+            logger.info(
+                "DSV41 CPU collective enter rank=%d seq=%d op=barrier label=%s",
+                getattr(self, "_rank_wire_rank", 0),
+                sequence,
+                label,
+            )
         self.tp_cpu_group.barrier().wait()
+        if _TRACE_COLLECTIVES:
+            logger.info(
+                "DSV41 CPU collective exit rank=%d seq=%d op=barrier label=%s",
+                getattr(self, "_rank_wire_rank", 0),
+                sequence,
+                label,
+            )
+        self._rank_wire_sequence = sequence + 1
+
+    def _cpu_all_reduce_sum(self, tensor: torch.Tensor, label: str) -> torch.Tensor:
+        sequence = getattr(self, "_rank_wire_sequence", 0)
+        if _TRACE_COLLECTIVES:
+            logger.info(
+                "DSV41 CPU collective enter rank=%d seq=%d op=all_reduce_sum "
+                "label=%s shape=%s dtype=%s",
+                getattr(self, "_rank_wire_rank", 0),
+                sequence,
+                label,
+                tuple(tensor.shape),
+                tensor.dtype,
+            )
+        self.tp_cpu_group.allreduce([tensor]).wait()
+        if _TRACE_COLLECTIVES:
+            logger.info(
+                "DSV41 CPU collective exit rank=%d seq=%d op=all_reduce_sum label=%s",
+                getattr(self, "_rank_wire_rank", 0),
+                sequence,
+                label,
+            )
+        self._rank_wire_sequence = sequence + 1
+        return tensor
 
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
@@ -120,14 +184,18 @@ class SchedulerIOMixin:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
-            raw = self._recv_from_tokenizer.get_raw()
-            msg = self._recv_from_tokenizer.decode(raw)
-            worker_msg, changed = _without_vision_pixels(msg)
-            if changed:
-                self._send_into_ranks.put(worker_msg)
+            if self._recv_from_tokenizer.wait(_RANK_IDLE_HEARTBEAT_MS):
+                raw = self._recv_from_tokenizer.get_raw()
+                msg = self._recv_from_tokenizer.decode(raw)
+                self._broadcast_rank_message(self._worker_message_bytes(msg, raw))
+                pending_msgs.append(msg)
             else:
-                self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(msg)
+                # Worker ranks are already waiting in the matching broadcast.
+                # A bounded zero-length heartbeat keeps Gloo's collective
+                # sequence progressing during long idle periods instead of
+                # letting the workers hit the process-group timeout while rank
+                # 0 blocks indefinitely on the tokenizer socket.
+                self._broadcast_rank_message(None)
 
         pending_raw_msgs: List[bytes] = []
         while not self._recv_from_tokenizer.empty():
@@ -135,15 +203,11 @@ class SchedulerIOMixin:
 
         # broadcast the number of raw messages to all ranks
         src_tensor = torch.tensor(len(pending_raw_msgs))
-        self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
+        self._cpu_broadcast(src_tensor, "pending_count")
 
         for raw in pending_raw_msgs:
             msg = self._recv_from_tokenizer.decode(raw)
-            worker_msg, changed = _without_vision_pixels(msg)
-            if changed:
-                self._send_into_ranks.put(worker_msg)
-            else:
-                self._send_into_ranks.put_raw(raw)
+            self._broadcast_rank_message(self._worker_message_bytes(msg, raw))
             pending_msgs.append(msg)
         return pending_msgs
 
@@ -151,16 +215,59 @@ class SchedulerIOMixin:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
-            pending_msgs.append(self._recv_from_rank0.get())
+            raw = self._broadcast_rank_message(None)
+            if raw:
+                pending_msgs.append(self._decode_rank_message(raw))
 
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)
-        self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
+        self._cpu_broadcast(dst_tensor, "pending_count")
         dst_length = int(dst_tensor.item())
 
         for _ in range(dst_length):
-            pending_msgs.append(self._recv_from_rank0.get())
+            pending_msgs.append(self._decode_rank_message(self._broadcast_rank_message(None)))
         return pending_msgs
+
+    @staticmethod
+    def _worker_message_bytes(msg: BaseBackendMsg, raw: bytes) -> bytes:
+        worker_msg, changed = _without_vision_pixels(msg)
+        if not changed:
+            return raw
+        return msgpack.packb(worker_msg.encoder(), use_bin_type=True)
+
+    @staticmethod
+    def _decode_rank_message(raw: bytes) -> BaseBackendMsg:
+        return BaseBackendMsg.decoder(msgpack.unpackb(raw, raw=False))
+
+    def _broadcast_rank_message(self, raw: bytes | None) -> bytes:
+        """Reliably fan one scheduler message out over the CPU process group.
+
+        PUB/SUB can drop a first request while a newly-started subscriber is
+        still joining.  A missed request is fatal for EP because rank 0 then
+        enters GPU P2P collectives that the worker never sees.  Gloo broadcast
+        already orders the scheduler control plane, so carry the bounded wire
+        payload on that same reliable channel.
+        """
+
+        length = torch.tensor(
+            len(raw) if raw is not None else 0,
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._cpu_broadcast(length, "message_length")
+        size = int(length.item())
+        if not 0 <= size <= _MAX_RANK_MESSAGE_BYTES:
+            raise ValueError(f"invalid scheduler rank message size {size}")
+        if size == 0:
+            return b""
+        if raw is None:
+            payload = torch.empty(size, dtype=torch.uint8, device="cpu")
+        else:
+            if len(raw) != size:
+                raise RuntimeError("scheduler rank message length changed during broadcast")
+            payload = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        self._cpu_broadcast(payload, "message_payload")
+        return payload.numpy().tobytes()
 
     def _reply_tokenizer_rank0(self, reply: List[BaseTokenizerMsg]) -> None:
         num_reply = len(reply)

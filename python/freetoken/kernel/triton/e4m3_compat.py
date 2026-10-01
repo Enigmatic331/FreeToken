@@ -43,40 +43,44 @@ if FORCE_EMU and "TRITON_CACHE_DIR" not in os.environ:
     os.environ["TRITON_CACHE_DIR"] = os.path.join(
         os.path.expanduser("~/.triton"), "cache-e4m3emu")
 
-_native: bool | None = None
-
-
-def e4m3_native() -> bool:
+def e4m3_native(device=None) -> bool:
     """Host-side twin of :func:`e4m3_native_cx`: True when kernels take fp8e4nv
-    tensors directly. False: pass ``.view(torch.uint8)`` and bf16 act buffers."""
-    global _native
+    tensors directly. False: pass ``.view(torch.uint8)`` and bf16 act buffers.
+
+    ``device`` is deliberately explicit-capable: the serving rank normally owns
+    one text GPU, but an auxiliary vision/DSpark GPU may have a different compute
+    capability in the same process.  Falling back to the assigned text device
+    would then choose an illegal FP8 pointer type for the auxiliary kernels.
+    """
     if _env_force() != FORCE_EMU:
         raise RuntimeError(
             "FREETOKEN_FORCE_E4M3_EMU changed after import: the flag is read once at "
             "import and is not part of triton's compile cache key -- set it before "
             "the process starts (with its own TRITON_CACHE_DIR)"
         )
-    if _native is None:
-        if FORCE_EMU:
-            _native = False
-        else:
-            from freetoken.gpu_select import assigned_visible_gpu
+    if FORCE_EMU:
+        return False
+    if isinstance(device, torch.Tensor):
+        device = device.device
+    if device is None:
+        from freetoken.gpu_select import assigned_visible_gpu
 
-            # one process runs on one GPU, so its convention is that GPU's; None (-> the current device) only before the process binds
-            _native = torch.cuda.get_device_capability(assigned_visible_gpu()) >= (8, 9)
-    return _native
+        # Preserve the pre-CUDA-init convention for ordinary one-GPU workers.
+        # Multi-GPU callers pass their tensor/device explicitly below.
+        device = assigned_visible_gpu()
+    return torch.cuda.get_device_capability(device) >= (8, 9)
 
 
 def e4m3_kernel_view(t: torch.Tensor) -> torch.Tensor:
     """An e4m3 tensor as the branched kernels expect it: unchanged when native,
     the uint8 view otherwise (the fp8 pointer type is illegal pre-sm_89)."""
-    return t if e4m3_native() else t.view(torch.uint8)
+    return t if e4m3_native(t.device) else t.view(torch.uint8)
 
 
-def e4m3_act_dtype() -> torch.dtype:
+def e4m3_act_dtype(device=None) -> torch.dtype:
     """Buffer dtype for quantized activations: fp8 when native, else bf16 (every
     e4m3 grid value is exactly representable)."""
-    return torch.float8_e4m3fn if e4m3_native() else torch.bfloat16
+    return torch.float8_e4m3fn if e4m3_native(device) else torch.bfloat16
 
 
 @constexpr_function

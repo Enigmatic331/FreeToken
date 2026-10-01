@@ -78,6 +78,25 @@ class EngineConfig:
     swa_num_pages_override: int | None = None
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
+    # DeepSeek V4/V4.1 checkpoint-native block speculative decoding.
+    speculative_dspark: bool = False
+    # V4.1 can keep its 7.4-GiB MTP payload resident on an auxiliary GPU,
+    # independently of the memory-bound target EP ranks.
+    dspark_device: str | None = None
+    dspark_fallback_acceptance: float = 0.6
+    dspark_fallback_min_drafted: int = 32
+    dspark_fallback_steps: int = 64
+    # Optional target verification prefix. None verifies the checkpoint's full
+    # block and is the compatibility default; shorter values are useful for
+    # profiling the per-length cost curve.
+    dspark_verification_length: int | None = None
+    # Benchmark-only per-request rotation. It profiles several fixed lengths in
+    # one loaded process and is mutually exclusive with the production policy.
+    dspark_verification_schedule: tuple[int, ...] | None = None
+    # Confidence-guided, one-step-stale verification. The five costs are total
+    # measured draft+target step milliseconds for verification lengths 1..5.
+    dspark_adaptive_verification: bool = False
+    dspark_adaptive_costs_ms: tuple[float, ...] | None = None
     use_pynccl: bool = True
     # Qwen3.8 heterogeneous EP: one rank owns the complete TP1 backbone and
     # every rank owns a contiguous routed-expert shard.

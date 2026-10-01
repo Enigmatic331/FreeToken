@@ -34,6 +34,9 @@ class TokenizedMultimodalPrompt:
     # One exact, content-addressed identity per image. The scheduler maps these
     # full digests to collision-free radix symbols for the lifetime of its KV cache.
     image_cache_keys: list[bytes] | None = None
+    # Exact half-open placeholder spans, one per image.  DeepSeek image spans
+    # can be adjacent, so run detection alone cannot recover their boundaries.
+    image_token_spans: list[tuple[int, int]] | None = None
     # Original compressed inputs let the scheduler safely reconstruct pixels after
     # a vision-feature LRU eviction. Online inputs are bytes/URLs; PIL objects stay local.
     image_inputs: list[str | bytes] | None = None
@@ -321,6 +324,10 @@ class QwenVLProcessor:
             rope_positions=positions.cpu(),
             mrope_position_delta=delta,
             image_cache_keys=keys,
+            image_token_spans=_placeholder_spans(
+                input_ids,
+                int(processor.tokenizer.convert_tokens_to_ids(processor.image_token)),
+            ),
             image_inputs=(
                 list(sources)
                 if can_omit_pixels
@@ -337,6 +344,20 @@ class QwenVLProcessor:
         pixels = encoded["pixel_values"].contiguous().cpu()
         grid = encoded["image_grid_thw"].to(torch.int32).contiguous().cpu()
         return pixels, grid, image_cache_keys(images, grid)
+
+
+def _placeholder_spans(
+    input_ids: torch.Tensor, image_token_id: int
+) -> list[tuple[int, int]]:
+    mask = input_ids.view(-1) == image_token_id
+    starts = mask & ~torch.cat((torch.tensor([False]), mask[:-1]))
+    result = []
+    for start in starts.nonzero(as_tuple=False).view(-1).tolist():
+        end = start + 1
+        while end < mask.numel() and bool(mask[end]):
+            end += 1
+        result.append((start, end))
+    return result
 
 
 __all__ = [

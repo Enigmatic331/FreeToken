@@ -2,33 +2,100 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
 
 from freetoken.distributed import DistributedCommunicator
+from freetoken.utils import init_logger
 
 from .engram import EngramHostTable
 from .execution import DeepseekV41ExecutionPlan, get_execution_plan
 from .profile import profile_range
 
+logger = init_logger(__name__)
+_TRACE_COLLECTIVES = os.getenv("FREETOKEN_DSV41_TRACE_COLLECTIVES", "0") == "1"
+
 
 @dataclass
 class TorchProcessGroupCommunicator:
-    """The Engram collective surface restricted to one NCCL process group."""
+    """Collective/P2P surface restricted to one NCCL process group."""
 
     group: dist.ProcessGroup
+    name: str = "subgroup"
+    _sequence: int = field(default=0, init=False, repr=False)
+
+    def _trace(
+        self,
+        stage: str,
+        operation: str,
+        tensor: torch.Tensor,
+        peer: int | None = None,
+    ) -> None:
+        if not _TRACE_COLLECTIVES:
+            return
+        stream = (
+            torch.cuda.current_stream(tensor.device).cuda_stream
+            if tensor.is_cuda
+            else None
+        )
+        logger.info(
+            "DSV41 collective %s name=%s seq=%d rank=%d group_rank=%d "
+            "op=%s peer=%s shape=%s dtype=%s device=%s stream=%s",
+            stage,
+            self.name,
+            self._sequence,
+            dist.get_rank(),
+            dist.get_rank(self.group),
+            operation,
+            peer,
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+            stream,
+        )
 
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         if dist.get_world_size(self.group) > 1:
+            self._trace("enter", "all_reduce", tensor)
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.group)
+            self._trace("exit", "all_reduce", tensor)
+            self._sequence += 1
         return tensor
 
     def broadcast(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
         if dist.get_world_size(self.group) > 1:
+            self._trace("enter", "broadcast", tensor, src)
             dist.broadcast(tensor, src=src, group=self.group)
+            self._trace("exit", "broadcast", tensor, src)
+            self._sequence += 1
+        return tensor
+
+    def send(self, tensor: torch.Tensor, dst: int) -> torch.Tensor:
+        rank = dist.get_rank()
+        if dist.get_world_size(self.group) != 2 or dst == rank:
+            raise RuntimeError("subgroup send requires exactly one remote peer")
+        # This communicator is used only by the two active prefill ranks. A
+        # subgroup broadcast is therefore identical to point-to-point send but
+        # avoids NCCL's lazy peer-link bootstrap, which can deadlock when the
+        # process also owns a larger world communicator.
+        self._trace("enter", "send_as_broadcast", tensor, dst)
+        dist.broadcast(tensor, src=rank, group=self.group)
+        self._trace("exit", "send_as_broadcast", tensor, dst)
+        self._sequence += 1
+        return tensor
+
+    def recv(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
+        rank = dist.get_rank()
+        if dist.get_world_size(self.group) != 2 or src == rank:
+            raise RuntimeError("subgroup receive requires exactly one remote peer")
+        self._trace("enter", "recv_as_broadcast", tensor, src)
+        dist.broadcast(tensor, src=src, group=self.group)
+        self._trace("exit", "recv_as_broadcast", tensor, src)
+        self._sequence += 1
         return tensor
 
 

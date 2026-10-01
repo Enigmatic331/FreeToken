@@ -105,6 +105,13 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def complete_n(self, n: int) -> None:
+        """Advance after one engine step emitted ``n`` tokens."""
+        if n < 1:
+            raise ValueError(f"a step must advance by at least one token, got {n}")
+        self.cached_len = self.device_len
+        self.device_len += n
+
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
         m = n + next_token.numel()
@@ -159,6 +166,25 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # DSpark verification is represented as a short prefill containing the live
+    # anchor plus the checkpoint's proposal block.  These fields carry the draft
+    # distribution and the per-position state needed to commit only the accepted
+    # prefix afterwards.
+    speculative: bool = field(default=False, init=False)
+    spec_block: int = field(default=0, init=False)
+    draft_confidence: torch.Tensor | None = field(default=None, init=False)
+    spec_emitted: List[torch.Tensor] | None = field(default=None, init=False)
+    draft_probs: torch.Tensor | None = field(default=None, init=False)
+    draft_tokens: torch.Tensor | None = field(default=None, init=False)
+    spec_carry_states: dict | None = field(default=None, init=False)
+    release_tail: object | None = field(default=None, init=False)
+    # DeepSeek-V4.1 may run the fixed-shape speculative target verifier through
+    # its own CUDA graph.  The first flag selects the tensor-driven model path
+    # while capturing; the second records that a live replay populated the
+    # compressors' device journals, so rejection restores from those journals
+    # instead of the eager Python list above.
+    dsv41_spec_graph: bool = field(default=False, init=False)
+    dsv41_spec_graph_replayed: bool = field(default=False, init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     # Optional model-specific graph inputs.  DeepSeek-V4.1 hashes the three raw
@@ -186,6 +212,17 @@ class Batch:
     @property
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
+
+    @property
+    def is_moe_prefill(self) -> bool:
+        """Whether routed experts should use bulk-prefill movement.
+
+        A speculative verify is represented as a multi-row prefill for attention
+        and recurrent-state correctness, but its tiny anchor+proposal span belongs
+        on the on-demand decode MoE path.  Streaming every expert layer for those
+        rows turns one verify cycle into several seconds on an offload deployment.
+        """
+        return self.is_prefill and not self.speculative
 
     @property
     def is_decode(self) -> bool:

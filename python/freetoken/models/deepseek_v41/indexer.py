@@ -103,8 +103,14 @@ def select_index_topk(
     *,
     offset: int = 0,
     candidate_mask: torch.Tensor | None = None,
+    inplace: bool = False,
 ) -> torch.Tensor:
-    """Mask, select, position-sort, and ``-1``-pad CSA2 compressed rows."""
+    """Mask, select, position-sort, and ``-1``-pad CSA2 compressed rows.
+
+    ``inplace`` lets the long-prefill path reuse its disposable fp32 logits
+    buffer instead of allocating another full score matrix for each mask.  The
+    default remains non-mutating for decode/verification and general callers.
+    """
 
     width = logits.shape[-1]
     if width == 0 or topk <= 0:
@@ -117,13 +123,20 @@ def select_index_topk(
     while live.ndim < logits.ndim:
         live = live.unsqueeze(-1)
     columns = torch.arange(width, device=logits.device)
-    scores = logits.masked_fill(columns >= live, -torch.inf)
+    scores = logits
+    if inplace:
+        scores.masked_fill_(columns >= live, -torch.inf)
+    else:
+        scores = scores.masked_fill(columns >= live, -torch.inf)
     if candidate_mask is not None:
         if candidate_mask.shape != logits.shape:
             raise ValueError(
                 f"candidate mask {candidate_mask.shape} != logits {logits.shape}"
             )
-        scores = scores.masked_fill(~candidate_mask, -torch.inf)
+        if inplace:
+            scores.masked_fill_(~candidate_mask, -torch.inf)
+        else:
+            scores = scores.masked_fill(~candidate_mask, -torch.inf)
     k = min(int(topk), width)
     picked = scores.topk(k, dim=-1, sorted=False).indices
     selected_scores = scores.gather(-1, picked)

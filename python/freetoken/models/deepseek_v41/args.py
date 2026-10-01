@@ -87,6 +87,16 @@ class DeepseekV41Args:
     dspark_markov_rank: int = 256
     dspark_n_routed_experts: int = 128
     dspark_n_activated_experts: int = 3
+    dspark_enabled: bool = False
+
+    @property
+    def has_dspark(self) -> bool:
+        return (
+            self.n_mtp_layers > 0
+            and self.dspark_block_size > 1
+            and self.dspark_noise_token_id >= 0
+            and len(self.dspark_target_layer_ids) > 0
+        )
 
     # Vision geometry is parsed but the first serving gate is text-only.
     vision_n_layers: int = 32

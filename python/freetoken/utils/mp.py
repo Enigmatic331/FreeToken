@@ -73,6 +73,11 @@ class ZmqPullQueue(Generic[T]):
     def decode(self, raw: bytes) -> T:
         return self.decoder(msgpack.unpackb(raw, raw=False))
 
+    def wait(self, timeout_ms: int) -> bool:
+        """Return whether a message became readable within ``timeout_ms``."""
+
+        return self.socket.poll(timeout=timeout_ms) != 0
+
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
 

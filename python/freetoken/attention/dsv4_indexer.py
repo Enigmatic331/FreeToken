@@ -55,6 +55,20 @@ class IndexerBackendMixin:
             valid, n_stage, ratio,
         )
 
+    def indexer_verify_scores(
+        self, q: torch.Tensor, weights: torch.Tensor, valid: torch.Tensor,
+        n_stage: int, ratio: int, layer_id: int,
+    ) -> torch.Tensor:
+        """Score ``T`` causal queries which all share snapshot request row zero."""
+
+        from freetoken.kernel.triton.dsv4.indexer import indexer_decode_logits
+
+        snapshot = self.snapshot()[:1].expand(q.shape[0], -1)
+        return indexer_decode_logits(
+            q, weights, self.compress_pool(layer_id, "idx"), snapshot,
+            valid, n_stage, ratio,
+        )
+
     def indexer_select_prefill(
         self, scores: torch.Tensor, *, start_pos: int, seqlen: int, ratio: int, topk: int,
         offset: int,

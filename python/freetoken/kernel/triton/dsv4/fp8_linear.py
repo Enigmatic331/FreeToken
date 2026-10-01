@@ -91,7 +91,7 @@ def act_quant_fp8(x: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torc
     assert K % block == 0, (K, block)
     x2d = x.reshape(-1, K).contiguous()
     M = x2d.shape[0]
-    y = torch.empty((M, K), dtype=e4m3_act_dtype(), device=x.device)
+    y = torch.empty((M, K), dtype=e4m3_act_dtype(x.device), device=x.device)
     s = torch.empty((M, K // block), dtype=torch.uint8, device=x.device)
     BLOCK_M = 32
     grid = (triton.cdiv(M, BLOCK_M), K // block)

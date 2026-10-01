@@ -121,7 +121,7 @@ def _prepare_partitioned_routes(
 class Gate(nn.Module):
     """Bias-corrected selection with unbiased, normalized route weights."""
 
-    def __init__(self, args: DeepseekV41Args) -> None:
+    def __init__(self, args: DeepseekV41Args, *, enable_vision: bool = False) -> None:
         super().__init__()
         self.topk = args.n_activated_experts
         self.score_func = args.score_func
@@ -135,8 +135,20 @@ class Gate(nn.Module):
         self.bias = nn.Parameter(
             torch.empty(args.n_routed_experts, dtype=torch.float32), requires_grad=False
         )
+        self.bias_vl = (
+            nn.Parameter(torch.empty_like(self.bias), requires_grad=False)
+            if enable_vision
+            else None
+        )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, image_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bias = self.bias
+        if image_mask is not None:
+            if self.bias_vl is None:
+                raise RuntimeError("image routing requested without vision router bias")
+            bias = torch.where(image_mask.reshape(-1, 1), self.bias_vl, bias)
         if x.is_cuda:
             from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 
@@ -144,7 +156,10 @@ class Gate(nn.Module):
             fused = os.getenv(
                 "FREETOKEN_DSV41_FUSED_ROUTER", "0"
             ).strip().lower() in {"1", "true", "yes", "on"}
-            if fused:
+            # The fused kernel consumes one shared bias vector. A multimodal
+            # prefill selects bias_vl per row, so keep that correctness path in
+            # PyTorch until the router kernel grows a row-strided bias input.
+            if fused and image_mask is None:
                 from freetoken.kernel.triton.dsv41.router import (
                     fused_sqrtsoftplus_topk,
                 )
@@ -155,7 +170,7 @@ class Gate(nn.Module):
                     )
                 return fused_sqrtsoftplus_topk(
                     scores,
-                    self.bias,
+                    bias,
                     topk=self.topk,
                     temperature=self.gate_temp,
                     renormalize=self.norm_topk_prob,
@@ -168,7 +183,7 @@ class Gate(nn.Module):
             scores = F.softplus(scores).sqrt()
         else:
             raise ValueError(f"unsupported V4.1 route score {self.score_func}")
-        indices = (scores + self.bias).topk(self.topk, dim=-1).indices
+        indices = (scores + bias).topk(self.topk, dim=-1).indices
         weights = scores.gather(-1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights /= weights.sum(-1, keepdim=True) + 1e-20
@@ -216,6 +231,9 @@ class RoutedExperts(ExpertParallelOffloadMoELayer):
             activation="silu",
         )
         self.swiglu_limit = args.swiglu_limit
+        # V4.1 uses one activation scale per 32 values.  Keep this model-local;
+        # the shared DS-FP4 kernels retain V4's 128-value default.
+        self.dsfp4_activation_block_size = int(args.weight_block_size[1])
 
     def _maybe_all_reduce(self, routes: torch.Tensor) -> torch.Tensor:
         with profile_range("DSV41/EP/RouteAllReduce"):
@@ -236,6 +254,7 @@ class MoE(nn.Module):
         self.partition = self.decode_partition
         self.storage = self.execution.storage_partition(args.n_routed_experts)
         self._comm = DistributedCommunicator()
+        self._prefill_comm = None
         self.gate = None if self.execution.is_expert_worker else Gate(args)
         self.shared_experts = (
             None if self.execution.is_expert_worker else SharedExpert(args)
@@ -252,25 +271,45 @@ class MoE(nn.Module):
                 for rank in self.execution.prefill_active_ranks
                 if rank != self.execution.backbone_rank
             )
-            if len(peers) != 1:
-                raise RuntimeError("packed prefill requires exactly one active peer")
-            self.experts.packed_prefill_peer_rank = peers[0]
+            self.experts.packed_prefill_peer_ranks = peers
+            self.experts.packed_prefill_peer_ranges = tuple(
+                (
+                    peer,
+                    partition.global_offset,
+                    partition.global_stop,
+                )
+                for peer in peers
+                for partition in (
+                    self.execution.partition_for_rank(
+                        args.n_routed_experts, peer, prefill=True
+                    ),
+                )
+            )
+            if len(peers) == 1:
+                self.experts.packed_prefill_peer_rank = peers[0]
         self.fused_route_prep = _fused_route_prep_enabled()
         self.fused_decode_dispatch = _fused_decode_dispatch_enabled()
+
+    def attach_prefill_communicator(self, communicator) -> None:
+        self._prefill_comm = communicator
+        self.experts.prefill_communicator = communicator
 
     def _phase_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         root = self.execution.backbone_rank
         assert root is not None
         batch = get_global_ctx().batch
-        if not batch.is_prefill or not self.execution.phase_aware:
+        if not batch.is_moe_prefill or not self.execution.uses_prefill_subgroup:
             return self._comm.broadcast(tensor, root)
+        if self._prefill_comm is None and self.execution.participates_in_prefill:
+            raise RuntimeError("V4.1 active prefill rank has no subgroup communicator")
+        communicator = self._prefill_comm
         if self.execution.rank == root:
             for peer in self.execution.prefill_active_ranks:
                 if peer != root:
-                    self._comm.send(tensor, peer)
+                    communicator.send(tensor, peer)
             return tensor
         if self.execution.participates_in_prefill:
-            return self._comm.recv(tensor, root)
+            return communicator.recv(tensor, root)
         raise RuntimeError("inactive prefill rank attempted a phase broadcast")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -281,7 +320,7 @@ class MoE(nn.Module):
         fused_dispatch = (
             self.fused_decode_dispatch
             and self.execution.uses_authority_transport
-            and not get_global_ctx().batch.is_prefill
+            and not get_global_ctx().batch.is_moe_prefill
         )
         if self.execution.uses_authority_transport and not fused_dispatch:
             hidden = self._phase_broadcast(hidden.contiguous())
@@ -303,13 +342,14 @@ class MoE(nn.Module):
         fused_cache_safe = (
             self.fused_route_prep
             and weights.is_cuda
-            and not get_global_ctx().batch.is_prefill
+            and not get_global_ctx().batch.is_moe_prefill
         )
         ownership = (
             self.prefill_partition
-            if get_global_ctx().batch.is_prefill
+            if get_global_ctx().batch.is_moe_prefill
             else self.decode_partition
         )
+        global_ids = ids
         weights, ids = _prepare_partitioned_routes(
             weights,
             ids,
@@ -317,11 +357,22 @@ class MoE(nn.Module):
             fused_cache_safe=fused_cache_safe,
             storage=self.storage,
         )
+        packed_peers = getattr(self.experts, "packed_prefill_peer_ranks", ())
         if not self.execution.tp2_ep2:
-            self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+            if len(packed_peers) > 1:
+                self.experts.prepare_packed_prefill_receive(
+                    weights, hidden.dtype, global_topk_ids=global_ids
+                )
+            else:
+                self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         shared = self.shared_experts(hidden)
         if self.execution.tp2_ep2:
-            self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+            if len(packed_peers) > 1:
+                self.experts.prepare_packed_prefill_receive(
+                    weights, hidden.dtype, global_topk_ids=global_ids
+                )
+            else:
+                self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
         routed_weights = weights.float().contiguous()
         routed_ids = ids.to(torch.int32).contiguous()
         if fused_cache_safe:
@@ -330,7 +381,7 @@ class MoE(nn.Module):
             )
         else:
             routed = self.experts.routed_forward(hidden, routed_weights, routed_ids)
-        if self.execution.tp2_ep2 and get_global_ctx().batch.is_prefill:
+        if self.execution.tp2_ep2 and get_global_ctx().batch.is_moe_prefill:
             if self.execution.rank != self.execution.backbone_rank:
                 routed = torch.empty_like(hidden)
             routed = self._comm.broadcast(
@@ -343,7 +394,7 @@ class MoE(nn.Module):
             raise RuntimeError("worker_forward is valid only on an expert worker")
         with profile_range("DSV41/EP/WorkerReceive"):
             hidden = torch.empty(hidden_shape, dtype=torch.bfloat16, device=device)
-            if self.fused_decode_dispatch and not get_global_ctx().batch.is_prefill:
+            if self.fused_decode_dispatch and not get_global_ctx().batch.is_moe_prefill:
                 hidden, weights, ids = _broadcast_decode_dispatch(
                     self._comm,
                     self.execution,
@@ -362,11 +413,11 @@ class MoE(nn.Module):
             fused_cache_safe = (
                 self.fused_route_prep
                 and weights.is_cuda
-                and not get_global_ctx().batch.is_prefill
+                and not get_global_ctx().batch.is_moe_prefill
             )
             ownership = (
                 self.prefill_partition
-                if get_global_ctx().batch.is_prefill
+                if get_global_ctx().batch.is_moe_prefill
                 else self.decode_partition
             )
             weights, ids = _prepare_partitioned_routes(

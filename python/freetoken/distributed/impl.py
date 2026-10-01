@@ -55,11 +55,18 @@ class TorchDistributedImpl(DistributedImpl):
         return x
 
     def send(self, x: torch.Tensor, dst: int) -> torch.Tensor:
-        dist.send(x, dst=dst)
+        # NCCL's eager communicator initialization can deadlock when the first
+        # operation on a world group is an unbatched P2P between only a subset
+        # of its ranks (for example the two active prefill ranks in EP3).
+        # Grouping even a single P2P op gives NCCL the matching group boundary
+        # it needs without forcing decode-only ranks into the transfer.
+        work = dist.batch_isend_irecv([dist.P2POp(dist.isend, x, dst)])[0]
+        work.wait()
         return x
 
     def recv(self, x: torch.Tensor, src: int) -> torch.Tensor:
-        dist.recv(x, src=src)
+        work = dist.batch_isend_irecv([dist.P2POp(dist.irecv, x, src)])[0]
+        work.wait()
         return x
 
 

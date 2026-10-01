@@ -28,7 +28,12 @@ def hc_mixes(
     leading = x.shape[:-2]
     flat = x.flatten(-2).float()
     mixes = F.linear(flat, weight.float())
-    mixes *= torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    # The FP32 projection input is dead after ``linear``.  Reuse it for the
+    # RMS reduction rather than materializing another full-size ``square``
+    # tensor (640 MiB for an 8K DSV4.1 prefill chunk).  CUDA stream ordering
+    # keeps the in-place write behind the linear kernel's final read.
+    flat.square_()
+    mixes *= torch.rsqrt(flat.mean(-1, keepdim=True) + norm_eps)
     rows = mixes.reshape(-1, mixes.shape[-1])
     if rows.is_cuda:
         from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn

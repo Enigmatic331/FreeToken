@@ -64,6 +64,23 @@ class CompressorBackendMixin:
         scratch = rows + self.compress_scratch_base(layer_id, tier)
         return torch.where(completed, row_of_block, scratch)
 
+    def verify_compress_rows(
+        self, pos: torch.Tensor, ratio: int, layer_id: int, tier: str,
+        completed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Store rows for one request's fixed speculative query span.
+
+        Incomplete groups all write the tier's discard row.  Duplicate writes
+        there are harmless: it is outside the addressable compressed history.
+        Completed groups map through request row zero's captured snapshot.
+        """
+
+        row_of_block = self.pool.cmp_rows(self.snapshot()[0, pos], ratio)
+        scratch = torch.full_like(
+            row_of_block, self.compress_scratch_base(layer_id, tier)
+        )
+        return torch.where(completed, row_of_block, scratch)
+
     def scatter_compressed(
         self, layer_id: int, tier: str, rows: torch.Tensor, kv: torch.Tensor
     ) -> None:

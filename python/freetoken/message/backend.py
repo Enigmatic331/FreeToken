@@ -47,6 +47,8 @@ class UserMsg(BaseBackendMsg):
     # Full SHA-256 identities in image-token-span order. These are safe across
     # tokenizer workers; the scheduler converts them to local radix symbols.
     image_cache_keys: list[bytes] | None = None
+    # Exact half-open placeholder ranges corresponding to image_cache_keys.
+    image_token_spans: list[tuple[int, int]] | None = None
     # Original compressed bytes/URL strings for a scheduler feature-cache miss.
     image_inputs: list[str | bytes] | None = field(default=None, repr=False)
 

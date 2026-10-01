@@ -9,6 +9,8 @@ TP2+EP2 research mode executes a sharded dense backbone on both ranks.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +19,7 @@ from torch import nn
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.utils import init_logger
 
 from .args import DeepseekV41Args
 from .attention_layout import AttentionLayout
@@ -33,6 +36,8 @@ from .layers import Linear, RMSNorm
 from .moe import Gate, MoE, SharedExpert
 from .profile import profile, profile_range
 
+logger = init_logger(__name__)
+
 
 class SharedAttentionRuntime:
     """Per-forward publications consumed by later CSA2 layers."""
@@ -47,6 +52,12 @@ class SharedAttentionRuntime:
 
 
 shared_attention = SharedAttentionRuntime()
+
+
+@dataclass(frozen=True)
+class DSparkTargetFeatures:
+    hidden: torch.Tensor
+    positions: torch.Tensor
 
 
 class Indexer(nn.Module):
@@ -117,6 +128,7 @@ class Indexer(nn.Module):
         *,
         offset: int = 0,
         candidate_mask: torch.Tensor | None = None,
+        inplace: bool = False,
     ) -> torch.Tensor:
         return select_index_topk(
             scores,
@@ -124,6 +136,7 @@ class Indexer(nn.Module):
             self.index_topk,
             offset=offset,
             candidate_mask=candidate_mask,
+            inplace=inplace,
         )
 
     def select_candidate_mask(
@@ -158,6 +171,7 @@ class Attention(nn.Module):
         self.n_groups = args.o_groups // tp_size
         self.o_lora_rank = args.o_lora_rank
         self.window_size = args.window_size
+        self.fp8_block_size = int(args.weight_block_size[1])
         self.softmax_scale = args.head_dim**-0.5
         self.attn_sink = nn.Parameter(
             torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False
@@ -223,7 +237,7 @@ class Attention(nn.Module):
 
         kv = self.kv_norm(self.wkv(x))
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs)
-        act_quant_fp8_inplace(kv, 64)
+        act_quant_fp8_inplace(kv, self.fp8_block_size)
         return kv
 
     def _project_output(self, output: torch.Tensor) -> torch.Tensor:
@@ -253,7 +267,8 @@ class Attention(nn.Module):
         if latent.shape[1] == 0:
             return
         ratio = self.plan.compress_ratio
-        positions = start_pos + torch.arange(
+        first_group = start_pos - (start_pos % ratio)
+        positions = first_group + torch.arange(
             0, latent.shape[1] * ratio, ratio, device=x.device
         )
         freqs = self.freqs_cis.index_select(0, positions)
@@ -345,7 +360,12 @@ class Attention(nn.Module):
                 else:
                     mask = None
                 selected[rows].copy_(
-                    self.indexer.select(scores, live[rows], candidate_mask=mask)
+                    self.indexer.select(
+                        scores,
+                        live[rows],
+                        candidate_mask=mask,
+                        inplace=True,
+                    )
                 )
             if published_candidates is not None:
                 shared_attention.candidates.mask = published_candidates
@@ -450,6 +470,42 @@ class Attention(nn.Module):
             self.layer_id, "attn", cmp_dest, compressed
         )
 
+    def _publish_source_verify(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        window_slots: torch.Tensor,
+    ) -> None:
+        """Publish one graph-captured speculative span into the source slabs."""
+
+        assert self.compressor is not None and self.indexer is not None
+        ratio = self.plan.compress_ratio
+        latent, cmp_dest, completed = self.compressor.verify_paged(
+            x,
+            positions,
+            window_slots,
+            layer_id=self.layer_id,
+            backend=self.attn,
+        )
+        group_pos = (positions + 1 - ratio).clamp_min(0)
+        group_freqs = self.freqs_cis.index_select(0, group_pos)
+        index_k = self.indexer.index_keys(latent, group_freqs)
+        idx_dest = self.attn.verify_compress_rows(
+            positions, ratio, self.layer_id, "idx", completed
+        )
+        self.attn.scatter_compressed(self.layer_id, "idx", idx_dest, index_k)
+        from freetoken.kernel.triton.dsv41 import rope_fp4_roundtrip
+
+        compressed = rope_fp4_roundtrip(
+            latent,
+            group_freqs,
+            self.rope_head_dim,
+            compressed_kv=True,
+        )
+        self.attn.scatter_compressed(
+            self.layer_id, "attn", cmp_dest, compressed
+        )
+
     def _index_decode(
         self,
         x: torch.Tensor,
@@ -499,6 +555,100 @@ class Attention(nn.Module):
         shared_attention.topk_rows = global_rows
         return global_rows
 
+    def _index_verify(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        n_stage: int,
+        freqs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Lightning-Indexer path for ``T`` queries of one captured request."""
+
+        if not self.plan.owns_index:
+            if shared_attention.topk_rows is None:
+                raise RuntimeError(
+                    f"V4.1 layer {self.layer_id} consumed top-k before publication"
+                )
+            return shared_attention.topk_rows
+        ratio = self.plan.compress_ratio
+        if n_stage == 0:
+            global_rows = torch.empty(
+                1, x.shape[1], 0, dtype=torch.int64, device=x.device
+            )
+        else:
+            assert self.indexer is not None
+            query = self.indexer.queries(q_lora[0], freqs)
+            weights = self.indexer.head_weights(x[0])
+            valid = torch.div(positions + 1, ratio, rounding_mode="floor")
+            scores = self.attn.indexer_verify_scores(
+                query, weights, valid, n_stage, ratio, self.layer_id
+            )
+            if self.plan.is_candidate_source:
+                shared_attention.candidates.publish(
+                    scores,
+                    valid.unsqueeze(-1),
+                    self.indexer.candidate_topk_blocks,
+                    self.indexer.candidate_block_size,
+                )
+            mask = (
+                shared_attention.candidates.mask
+                if self.plan.uses_candidates
+                else None
+            )
+            blocks = self.indexer.select(
+                scores, valid, candidate_mask=mask
+            )
+            global_rows = self.attn.verify_blocks_to_global(blocks, ratio)
+        shared_attention.topk_rows = global_rows
+        return global_rows
+
+    def verify_single(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        cmp_stage_cap: int,
+        window_ctx,
+    ) -> torch.Tensor:
+        """Fixed-shape, tensor-addressed target verification for CUDA capture."""
+
+        from freetoken.models.deepseek_v4.ops import apply_rotary_emb
+
+        assert self.freqs_cis is not None
+        window_slots, window_rows = window_ctx
+        freqs = self.freqs_cis.index_select(0, positions)
+        q_lora, q = self._project_q(x, freqs)
+        kv = self._project_window_kv(x, freqs)
+        self.attn.store_window(kv[0], self.layer_id, window_slots)
+
+        ratio = self.plan.compress_ratio
+        cmp_counts = None
+        if self.plan.owns_kv:
+            self._publish_source_verify(x, positions, window_slots)
+        if ratio:
+            n_stage = (cmp_stage_cap + 1) // ratio
+            compressed_rows = self._index_verify(
+                x, q_lora, positions, n_stage, freqs
+            )
+            topk = torch.cat([window_rows, compressed_rows], -1).int()
+            cmp_counts = (compressed_rows >= 0).sum(-1).to(torch.int32)
+        else:
+            topk = window_rows.int()
+        output = self.attn.attend(
+            q,
+            self.layer_id,
+            topk,
+            self.window_size,
+            self.attn_sink,
+            self.softmax_scale,
+            cmp_counts=cmp_counts,
+            has_compression=bool(ratio),
+        )
+        apply_rotary_emb(
+            output[..., -self.rope_head_dim :], freqs, inverse=True
+        )
+        return self._project_output(output)
+
     def decode_step(
         self,
         x: torch.Tensor,
@@ -523,7 +673,7 @@ class Attention(nn.Module):
         apply_rotary_emb_decode(q[..., -self.rope_head_dim :], freqs)
         kv = self.kv_norm(self.wkv(x))
         apply_rotary_emb_decode(kv[..., -self.rope_head_dim :], freqs)
-        act_quant_fp8_inplace(kv, 64)
+        act_quant_fp8_inplace(kv, self.fp8_block_size)
         self.attn.store_window(
             kv.view(x.shape[0], self.head_dim), self.layer_id, window_slots
         )
@@ -562,7 +712,9 @@ class Attention(nn.Module):
 class MoEState(nn.Module):
     """Resident router/shared-expert state; routed experts attach at runtime."""
 
-    def __init__(self, args: DeepseekV41Args) -> None:
+    def __init__(
+        self, args: DeepseekV41Args, *, enable_vision: bool = False
+    ) -> None:
         super().__init__()
         from .execution import get_execution_plan
 
@@ -571,7 +723,9 @@ class MoEState(nn.Module):
             execution.rank == execution.backbone_rank
         )
         self.dim = args.dim
-        self.gate = Gate(args) if owns_shared_path else None
+        self.gate = (
+            Gate(args, enable_vision=enable_vision) if owns_shared_path else None
+        )
         self.shared_experts = SharedExpert(args) if owns_shared_path else None
         self.experts = None
         self.execution = None
@@ -580,6 +734,7 @@ class MoEState(nn.Module):
         self.decode_partition = None
         self.storage = None
         self._comm = None
+        self._prefill_comm = None
         self.decode_refill_overlap = os.getenv(
             "FREETOKEN_DSV41_DECODE_REFILL_OVERLAP", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -617,9 +772,28 @@ class MoEState(nn.Module):
                 for rank in self.execution.prefill_active_ranks
                 if rank != self.execution.backbone_rank
             )
-            if len(peers) != 1:
-                raise RuntimeError("packed prefill requires exactly one active peer")
-            self.experts.packed_prefill_peer_rank = peers[0]
+            self.experts.packed_prefill_peer_ranks = peers
+            self.experts.packed_prefill_peer_ranges = tuple(
+                (
+                    peer,
+                    partition.global_offset,
+                    partition.global_stop,
+                )
+                for peer in peers
+                for partition in (
+                    self.execution.partition_for_rank(
+                        args.n_routed_experts, peer, prefill=True
+                    ),
+                )
+            )
+            if len(peers) == 1:
+                self.experts.packed_prefill_peer_rank = peers[0]
+
+    def attach_prefill_communicator(self, communicator) -> None:
+        if self.experts is None:
+            raise RuntimeError("routed experts must be attached first")
+        self._prefill_comm = communicator
+        self.experts.prefill_communicator = communicator
 
     def _phase_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         """Exclude decode-only auxiliary ranks from prefill collectives."""
@@ -628,18 +802,23 @@ class MoEState(nn.Module):
         root = self.execution.backbone_rank
         assert root is not None
         batch = get_global_ctx().batch
-        if not batch.is_prefill or not self.execution.phase_aware:
+        if not batch.is_moe_prefill or not self.execution.uses_prefill_subgroup:
             return self._comm.broadcast(tensor, root)
+        if self._prefill_comm is None and self.execution.participates_in_prefill:
+            raise RuntimeError("V4.1 active prefill rank has no subgroup communicator")
+        communicator = self._prefill_comm
         if self.execution.rank == root:
             for peer in self.execution.prefill_active_ranks:
                 if peer != root:
-                    self._comm.send(tensor, peer)
+                    communicator.send(tensor, peer)
             return tensor
         if self.execution.participates_in_prefill:
-            return self._comm.recv(tensor, root)
+            return communicator.recv(tensor, root)
         raise RuntimeError("inactive prefill rank attempted a phase broadcast")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, image_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if self.experts is None or self.execution is None:
             raise RuntimeError("V4.1 routed experts have not been attached")
         shape = x.shape
@@ -647,7 +826,7 @@ class MoEState(nn.Module):
         fused_dispatch = (
             getattr(self, "fused_decode_dispatch", False)
             and self.execution.uses_authority_transport
-            and not get_global_ctx().batch.is_prefill
+            and not get_global_ctx().batch.is_moe_prefill
         )
         if self.execution.uses_authority_transport and not fused_dispatch:
             with profile_range("DSV41/EP/HiddenBroadcast"):
@@ -662,7 +841,11 @@ class MoEState(nn.Module):
         else:
             with profile_range("DSV41/MoE/Router"):
                 assert self.gate is not None
-                weights, ids = self.gate(hidden)
+                weights, ids = (
+                    self.gate(hidden)
+                    if image_mask is None
+                    else self.gate(hidden, image_mask)
+                )
         if fused_dispatch:
             from .moe import _broadcast_decode_dispatch
 
@@ -683,14 +866,15 @@ class MoEState(nn.Module):
             getattr(self, "fused_route_prep", False)
             and self.execution.enabled
             and weights.is_cuda
-            and not get_global_ctx().batch.is_prefill
+            and not get_global_ctx().batch.is_moe_prefill
         )
+        global_ids = ids
         if self.execution.enabled:
             from .moe import _prepare_partitioned_routes
 
             ownership = (
                 getattr(self, "prefill_partition", self.partition)
-                if get_global_ctx().batch.is_prefill
+                if get_global_ctx().batch.is_moe_prefill
                 else getattr(self, "decode_partition", self.partition)
             )
             weights, ids = _prepare_partitioned_routes(
@@ -700,9 +884,17 @@ class MoEState(nn.Module):
                 fused_cache_safe=fused_cache_safe,
                 storage=getattr(self, "storage", None),
             )
+        packed_peers = getattr(self.experts, "packed_prefill_peer_ranks", ())
         if not self.execution.tp2_ep2:
             with profile_range("DSV41/MoE/PrepareRouted"):
-                self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+                if len(packed_peers) > 1:
+                    self.experts.prepare_packed_prefill_receive(
+                        weights, hidden.dtype, global_topk_ids=global_ids
+                    )
+                else:
+                    self.experts.prepare_packed_prefill_receive(
+                        weights, hidden.dtype
+                    )
         routed_weights = weights.float().contiguous()
         routed_ids = ids.to(torch.int32).contiguous()
         refill_plan = None
@@ -710,7 +902,7 @@ class MoEState(nn.Module):
             self.decode_refill_overlap
             and self.execution.uses_authority_transport
             and self.execution.rank == self.execution.backbone_rank
-            and not get_global_ctx().batch.is_prefill
+            and not get_global_ctx().batch.is_moe_prefill
         ):
             with profile_range("DSV41/MoE/DecodeRefillFork"):
                 if fused_cache_safe:
@@ -733,7 +925,14 @@ class MoEState(nn.Module):
             # Both TP ranks must finish shared-expert all-reduce before root
             # posts a P2P receive whose matching worker send occurs below.
             with profile_range("DSV41/MoE/PrepareRouted"):
-                self.experts.prepare_packed_prefill_receive(weights, hidden.dtype)
+                if len(packed_peers) > 1:
+                    self.experts.prepare_packed_prefill_receive(
+                        weights, hidden.dtype, global_topk_ids=global_ids
+                    )
+                else:
+                    self.experts.prepare_packed_prefill_receive(
+                        weights, hidden.dtype
+                    )
         with profile_range("DSV41/MoE/RoutedExpert"):
             if refill_plan is None:
                 if fused_cache_safe:
@@ -748,7 +947,7 @@ class MoEState(nn.Module):
                 routed = self.experts.finish_routed_decode(
                     hidden, routed_weights, refill_plan
                 )
-        if self.execution.tp2_ep2 and get_global_ctx().batch.is_prefill:
+        if self.execution.tp2_ep2 and get_global_ctx().batch.is_moe_prefill:
             # Packed EP prefill combines exact per-route outputs only on the
             # root.  The second dense rank needs that combined residual too.
             if self.execution.rank != self.execution.backbone_rank:
@@ -776,12 +975,14 @@ class Block(nn.Module):
         args: DeepseekV41Args,
         layer_id: int,
         layout: AttentionLayout,
+        *,
+        enable_vision: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = int(layer_id)
         self.attn = Attention(args, layer_id, layout)
         self.engram = Engram(args, layer_id) if layer_id in args.engram_layer_ids else None
-        self.ffn = MoEState(args)
+        self.ffn = MoEState(args, enable_vision=enable_vision)
         self.attn_norm = RMSNorm(args.dim, args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, args.norm_eps)
         self.hc_mult = args.hc_mult
@@ -839,6 +1040,7 @@ class Block(nn.Module):
         table_idx: int,
         engram_rows: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .hc import hc_post, hc_pre
 
@@ -856,7 +1058,7 @@ class Block(nn.Module):
         ffn_pre, ffn_post, ffn_comb = self._mixes(hidden, "ffn")
         block_input = self.ffn_norm(hc_pre(hidden, attn_pre))
         with profile_range("DSV41/MoE/Authority"):
-            block_output = self.ffn(block_input)
+            block_output = self.ffn(block_input, image_mask)
         return hc_post(block_output, residual, ffn_post, ffn_comb), ffn_pre
 
     @profile("DSV41/Layer_{}/Decode", layer_id_field="layer_id")
@@ -891,23 +1093,79 @@ class Block(nn.Module):
             block_output = self.ffn(block_input)
         return hc_post(block_output, residual, ffn_post, ffn_comb), ffn_pre
 
+    @profile("DSV41/Layer_{}/Verify", layer_id_field="layer_id")
+    def verify_single(
+        self,
+        hidden: torch.Tensor,
+        incoming_pre: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        cmp_stage_cap: int,
+        window_ctx,
+        engram_rows: torch.Tensor | None = None,
+        token_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from .hc import hc_post, hc_pre
+
+        hidden = self._engram(hidden, engram_rows, token_mask)
+        residual = hidden
+        attn_pre, attn_post, attn_comb = self._mixes(hidden, "attn")
+        block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
+        with profile_range("DSV41/Attention/Verify"):
+            block_output = self.attn.verify_single(
+                block_input, positions, cmp_stage_cap, window_ctx
+            )
+        hidden = hc_post(block_output, residual, attn_post, attn_comb)
+
+        residual = hidden
+        ffn_pre, ffn_post, ffn_comb = self._mixes(hidden, "ffn")
+        block_input = self.ffn_norm(hc_pre(hidden, attn_pre))
+        with profile_range("DSV41/MoE/Authority"):
+            block_output = self.ffn(block_input)
+        return hc_post(block_output, residual, ffn_post, ffn_comb), ffn_pre
+
 
 class Transformer(nn.Module):
-    """Ordinary-generation V4.1 backbone; MTP and vision are intentionally absent."""
+    """Ordinary-generation V4.1 backbone with an optional native vision tower."""
 
-    def __init__(self, args: DeepseekV41Args) -> None:
+    def __init__(
+        self, args: DeepseekV41Args, *, enable_vision: bool = False
+    ) -> None:
         super().__init__()
         self.args = args
         self.attention_layout = AttentionLayout(args)
         self.embed = nn.Embedding(args.vocab_size, args.dim, dtype=torch.bfloat16)
         self.embed.weight.requires_grad_(False)
         self.layers = nn.ModuleList(
-            [Block(args, layer, self.attention_layout) for layer in range(args.n_layers)]
+            [
+                Block(
+                    args,
+                    layer,
+                    self.attention_layout,
+                    enable_vision=enable_vision,
+                )
+                for layer in range(args.n_layers)
+            ]
         )
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.head = nn.Parameter(
             torch.empty(args.vocab_size, args.dim, dtype=torch.float32), requires_grad=False
         )
+        self.vision = None
+        self._dspark_hidden: torch.Tensor | None = None
+        if enable_vision:
+            from .vision import Aligner, ViT
+
+            self.vision = ViT(args)
+            self.aligner = Aligner(args)
+            for name in ("image_start", "image_end", "image_newline"):
+                self.register_parameter(
+                    name,
+                    nn.Parameter(
+                        torch.empty(args.dim, dtype=torch.bfloat16),
+                        requires_grad=False,
+                    ),
+                )
         # RoutedExperts owns no resident model tensors. Construct the shells with
         # the engine model so the generic offload-cache walker can attach before
         # runtime preparation. Standalone meta tooling has no TP context and only
@@ -931,11 +1189,25 @@ class Transformer(nn.Module):
         for block in self.layers:
             block.attn.bind(device)
 
+    def attach_prefill_communicator(self, communicator) -> None:
+        self._attach_routed_experts()
+        for block in self.layers:
+            block.ffn.attach_prefill_communicator(communicator)
+
     def attach_engram_table(self, layer_id: int, table) -> None:
         block = self.layers[layer_id]
         if block.engram is None:
             raise ValueError(f"layer {layer_id} has no Engram module")
         block.engram.attach_table(table)
+
+    def encode_image(
+        self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int
+    ) -> torch.Tensor:
+        if self.vision is None:
+            raise RuntimeError("DeepSeek-V4.1 vision tower is not loaded")
+        return self.aligner(
+            self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w
+        )
 
     def prefill_single(
         self,
@@ -945,15 +1217,38 @@ class Transformer(nn.Module):
         table_idx: int,
         engram_rows: dict[int, torch.Tensor] | None = None,
         token_mask: torch.Tensor | None = None,
+        mm_embeds: torch.Tensor | None = None,
+        full_logits: bool = False,
+        capture_dspark: bool = False,
     ) -> torch.Tensor:
         from .hc import hc_pre, identity_pre_mix
 
         shared_attention.reset()
-        hidden = self.embed(input_ids).unsqueeze(2).repeat(
+        embedded = self.embed(input_ids)
+        image_mask = None
+        if mm_embeds is not None:
+            image_mask = input_ids == self.args.image_token_id
+            count = int(image_mask.sum().item())
+            if mm_embeds.shape != (count, self.args.dim):
+                raise ValueError(
+                    f"DeepSeek image embeddings {tuple(mm_embeds.shape)} do not "
+                    f"match {count} placeholder tokens"
+                )
+            embedded = embedded.clone()
+            embedded[image_mask] = mm_embeds.to(
+                device=embedded.device, dtype=embedded.dtype
+            )
+            token_mask = ~image_mask
+        hidden = embedded.unsqueeze(2).repeat(
             1, 1, self.args.hc_mult, 1
         )
         incoming = identity_pre_mix(hidden, self.args.hc_mult)
+        target_hiddens = []
         for layer_id, block in enumerate(self.layers):
+            # The official V4.1 DSpark reference taps the attention INPUT of
+            # layers 37/38/39, with the HC copies averaged away.
+            if capture_dspark and layer_id in self.args.dspark_target_layer_ids:
+                target_hiddens.append(hidden.mean(dim=2))
             hidden, incoming = block.prefill_single(
                 hidden,
                 incoming,
@@ -961,9 +1256,15 @@ class Transformer(nn.Module):
                 table_idx=table_idx,
                 engram_rows=(engram_rows or {}).get(layer_id),
                 token_mask=token_mask,
+                image_mask=image_mask,
             )
         hidden = self.norm(hc_pre(hidden, incoming))
-        return F.linear(hidden[:, -1].float(), self.head)
+        self._dspark_hidden = (
+            torch.cat(target_hiddens, dim=-1)[0] if target_hiddens else None
+        )
+        projected = hidden if full_logits else hidden[:, -1]
+        logits = F.linear(projected.float(), self.head)
+        return logits[0] if full_logits else logits
 
     def decode(
         self,
@@ -973,6 +1274,7 @@ class Transformer(nn.Module):
         *,
         engram_rows: dict[int, torch.Tensor] | None = None,
         token_mask: torch.Tensor | None = None,
+        capture_dspark: bool = False,
     ) -> torch.Tensor:
         from .hc import hc_pre, identity_pre_mix
 
@@ -986,7 +1288,10 @@ class Transformer(nn.Module):
             1, 1, self.args.hc_mult, 1
         )
         incoming = identity_pre_mix(hidden, self.args.hc_mult)
+        target_hiddens = []
         for layer_id, block in enumerate(self.layers):
+            if capture_dspark and layer_id in self.args.dspark_target_layer_ids:
+                target_hiddens.append(hidden.mean(dim=2))
             hidden, incoming = block.decode_step(
                 hidden,
                 incoming,
@@ -998,7 +1303,69 @@ class Transformer(nn.Module):
                 token_mask=token_mask,
             )
         hidden = self.norm(hc_pre(hidden, incoming))
+        self._dspark_hidden = (
+            torch.cat(target_hiddens, dim=-1)[:, 0]
+            if target_hiddens
+            else None
+        )
         return F.linear(hidden[:, -1].float(), self.head)
+
+    def verify(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        cmp_stage_cap: int,
+        *,
+        engram_rows: dict[int, torch.Tensor] | None = None,
+        token_mask: torch.Tensor | None = None,
+        capture_dspark: bool = False,
+    ) -> torch.Tensor:
+        """Run one fixed speculative span with graph-stable tensor addressing."""
+
+        from .hc import hc_pre, identity_pre_mix
+
+        shared_attention.reset()
+        metadata = get_global_ctx().batch.attn_metadata
+        window_ctx = metadata.verify_window_ctx(positions)
+        hidden = self.embed(input_ids.view(1, -1)).unsqueeze(2).repeat(
+            1, 1, self.args.hc_mult, 1
+        )
+        incoming = identity_pre_mix(hidden, self.args.hc_mult)
+        target_hiddens = []
+        for layer_id, block in enumerate(self.layers):
+            if capture_dspark and layer_id in self.args.dspark_target_layer_ids:
+                target_hiddens.append(hidden.mean(dim=2))
+            hidden, incoming = block.verify_single(
+                hidden,
+                incoming,
+                positions=positions,
+                cmp_stage_cap=cmp_stage_cap,
+                window_ctx=window_ctx,
+                engram_rows=(engram_rows or {}).get(layer_id),
+                token_mask=token_mask,
+            )
+        hidden = self.norm(hc_pre(hidden, incoming))
+        self._dspark_hidden = (
+            torch.cat(target_hiddens, dim=-1)[0]
+            if target_hiddens
+            else None
+        )
+        return F.linear(hidden[0].float(), self.head)
+
+    def restore_dspark_graph_carry(
+        self, selected_row: int, window_slot: int
+    ) -> None:
+        """Restore every source compressor from its captured device journal."""
+
+        for layer_id, block in enumerate(self.layers):
+            compressor = block.attn.compressor
+            if compressor is not None and compressor.compress_ratio > 1:
+                compressor.restore_graph_carry(
+                    selected_row,
+                    window_slot,
+                    layer_id=layer_id,
+                    backend=block.attn.attn,
+                )
 
 
 class _CoordinatedEngramTable:
@@ -1054,6 +1421,10 @@ class DeepseekV41ExpertWorkerModel:
     def attach_engram_coordinator(self, coordinator) -> None:
         self.engram_coordinator = coordinator
 
+    def attach_prefill_communicator(self, communicator) -> None:
+        for layer in self.layers:
+            layer.attach_prefill_communicator(communicator)
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.engram_coordinator is None:
             raise RuntimeError("V4.1 worker has no Engram tables")
@@ -1061,7 +1432,7 @@ class DeepseekV41ExpertWorkerModel:
         device = input_ids.device
         if (
             self.engram_coordinator.execution.phase_aware
-            and get_global_ctx().batch.is_prefill
+            and get_global_ctx().batch.is_moe_prefill
             and not self.engram_coordinator.execution.participates_in_prefill
         ):
             return torch.zeros((1, 1), dtype=torch.float32, device=device)
@@ -1083,7 +1454,7 @@ class DeepseekV41ExpertWorkerModel:
 
 
 class DeepseekV41ForCausalLM(BaseLLMModel):
-    """Engine adapter for text-only, non-speculative DeepSeek-V4.1 serving."""
+    """Engine adapter for native text/image, non-speculative V4.1 serving."""
 
     def __init__(self, config) -> None:
         from .execution import get_execution_plan
@@ -1091,16 +1462,24 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         self._config = config
         self._args: DeepseekV41Args = config.dsv41_args
         self._execution = get_execution_plan()
+        vision_on_this_rank = bool(getattr(config, "is_multimodal", False)) and (
+            not self._execution.enabled
+            or self._execution.rank == self._execution.backbone_rank
+        )
         self._model = (
             DeepseekV41ExpertWorkerModel(self._args)
             if self._execution.is_expert_worker
-            else Transformer(self._args)
+            else Transformer(self._args, enable_vision=vision_on_this_rank)
         )
+        self._vision_device: torch.device | None = None
         self._bound = False
         self._engram_hasher = None
         self._engram_tables = None
         self._engram_coordinator = None
         self._phase_barrier_group = None
+        self._dspark_device: torch.device | None = None
+        self._drafter = None
+        self._dspark_target_features: DSparkTargetFeatures | None = None
 
     def state_dict(self, *, prefix: str = "", result=None):
         result = {} if result is None else result
@@ -1120,10 +1499,159 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             key = f"{prefix}.{name}" if prefix else name
             if key not in state_dict:
                 raise RuntimeError(f"Missing weight for DeepSeek-V4.1 parameter: {key}")
-            casted[name] = state_dict.pop(key).to(parameter.dtype)
+            value = state_dict.pop(key)
+            if value.shape != parameter.shape:
+                raise ValueError(
+                    f"DeepSeek-V4.1 weight {key} has shape {tuple(value.shape)}; "
+                    f"expected {tuple(parameter.shape)}"
+                )
+            target = (
+                self._vision_device
+                if self._vision_device is not None
+                and name.startswith(("vision.", "aligner.", "image_"))
+                else value.device
+            )
+            casted[name] = value.to(device=target, dtype=parameter.dtype)
         if state_dict and not _internal:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict)}")
         self._model.load_state_dict(casted, assign=True, strict=False)
+
+    def set_vision_device(self, device: torch.device) -> None:
+        if device.type != "cuda":
+            raise ValueError(f"DeepSeek vision device must be CUDA, got {device}")
+        if not self._execution.is_expert_worker and self._model.vision is not None:
+            self._vision_device = device
+
+    def set_dspark_device(self, device: torch.device) -> None:
+        if device.type != "cuda":
+            raise ValueError(f"DeepSeek DSpark device must be CUDA, got {device}")
+        if self._args.dspark_enabled and not self._execution.is_expert_worker:
+            self._dspark_device = device
+
+    def load_auxiliary_weights(self, engine_config) -> int:
+        if not self._args.dspark_enabled or self._execution.is_expert_worker:
+            return 0
+        if self._dspark_device is None:
+            raise RuntimeError("DSpark is enabled but no auxiliary device was bound")
+        from .dspark import DSparkDrafter, load_dspark_checkpoint
+
+        # torch.cuda.device selects the CUDA ordinal for kernels, while
+        # torch.device makes factory calls without an explicit device allocate
+        # there instead of silently constructing the 7.4-GiB stack on CPU.
+        with (
+            torch.cuda.device(self._dspark_device),
+            torch.device(self._dspark_device),
+        ):
+            self._drafter = DSparkDrafter(self._args)
+            loaded = load_dspark_checkpoint(
+                engine_config.model_path, self._drafter, self._dspark_device
+            )
+        self._drafter.bind(self._target_embed, self._target_logits)
+        return loaded
+
+    def _target_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self._execution.is_expert_worker:
+            raise RuntimeError("expert workers have no target embedding")
+        return self._model.embed(input_ids.long())
+
+    def _target_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self._execution.is_expert_worker:
+            raise RuntimeError("expert workers have no target head")
+        return F.linear(hidden.float(), self._model.head)
+
+    def dspark_target_features(self) -> DSparkTargetFeatures | None:
+        return self._dspark_target_features
+
+    def set_dspark_graph_target_features(
+        self, hidden: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        """Publish address-stable target taps written by a decode CUDA graph."""
+
+        if not self._args.dspark_enabled or self._execution.is_expert_worker:
+            self._dspark_target_features = None
+            return
+        self._dspark_target_features = DSparkTargetFeatures(hidden, positions)
+
+    def restore_dspark_graph_carry(
+        self, selected_row: int, window_slot: int
+    ) -> None:
+        if self._execution.is_expert_worker:
+            return
+        self._model.restore_dspark_graph_carry(selected_row, window_slot)
+
+    def catch_up_draft_context(self, features: DSparkTargetFeatures | None) -> None:
+        if self._drafter is not None and features is not None:
+            self._drafter.catch_up_context(features.hidden, features.positions)
+
+    def draft(self, sampling_params):
+        if self._drafter is None:
+            return None
+        batch = get_global_ctx().batch
+        span = 1 + batch.spec_block
+        if batch.input_ids.numel() != span:
+            raise RuntimeError(
+                f"V4.1 DSpark expected one {span}-row verify span, got "
+                f"{batch.input_ids.numel()} rows"
+            )
+        # Verification may trim the target prefix below the checkpoint's full
+        # block.  The auxiliary network still produces all positions so its
+        # confidence head can price the next step; synthesize the omitted tail
+        # positions instead of coupling draft shape to target shape.
+        draft_positions = batch.positions[0].long() + torch.arange(
+            self._args.dspark_block_size,
+            dtype=torch.long,
+            device=batch.positions.device,
+        )
+        return self._drafter.propose(
+            batch.input_ids[:1].long(),
+            # The draft's first hidden row embeds the live anchor itself.  The
+            # target context cache ends one token earlier, so the official
+            # `start_pos + seqlen` row is positions[0], not positions[1].
+            draft_positions,
+            sampling_params,
+        )
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        if self._execution.is_expert_worker or self._model.vision is None:
+            raise RuntimeError("DeepSeek-V4.1 vision tower is not loaded on this rank")
+        from .image_processor import image_token_types
+        from .vision import image_span_embeddings
+
+        grids = image_grid_thw.to(device="cpu", dtype=torch.int64).view(-1, 3)
+        patches = pixel_values.view(
+            -1,
+            3,
+            self._args.vision_patch_size,
+            self._args.vision_patch_size,
+        )
+        spans = []
+        offset = 0
+        for n_vit_h, n_vit_w, span_count in grids.tolist():
+            count = int(n_vit_h * n_vit_w)
+            image_patches = patches[offset : offset + count]
+            if image_patches.shape[0] != count:
+                raise ValueError("vision patch tensor is shorter than its image grid")
+            n_llm_h = (n_vit_h + self._args.vision_downsample_ratio - 1) // self._args.vision_downsample_ratio
+            n_llm_w = (n_vit_w + self._args.vision_downsample_ratio - 1) // self._args.vision_downsample_ratio
+            types = image_token_types(n_llm_h, n_llm_w)
+            if types.numel() != span_count:
+                raise ValueError("DeepSeek image span length does not match its grid")
+            spans.append(
+                image_span_embeddings(
+                    self._model, image_patches, n_vit_h, n_vit_w, types
+                )
+            )
+            offset += count
+        if offset != patches.shape[0]:
+            raise ValueError("vision patch tensor contains unused rows")
+        if not spans:
+            raise ValueError("vision request contains no image grids")
+        return torch.cat(spans, dim=0).to(
+            device=self._model.embed.weight.device, dtype=torch.bfloat16
+        )
 
     def _iter_offload_moe_layers(self):
         if self._execution.is_expert_worker:
@@ -1168,12 +1696,33 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             # All global ranks call new_group in the same order. Non-members receive
             # GroupMember.NON_GROUP_MEMBER and never enter an Engram collective.
             engram_group = torch.distributed.new_group(
-                ranks=list(engram_ranks), backend="nccl"
+                ranks=list(engram_ranks),
+                backend="nccl",
+                timeout=timedelta(seconds=engine_config.distributed_timeout),
+                device_id=torch.device("cuda", torch.cuda.current_device()),
             )
-        if self._execution.phase_aware:
+        prefill_group = None
+        if self._execution.uses_prefill_subgroup:
+            prefill_ranks = self._execution.prefill_active_ranks
+            # Every global rank calls new_group in the same order; inactive
+            # ranks receive NON_GROUP_MEMBER and never enter prefill ops.
+            # Keep this communicator separate from Engram even when the
+            # memberships match. Engram and MoE route exchange run on
+            # different CUDA streams; sharing one NCCL communicator lets
+            # their collective order diverge across ranks during a long
+            # multimodal prefill.
+            prefill_group = torch.distributed.new_group(
+                ranks=list(prefill_ranks),
+                backend="nccl",
+                timeout=timedelta(seconds=engine_config.distributed_timeout),
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
             # Inactive prefill ranks wait here without submitting an early NCCL
             # collective ahead of the active ranks' point-to-point route traffic.
-            self._phase_barrier_group = torch.distributed.new_group(backend="gloo")
+            self._phase_barrier_group = torch.distributed.new_group(
+                backend="gloo",
+                timeout=timedelta(seconds=engine_config.distributed_timeout),
+            )
         args = self._args
         if getattr(engine_config, "use_dummy_weight", False):
             tables = (
@@ -1210,7 +1759,16 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
         communicator = None
         if self._execution.participates_in_engram and engram_group is not None:
-            communicator = TorchProcessGroupCommunicator(engram_group)
+            communicator = TorchProcessGroupCommunicator(engram_group, name="engram")
+        if (
+            self._execution.uses_prefill_subgroup
+            and self._execution.participates_in_prefill
+        ):
+            if prefill_group is None:
+                raise RuntimeError("V4.1 active prefill rank has no NCCL subgroup")
+            self._model.attach_prefill_communicator(
+                TorchProcessGroupCommunicator(prefill_group, name="prefill")
+            )
         coordinator = EngramCoordinator(
             tables, execution=self._execution, communicator=communicator
         )
@@ -1264,9 +1822,21 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             cu = torch.tensor(
                 [0, input_ids.numel()], dtype=torch.int32, **pin
             ).to(input_ids.device, non_blocking=True)
-        all_rows = self._engram_hasher.row_ids(
-            input_ids.view(-1), batch.positions.view(-1), cu, history
-        )
+        flat_ids = input_ids.view(-1)
+        image_token_id = getattr(getattr(self, "_config", None), "image_token_id", None)
+        if image_token_id is None:
+            all_rows = self._engram_hasher.row_ids(
+                flat_ids, batch.positions.view(-1), cu, history
+            )
+        else:
+            all_rows = self._engram_hasher.row_ids(
+                flat_ids,
+                batch.positions.view(-1),
+                cu,
+                history,
+                token_mask=flat_ids != image_token_id,
+                history_mask=history != image_token_id,
+            )
         return {
             layer_id: all_rows[:, index]
             for index, layer_id in enumerate(self._args.engram_layer_ids)
@@ -1274,9 +1844,20 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
+        if os.getenv("FREETOKEN_DSV41_TRACE_COLLECTIVES", "0") == "1":
+            logger.info(
+                "DSV41 model enter rank=%d phase=%s moe_prefill=%s "
+                "speculative=%s tokens=%d multimodal=%s",
+                self._execution.rank,
+                batch.phase,
+                batch.is_moe_prefill,
+                batch.speculative,
+                batch.input_ids.numel(),
+                any(req.is_multimodal for req in batch.reqs),
+            )
 
         def phase_barrier(result: torch.Tensor) -> torch.Tensor:
-            if batch.is_prefill and self._execution.phase_aware:
+            if batch.is_moe_prefill and self._execution.uses_prefill_subgroup:
                 if self._phase_barrier_group is None:
                     raise RuntimeError("phase-aware prefill barrier was not initialized")
                 torch.distributed.barrier(group=self._phase_barrier_group)
@@ -1286,19 +1867,56 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             with profile_range("DSV41/Batch/ExpertWorker"):
                 return phase_barrier(self._model.forward(batch.input_ids))
         self.prepare_for_runtime()
+        capture_dspark = self._args.dspark_enabled and not any(
+            req.is_multimodal for req in batch.reqs
+        )
         input_ids = batch.input_ids.long()
         engram_rows = self._engram_rows(batch, input_ids)
+        if batch.speculative and batch.dsv41_spec_graph:
+            positions = batch.positions.long().view(-1)
+            graph_stage_cap = batch.dsv41_graph_stage_cap
+            if graph_stage_cap is None:
+                raise RuntimeError("DSpark CUDA graph has no compressed-history cap")
+            with profile_range("DSV41/Batch/Verify"):
+                result = self._model.verify(
+                    input_ids,
+                    positions,
+                    int(graph_stage_cap),
+                    engram_rows=engram_rows,
+                    capture_dspark=capture_dspark,
+                )
+            if capture_dspark:
+                hidden = self._model._dspark_hidden
+                self._dspark_target_features = (
+                    DSparkTargetFeatures(hidden, positions)
+                    if hidden is not None
+                    else None
+                )
+            else:
+                self._dspark_target_features = None
+            return phase_barrier(result)
         if batch.is_prefill:
             req = batch.reqs[0]
             with profile_range("DSV41/Batch/Prefill"):
-                return phase_barrier(
-                    self._model.prefill_single(
-                        input_ids.view(1, -1),
-                        start_pos=req.cached_len,
-                        table_idx=req.table_idx,
-                        engram_rows=engram_rows,
-                    )
+                result = self._model.prefill_single(
+                    input_ids.view(1, -1),
+                    start_pos=req.cached_len,
+                    table_idx=req.table_idx,
+                    engram_rows=engram_rows,
+                    mm_embeds=batch.mm_embeds,
+                    full_logits=batch.speculative,
+                    capture_dspark=capture_dspark,
                 )
+                if capture_dspark:
+                    hidden = self._model._dspark_hidden
+                    self._dspark_target_features = (
+                        DSparkTargetFeatures(hidden, batch.positions.long().view(-1))
+                        if hidden is not None
+                        else None
+                    )
+                else:
+                    self._dspark_target_features = None
+                return phase_barrier(result)
         positions = batch.positions.long().view(-1)[: batch.padded_size]
         graph_stage_cap = getattr(batch, "dsv41_graph_stage_cap", None)
         if graph_stage_cap is not None:
@@ -1309,12 +1927,23 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         else:
             cmp_stage_cap = int(positions.max().item())
         with profile_range("DSV41/Batch/Decode"):
-            return self._model.decode(
+            result = self._model.decode(
                 input_ids.view(batch.padded_size, 1),
                 positions,
                 cmp_stage_cap,
                 engram_rows=engram_rows,
+                capture_dspark=capture_dspark,
             )
+        if capture_dspark:
+            hidden = self._model._dspark_hidden
+            self._dspark_target_features = (
+                DSparkTargetFeatures(hidden, positions)
+                if hidden is not None
+                else None
+            )
+        else:
+            self._dspark_target_features = None
+        return result
 
 
 __all__ = [
@@ -1322,6 +1951,7 @@ __all__ = [
     "Block",
     "DeepseekV41ExpertWorkerModel",
     "DeepseekV41ForCausalLM",
+    "DSparkTargetFeatures",
     "Indexer",
     "Transformer",
 ]

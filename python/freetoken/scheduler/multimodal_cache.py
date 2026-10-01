@@ -32,6 +32,7 @@ class MultimodalCacheKeyRegistry:
         input_ids: torch.Tensor,
         image_token_id: int,
         image_keys: list[bytes],
+        image_token_spans: list[tuple[int, int]] | None = None,
     ) -> torch.Tensor | None:
         """Return token-length radix keys, or ``None`` when safe reuse is unavailable."""
         if not image_keys:
@@ -40,12 +41,31 @@ class MultimodalCacheKeyRegistry:
             raise ValueError("multimodal input_ids must be a CPU 1D int32 tensor")
 
         mask = input_ids == image_token_id
-        starts = mask & ~torch.cat((torch.tensor([False]), mask[:-1]))
-        span_starts = starts.nonzero(as_tuple=False).view(-1).tolist()
-        if len(span_starts) != len(image_keys):
+        if image_token_spans is None:
+            starts = mask & ~torch.cat((torch.tensor([False]), mask[:-1]))
+            spans = []
+            for start in starts.nonzero(as_tuple=False).view(-1).tolist():
+                end = start + 1
+                while end < mask.numel() and bool(mask[end]):
+                    end += 1
+                spans.append((start, end))
+        else:
+            spans = [(int(start), int(end)) for start, end in image_token_spans]
+            previous_end = 0
+            for start, end in spans:
+                if (
+                    start < previous_end
+                    or start < 0
+                    or end <= start
+                    or end > input_ids.numel()
+                    or not bool(mask[start:end].all())
+                ):
+                    raise ValueError(f"invalid image-token span ({start}, {end})")
+                previous_end = end
+        if len(spans) != len(image_keys):
             raise ValueError(
                 f"image cache keys ({len(image_keys)}) do not match image-token spans "
-                f"({len(span_starts)})"
+                f"({len(spans)})"
             )
 
         new_keys = [key for key in dict.fromkeys(image_keys) if key not in self._symbols]
@@ -58,10 +78,7 @@ class MultimodalCacheKeyRegistry:
             self._next_symbol -= 1
 
         result = input_ids.clone()
-        for index, start in enumerate(span_starts):
-            end = start
-            while end < mask.numel() and bool(mask[end]):
-                end += 1
+        for index, (start, end) in enumerate(spans):
             result[start:end] = self._symbols[image_keys[index]]
         return result
 
@@ -112,4 +129,3 @@ class VisionFeatureCache:
     def clear(self) -> None:
         self._entries.clear()
         self.current_bytes = 0
-

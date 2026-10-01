@@ -1,10 +1,15 @@
-"""Engine-facing text-only configuration for DeepSeek-V4.1-Flash."""
+"""Engine-facing configuration for DeepSeek-V4.1-Flash."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, RotaryConfig
+from freetoken.models.config import (
+    DSV4AttentionGroupConfig,
+    ModelConfig,
+    RotaryConfig,
+    vision_load_enabled,
+)
 
 from .args import load_args
 
@@ -28,6 +33,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         "beta_slow": args.beta_slow,
         "original_max_position_embeddings": args.original_seq_len,
     }
+    vision_config = getattr(hf_config, "vision_config", None)
+    if not vision_load_enabled():
+        vision_config = None
     return ModelConfig(
         num_layers=args.n_layers,
         num_qo_heads=args.n_heads,
@@ -56,6 +64,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         expert_quant="ds_fp4",
         attn_sm_scale=args.head_dim**-0.5,
         swiglu_limit=args.swiglu_limit,
+        vision_config=vision_config,
+        # Every EP rank needs the placeholder id for deterministic radix keys and
+        # Engram masking, even though only the authority builds the vision tower.
+        # ``vision_config`` remains the sole switch for allocating/loading vision.
+        image_token_id=args.image_token_id,
         dsv4_args=args,
         dsv41_args=args,
         single_stream_only=True,
