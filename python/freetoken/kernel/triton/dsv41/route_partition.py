@@ -76,8 +76,8 @@ def fused_localize_cache_safe_routes(
         raise ValueError(f"route ids must be int32, got {ids.dtype}")
     if not weights.is_contiguous() or not ids.is_contiguous():
         raise ValueError("route weights and ids must be contiguous")
-    if local_count <= 0:
-        raise ValueError(f"local_count must be positive, got {local_count}")
+    if local_count < 0:
+        raise ValueError(f"local_count must be non-negative, got {local_count}")
 
     rows, top_k = weights.shape
     if top_k <= 0:

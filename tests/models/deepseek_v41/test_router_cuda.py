@@ -88,3 +88,41 @@ def test_fused_route_partition_matches_composed_reference_and_graph(rank: int):
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_weights, local_weights)
     torch.testing.assert_close(graph_ids, expected_ids)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_route_partition_supports_zero_owned_experts_and_graph():
+    weights = torch.tensor(
+        [[0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.8]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    ids = torch.tensor(
+        [[0, 95, 96, 97, 191, 32, 160, 64]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    got_weights, got_ids = fused_localize_cache_safe_routes(
+        weights,
+        ids,
+        global_offset=0,
+        local_count=0,
+    )
+    torch.testing.assert_close(got_weights, torch.zeros_like(weights))
+    torch.testing.assert_close(got_ids, torch.zeros_like(ids))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_weights, graph_ids = fused_localize_cache_safe_routes(
+            weights,
+            ids,
+            global_offset=0,
+            local_count=0,
+        )
+    weights.fill_(1.0)
+    ids.copy_(torch.flip(ids, dims=(1,)))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_weights, torch.zeros_like(weights))
+    torch.testing.assert_close(graph_ids, torch.zeros_like(ids))
