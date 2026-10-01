@@ -149,6 +149,31 @@ def test_ragged_hash_windows_match_one_shot_across_chunk_boundary():
     assert torch.equal(tail, full[4:])
 
 
+def test_image_tokens_mask_injection_and_break_longer_ngram_windows():
+    hasher = object.__new__(EngramHasher)
+    hasher.layout = SimpleNamespace(max_ngram_size=4)
+    hasher.pad_id = 0
+    hasher.token_map = torch.arange(16, dtype=torch.int64)
+    hasher.multipliers = torch.ones((1, 4), dtype=torch.int64)
+    hasher.primes = torch.tensor([[[11], [13], [17]]], dtype=torch.int64)
+    hasher.offsets = torch.zeros((1, 3), dtype=torch.int64)
+    ids = torch.tensor([1, 9, 2], dtype=torch.int64)
+
+    rows = hasher.row_ids(
+        ids,
+        torch.arange(3),
+        torch.tensor([0, 3]),
+        torch.tensor([[0, 0, 0]]),
+        token_mask=torch.tensor([True, False, True]),
+        history_mask=torch.ones((1, 3), dtype=torch.bool),
+    )
+
+    # The image row itself is fully padded. For the following text row, the
+    # image blocks every n-gram length instead of allowing a hash to cross it.
+    assert rows[1].eq(0).all()
+    assert rows[2, 0].tolist() == [2, 2, 2]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_cuda_graph_hasher_follows_token_position_and_history_inputs():
     """Every decode-time Engram input must remain dynamic across graph replays."""

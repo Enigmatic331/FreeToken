@@ -144,6 +144,41 @@ def test_text_stream_never_materializes_engram_experts_mtp_or_vision(tmp_path):
     torch.testing.assert_close(loaded["head"], tensors["head.weight"])
 
 
+def test_vision_stream_is_explicit_and_includes_visual_router_bias(
+    tmp_path, monkeypatch
+):
+    tensors = {
+        "head.weight": torch.arange(8, dtype=torch.bfloat16).view(2, 4),
+        "vision.patch_embed.proj.weight": torch.ones(
+            4, 3, dtype=torch.bfloat16
+        ),
+        "aligner.w1.bias": torch.ones(4, dtype=torch.bfloat16),
+        "image_start": torch.ones(4, dtype=torch.bfloat16),
+        "layers.0.ffn.gate.bias_vl": torch.ones(2),
+    }
+    shard = "model.safetensors"
+    save_file(tensors, tmp_path / shard)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard for name in tensors}})
+    )
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+
+    loaded = dict(
+        iter_weights(
+            str(tmp_path),
+            torch.device("cpu"),
+            include_moe_experts=False,
+        )
+    )
+    assert set(loaded) == {
+        "head",
+        "vision.patch_embed.proj.weight",
+        "aligner.w1.bias",
+        "image_start",
+        "layers.0.ffn.gate.bias_vl",
+    }
+
+
 def test_attention_tp2_peer_stream_skips_root_owned_router_and_shared(tmp_path):
     tensors = {
         "head.weight": torch.arange(8, dtype=torch.bfloat16).view(2, 4),

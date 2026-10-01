@@ -85,6 +85,32 @@ def test_topk_respects_ratio_visibility_and_pads_unreachable_columns():
     ]
 
 
+def test_topk_inplace_matches_default_and_reuses_disposable_logits():
+    logits = torch.tensor([[9.0, 8.0, 7.0, 6.0, 5.0, 4.0]])
+    original = logits.clone()
+    candidate_mask = torch.tensor([[True, False, True, True, True, True]])
+    expected = select_index_topk(
+        logits,
+        4,
+        4,
+        candidate_mask=candidate_mask,
+    )
+    assert torch.equal(logits, original)
+
+    got = select_index_topk(
+        logits,
+        4,
+        4,
+        candidate_mask=candidate_mask,
+        inplace=True,
+    )
+    assert torch.equal(got, expected)
+    assert torch.equal(
+        torch.isneginf(logits),
+        torch.tensor([[False, True, False, False, True, True]]),
+    )
+
+
 def test_candidate_consumer_requires_source_publication():
     runtime = CandidateRuntime()
     try:

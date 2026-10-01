@@ -301,6 +301,79 @@ def test_engine_config_can_opt_in_to_ep2_graph_decode(monkeypatch):
         distributed_info._TP_INFO = None
 
 
+def test_dspark_keeps_opted_in_one_token_decode_graph(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setenv("FREETOKEN_DSV41_CUDA_GRAPH", "1")
+    config = _engine_config()
+    object.__setattr__(config, "max_running_req", 1)
+    object.__setattr__(config, "speculative_dspark", True)
+    object.__setattr__(config, "dspark_device", "1")
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(config.dsv41_backbone_rank)
+        _adjust_config(config)
+        assert config.model_config.dsv41_args.dspark_enabled
+        assert config.cuda_graph_bs == [1]
+        assert config.cuda_graph_max_bs == 1
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {"dspark_adaptive_verification": True},
+            "requires --dspark-adaptive-costs-ms",
+        ),
+        (
+            {
+                "dspark_adaptive_verification": True,
+                "dspark_adaptive_costs_ms": (1.0, 2.0),
+            },
+            "expected 5, got 2",
+        ),
+        (
+            {"dspark_verification_length": 6},
+            "cannot exceed the checkpoint block size 5",
+        ),
+        (
+            {"dspark_verification_schedule": (1, 6)},
+            "values cannot exceed the checkpoint block size 5",
+        ),
+        (
+            {
+                "dspark_verification_length": 2,
+                "dspark_adaptive_verification": True,
+                "dspark_adaptive_costs_ms": (1.0, 2.0, 3.0, 4.0, 5.0),
+            },
+            "mutually exclusive",
+        ),
+    ],
+)
+def test_dspark_adaptive_config_rejects_invalid_combinations(updates, message):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config()
+    object.__setattr__(config, "max_running_req", 1)
+    object.__setattr__(config, "speculative_dspark", True)
+    object.__setattr__(config, "dspark_device", "1")
+    for name, value in updates.items():
+        object.__setattr__(config, name, value)
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(config.dsv41_backbone_rank)
+        with pytest.raises(ValueError, match=message):
+            _adjust_config(config)
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
 def test_engine_config_requires_ep_and_backbone_rank():
     from freetoken.engine.engine import _adjust_config
 
@@ -333,7 +406,7 @@ def test_engine_config_accepts_asymmetric_ep3():
         )
         _adjust_config(config)
         assert plan.partition(8).local_count == 3
-        assert not plan.supports_packed_prefill
+        assert plan.supports_packed_prefill
         assert config.model_tp_size == 1
         assert config.model_config.num_experts == 3
     finally:
@@ -543,6 +616,132 @@ def test_graph_buffer_stages_fresh_host_engram_history_each_replay():
     buffer.copy_from(replay_batch)
     graph.replay()
     assert result.item() == 17 + 19 + 23 + 29 + 4
+
+
+def test_graph_buffer_reserves_address_stable_dspark_target_features():
+    from freetoken.engine.graph import GraphCaptureBuffer
+
+    buffer = GraphCaptureBuffer.init(
+        2,
+        64,
+        torch.device("cpu"),
+        dspark_hidden_width=96,
+    )
+
+    assert buffer.dspark_hidden is not None
+    assert buffer.dspark_hidden.shape == (2, 96)
+    assert buffer.dspark_hidden.dtype == torch.bfloat16
+
+
+def test_dspark_keeps_multimodal_requests_on_the_target_path():
+    from freetoken.engine.engine import Engine
+
+    engine = object.__new__(Engine)
+    engine._dspark_fallback = None
+
+    assert not Engine.should_speculate(
+        engine, SimpleNamespace(is_multimodal=True)
+    )
+    assert Engine.should_speculate(
+        engine, SimpleNamespace(is_multimodal=False)
+    )
+
+
+def test_dspark_acceptance_tracks_each_proposal_position():
+    from freetoken.engine.engine import Engine
+
+    engine = object.__new__(Engine)
+    engine._spec_accepted = 0
+    engine._spec_drafted = 0
+    engine._spec_reported_drafted = 0
+    engine._spec_report_interval = 10_000
+    engine._spec_rounds = 0
+    engine._spec_accepted_per_position = []
+    engine._spec_proposed_per_position = []
+    engine._spec_verification_lengths = {}
+    engine._spec_accepted_by_length = {}
+    engine._spec_drafted_by_length = {}
+    engine._dspark_fallback = None
+
+    req = SimpleNamespace(uid=1)
+    Engine._record_dspark_acceptance(engine, req, accepted=2, drafted=5)
+    Engine._record_dspark_acceptance(engine, req, accepted=0, drafted=5)
+    Engine._record_dspark_acceptance(engine, req, accepted=5, drafted=5)
+
+    assert engine._spec_accepted == 7
+    assert engine._spec_drafted == 15
+    assert engine._spec_rounds == 3
+    assert engine._spec_accepted_per_position == [2, 2, 1, 1, 1]
+    assert engine._spec_proposed_per_position == [3, 3, 3, 3, 3]
+    assert engine._spec_verification_lengths == {5: 3}
+    assert engine._spec_accepted_by_length == {5: 7}
+    assert engine._spec_drafted_by_length == {5: 15}
+
+
+def test_dspark_adaptive_verification_length_is_request_local():
+    from freetoken.engine.engine import Engine
+    from freetoken.models.deepseek_v41.dspark import DSparkAdaptiveVerification
+
+    engine = object.__new__(Engine)
+    engine._dspark_adaptive = DSparkAdaptiveVerification([5, 6, 7, 8, 9])
+    engine._dspark_adaptive_uid = None
+    engine._dspark_next_verification_length = None
+    first = SimpleNamespace(uid=1)
+    second = SimpleNamespace(uid=2)
+
+    assert Engine.speculation_length(engine, first, 5) == 5
+    engine._dspark_next_verification_length = 2
+    assert Engine.speculation_length(engine, first, 5) == 2
+    assert Engine.speculation_length(engine, second, 5) == 5
+
+
+def test_dspark_static_profile_rotates_length_once_per_request():
+    from freetoken.engine.engine import Engine
+
+    engine = object.__new__(Engine)
+    engine._dspark_adaptive = None
+    engine._dspark_verification_schedule = (1, 3, 5)
+    engine._dspark_schedule_index = 0
+    engine._dspark_schedule_uid = None
+    engine._dspark_scheduled_length = None
+    first = SimpleNamespace(uid=1)
+    second = SimpleNamespace(uid=2)
+
+    assert Engine.speculation_length(engine, first, 5) == 1
+    assert Engine.speculation_length(engine, first, 5) == 1
+    assert Engine.speculation_length(engine, second, 5) == 3
+
+
+@pytest.mark.parametrize(
+    ("speculative", "enabled", "worker", "expected"),
+    [
+        (True, True, True, 1),
+        (False, True, True, 0),
+        (True, False, True, 0),
+        (True, True, False, 0),
+    ],
+)
+def test_dspark_worker_stream_fence_is_narrowly_scoped(
+    speculative, enabled, worker, expected
+):
+    from freetoken.engine.engine import Engine
+
+    class Stream:
+        calls = 0
+
+        def synchronize(self):
+            self.calls += 1
+
+    engine = object.__new__(Engine)
+    engine.config = SimpleNamespace(speculative_dspark=enabled)
+    engine._execution_plan = SimpleNamespace(is_expert_worker=worker)
+    engine.stream = Stream()
+
+    Engine._fence_dspark_worker_before_decision(
+        engine, SimpleNamespace(speculative=speculative)
+    )
+
+    assert engine.stream.calls == expected
 
 
 def test_worker_enters_engram_collective_at_the_matching_layer_boundary():

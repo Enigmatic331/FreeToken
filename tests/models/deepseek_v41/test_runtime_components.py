@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 from freetoken.models.deepseek_v41.compress import Compressor
-from freetoken.models.deepseek_v41.engram_runtime import EngramCoordinator
+from freetoken.models.deepseek_v41.engram_runtime import (
+    EngramCoordinator,
+    TorchProcessGroupCommunicator,
+)
 from freetoken.models.deepseek_v41.execution import DeepseekV41ExecutionPlan
 
 
@@ -51,6 +55,26 @@ class FakePagedCompressorBackend:
         self, rows, positions, ratio, layer_id, tier, completed
     ):
         return positions // ratio
+
+
+def test_subgroup_communicator_uses_two_rank_broadcasts(monkeypatch):
+    group = object()
+    calls = []
+    ranks = iter((0, 1))
+    monkeypatch.setattr(dist, "get_rank", lambda: next(ranks))
+    monkeypatch.setattr(dist, "get_world_size", lambda op_group: 2)
+    monkeypatch.setattr(
+        dist,
+        "broadcast",
+        lambda tensor, src, group: calls.append((tensor, src, group)),
+    )
+
+    communicator = TorchProcessGroupCommunicator(group)
+    tensor = torch.arange(4)
+    assert communicator.send(tensor, 1) is tensor
+    assert communicator.recv(tensor, 0) is tensor
+
+    assert calls == [(tensor, 0, group), (tensor, 0, group)]
 
 
 def test_engram_authority_and_worker_enter_identical_collective_sequence():

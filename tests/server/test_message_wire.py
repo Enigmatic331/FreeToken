@@ -7,6 +7,7 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import msgpack
 import torch
 
 from freetoken.message import (
@@ -24,7 +25,44 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.core import SamplingParams
-from freetoken.scheduler.io import _without_vision_pixels
+from freetoken.scheduler.io import SchedulerIOMixin, _without_vision_pixels
+
+
+class _CompletedWork:
+    def wait(self):
+        return True
+
+
+class _RecordingProcessGroup:
+    def __init__(self):
+        self.tensors = []
+
+    def broadcast(self, tensor, root):
+        assert root == 0
+        self.tensors.append(tensor.clone())
+        return _CompletedWork()
+
+
+class _ReplayingProcessGroup:
+    def __init__(self, tensors):
+        self.tensors = list(tensors)
+
+    def broadcast(self, tensor, root):
+        assert root == 0
+        tensor.copy_(self.tensors.pop(0))
+        return _CompletedWork()
+
+
+class _IdlePullQueue:
+    def __init__(self):
+        self.wait_timeouts = []
+
+    def wait(self, timeout_ms):
+        self.wait_timeouts.append(timeout_ms)
+        return False
+
+    def empty(self):
+        return True
 
 
 def test_cache_rebuild_msg_roundtrip():
@@ -175,6 +213,7 @@ def test_ep_worker_copy_drops_pixels_but_keeps_mrope_metadata():
         mrope_position_delta=-1,
         is_multimodal=True,
         image_cache_keys=[b"b" * 32],
+        image_token_spans=[(1, 3)],
         image_inputs=["data:image/png;base64,AAAA"],
     )
 
@@ -186,4 +225,59 @@ def test_ep_worker_copy_drops_pixels_but_keeps_mrope_metadata():
     assert torch.equal(worker.rope_positions, msg.rope_positions)
     assert worker.is_multimodal and worker.mrope_position_delta == -1
     assert worker.image_cache_keys == [b"b" * 32]
+    assert worker.image_token_spans == [(1, 3)]
     assert worker.image_inputs is None
+
+
+def test_ep_rank_message_uses_reliable_length_prefixed_broadcast():
+    msg = UserMsg(
+        uid=11,
+        input_ids=torch.arange(4, dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        pixel_values=torch.ones(2, 3),
+        image_grid_thw=torch.tensor([[1, 2, 2]], dtype=torch.int32),
+        rope_positions=torch.arange(12, dtype=torch.int32).reshape(4, 3),
+        mrope_position_delta=-1,
+        is_multimodal=True,
+        image_cache_keys=[b"c" * 32],
+        image_token_spans=[(1, 3)],
+        image_inputs=[b"compressed-image"],
+    )
+    raw = msgpack.packb(msg.encoder(), use_bin_type=True)
+
+    root = SchedulerIOMixin.__new__(SchedulerIOMixin)
+    root.tp_cpu_group = _RecordingProcessGroup()
+    worker_raw = root._worker_message_bytes(msg, raw)
+    assert root._broadcast_rank_message(worker_raw) == worker_raw
+
+    worker = SchedulerIOMixin.__new__(SchedulerIOMixin)
+    worker.tp_cpu_group = _ReplayingProcessGroup(root.tp_cpu_group.tensors)
+    received = worker._decode_rank_message(worker._broadcast_rank_message(None))
+
+    assert isinstance(received, UserMsg)
+    assert received.uid == msg.uid
+    assert received.pixel_values is None
+    assert received.image_grid_thw is None
+    assert received.image_inputs is None
+    assert received.image_cache_keys == [b"c" * 32]
+    assert received.image_token_spans == [[1, 3]]
+    assert torch.equal(received.rope_positions, msg.rope_positions)
+    assert worker.tp_cpu_group.tensors == []
+
+
+def test_ep_rank_idle_heartbeat_keeps_collective_sequence_matched():
+    root = SchedulerIOMixin.__new__(SchedulerIOMixin)
+    root.tp_cpu_group = _RecordingProcessGroup()
+    root._recv_from_tokenizer = _IdlePullQueue()
+    root.run_when_idle = lambda: None
+
+    assert root._recv_msg_multi_rank0(blocking=True) == []
+    assert root._recv_from_tokenizer.wait_timeouts == [1000]
+    assert [int(tensor.item()) for tensor in root.tp_cpu_group.tensors] == [0, 0]
+
+    worker = SchedulerIOMixin.__new__(SchedulerIOMixin)
+    worker.tp_cpu_group = _ReplayingProcessGroup(root.tp_cpu_group.tensors)
+    worker.run_when_idle = lambda: None
+
+    assert worker._recv_msg_multi_rank1(blocking=True) == []
+    assert worker.tp_cpu_group.tensors == []

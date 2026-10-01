@@ -18,6 +18,8 @@ import torch
 
 from freetoken.core import Req, SamplingParams
 from freetoken.distributed import set_tp_info, try_get_tp_info
+from freetoken.distributed.info import DistributedInfo
+from freetoken.distributed import info as distributed_info
 from freetoken.models.config import KVCacheGroupSpec
 from freetoken.scheduler.cache import CacheManager
 
@@ -25,6 +27,12 @@ DEVICE = torch.device("cpu")
 
 if try_get_tp_info() is None:
     set_tp_info(rank=0, size=1)
+
+
+@pytest.fixture(autouse=True)
+def _single_rank_tp_info(monkeypatch):
+    """Keep this standalone cache suite independent of earlier global teardown."""
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(rank=0, size=1))
 
 
 def _swa_pool(ps: int, num_full_pages: int, num_swa_tokens: int):
@@ -97,6 +105,43 @@ def test_abort_mid_decode_conserves_swa_slots(ps):
     for r in (0, 1, ps - 1):
         cm = _mgr(ps)
         _run_lifecycle(cm, total_len=3 * ps + 4 + r, n_decode=6, abort_after=2)
+
+
+def test_speculative_finish_on_page_boundary_conserves_swa_slots():
+    """A target bonus at the next page is logical only until its decode forward.
+
+    The speculative verify has nevertheless preallocated that whole page.  If
+    the accepted KV prefix ends exactly at the prior boundary and the request
+    finishes, the speculative-only page must return before finish insertion;
+    otherwise all 128 of its SWA slots become unreachable.
+    """
+    ps = 128
+    cm = _mgr(ps)
+    req = _req(prompt_len=123, n_decode=6)
+    handle = cm.match_req(req).cuda_handle
+    req.cache_handle = handle
+    req.cached_len = handle.cached_len
+    cm.lock(handle)
+
+    # Initial prefill computes [0, 123), samples the live anchor at 123,
+    # and publishes the valid prefix before speculative decode.
+    cm.allocate_paged([req])
+    req.complete_one()
+    req.append_host(torch.tensor([9999], dtype=torch.int32))
+    cm.cache_req(req, finished=False)
+
+    # Verify anchor + five proposals: allocation reaches position 128 and
+    # therefore charges a second full page. Four accepted proposals leave
+    # valid KV [0, 128); the bonus at 128 has not been forwarded.
+    gamma = 5
+    req.append_host(torch.full((gamma,), 9998, dtype=torch.int32))
+    req.device_len += gamma
+    cm.allocate_paged([req])
+    cm.release_speculative_tail(req, committed_len=128)
+    req.cached_len, req.device_len = 128, 129
+
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()
 
 
 @pytest.mark.parametrize("ps", [8, 128])

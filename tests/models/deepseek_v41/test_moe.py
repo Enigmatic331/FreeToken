@@ -1,18 +1,143 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.layers.moe import ExpertParallelOffloadMoELayer
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 from freetoken.models.deepseek_v41.execution import DeepseekV41ExecutionPlan
 from freetoken.models.deepseek_v41.moe import (
     Gate,
+    MoE,
     _broadcast_decode_dispatch,
     _prepare_partitioned_routes,
 )
 from freetoken.moe.partition import ExpertPartition, ExpertStorageRange
+
+
+def test_multi_peer_packed_prefill_maps_and_combines_each_peer(monkeypatch):
+    import freetoken.kernel as kernel_module
+    import freetoken.layers.moe as moe_module
+
+    monkeypatch.setattr(moe_module, "_EP_PACKED_PREFILL_OVERLAP", False)
+    monkeypatch.setattr(
+        moe_module, "get_tp_info", lambda: SimpleNamespace(rank=0, size=3)
+    )
+    monkeypatch.setattr(
+        moe_module,
+        "get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_moe_prefill=True)),
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "moe_sum_reduce_triton",
+        lambda routes, output: output.copy_(routes.sum(dim=1)),
+    )
+
+    peer_payloads = {
+        1: [torch.tensor([[3.0, 30.0], [4.0, 40.0]])],
+        2: [torch.tensor([[6.0, 60.0], [7.0, 70.0]])],
+    }
+
+    class Communicator:
+        def recv(self, output, peer):
+            output.copy_(peer_payloads[peer].pop(0))
+            return output
+
+    layer = ExpertParallelOffloadMoELayer(
+        layer_id=0,
+        num_experts=3,
+        top_k=3,
+        hidden_size=2,
+        intermediate_size=6,
+    )
+    layer.packed_prefill_root = 0
+    layer.packed_prefill_peer_ranks = (1, 2)
+    layer.packed_prefill_peer_ranges = ((1, 3, 6), (2, 6, 8))
+    layer.prefill_communicator = Communicator()
+
+    local_weights = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    global_ids = torch.tensor([[0, 3, 6], [2, 4, 7]], dtype=torch.int32)
+    layer.prepare_packed_prefill_receive(
+        local_weights, torch.float32, global_topk_ids=global_ids
+    )
+    assert [indices.tolist() for _, indices in layer._packed_prefill_remote_indices] == [
+        [1, 4],
+        [2, 5],
+    ]
+
+    routes = torch.zeros((2, 3, 2))
+    routes.view(-1, 2)[[0, 3]] = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
+    output = layer._maybe_combine_packed_prefill_routes(routes, local_weights)
+
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[10.0, 100.0], [13.0, 130.0]]),
+    )
+    assert peer_payloads == {1: [], 2: []}
+
+
+def test_multi_peer_packed_prefill_route_tiles_keep_global_owner_plan(monkeypatch):
+    import freetoken.layers.moe as moe_module
+
+    monkeypatch.setattr(moe_module, "_EP_PACKED_PREFILL_OVERLAP", False)
+    monkeypatch.setattr(moe_module, "_EP_PREFILL_ROUTE_TILE_TOKENS", 2)
+    monkeypatch.setattr(
+        moe_module, "get_tp_info", lambda: SimpleNamespace(rank=0, size=3)
+    )
+    monkeypatch.setattr(
+        moe_module,
+        "get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_moe_prefill=True)),
+    )
+
+    layer = ExpertParallelOffloadMoELayer(
+        layer_id=0,
+        num_experts=3,
+        top_k=3,
+        hidden_size=2,
+        intermediate_size=6,
+    )
+    layer.packed_prefill_root = 0
+    layer.packed_prefill_peer_ranks = (1, 2)
+    layer.packed_prefill_peer_ranges = ((1, 3, 6), (2, 6, 8))
+
+    local_weights = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    global_ids = torch.tensor(
+        [[0, 3, 6], [2, 4, 7], [1, 5, 6], [0, 3, 7]], dtype=torch.int32
+    )
+
+    # The model posts tile zero before shared-expert compute and retains the
+    # full global-id tensor for the routed loop to post tile one later.
+    layer.prepare_packed_prefill_receive(
+        local_weights, torch.float32, global_topk_ids=global_ids
+    )
+    assert layer._packed_prefill_tiled_global_ids is global_ids
+    assert [indices.tolist() for _, indices in layer._packed_prefill_remote_indices] == [
+        [1, 4],
+        [2, 5],
+    ]
+
+    layer.prepare_packed_prefill_receive(
+        local_weights[2:],
+        torch.float32,
+        global_topk_ids=layer._packed_prefill_tiled_global_ids[2:],
+    )
+    assert [indices.tolist() for _, indices in layer._packed_prefill_remote_indices] == [
+        [1, 4],
+        [2, 5],
+    ]
 
 
 def test_execution_plan_balances_global_experts_and_keeps_workers_in_engram():
@@ -82,6 +207,7 @@ def test_execution_plan_phase_splits_prefill_from_decode_storage():
         for rank in range(3)
     ]
     assert plans[0].prefill_active_ranks == (0, 1)
+    assert all(plan.uses_prefill_subgroup for plan in plans)
     assert all(plan.supports_packed_prefill for plan in plans)
     assert [plan.participates_in_prefill for plan in plans] == [True, True, False]
     assert [
@@ -90,6 +216,50 @@ def test_execution_plan_phase_splits_prefill_from_decode_storage():
     ] == [(0, 4), (3, 5), (6, 2)]
     assert [plan.partition(8, prefill=True).local_count for plan in plans] == [4, 4, 0]
     assert [plan.partition(8).local_count for plan in plans] == [3, 3, 2]
+
+
+@pytest.mark.parametrize("rank", (0, 1, 2))
+def test_all_active_phase_split_uses_world_broadcast(monkeypatch, rank):
+    import freetoken.models.deepseek_v41.moe as moe_module
+
+    calls = []
+
+    class WorldCommunicator:
+        def broadcast(self, tensor, root):
+            calls.append((tensor, root))
+            return tensor
+
+    class UnexpectedSubgroup:
+        def send(self, *_args):
+            raise AssertionError("all-active prefill must not use subgroup send")
+
+        def recv(self, *_args):
+            raise AssertionError("all-active prefill must not use subgroup receive")
+
+    plan = DeepseekV41ExecutionPlan(
+        rank,
+        3,
+        backbone_rank=0,
+        expert_shards=(3, 3, 2),
+        prefill_expert_shards=(3, 3, 2),
+        expert_storage_ranges=((0, 3), (3, 3), (6, 2)),
+    )
+    assert plan.phase_aware
+    assert not plan.uses_prefill_subgroup
+    monkeypatch.setattr(
+        moe_module,
+        "get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_moe_prefill=True)),
+    )
+    layer = SimpleNamespace(
+        execution=plan,
+        _comm=WorldCommunicator(),
+        _prefill_comm=UnexpectedSubgroup(),
+    )
+    tensor = torch.arange(4)
+
+    assert MoE._phase_broadcast(layer, tensor) is tensor
+    assert calls == [(tensor, 0)]
 
 
 def test_execution_plan_rejects_storage_that_misses_phase_ownership():
@@ -271,7 +441,9 @@ def test_authority_decode_refill_is_forked_around_shared_expert(monkeypatch):
     monkeypatch.setattr(
         model_module,
         "get_global_ctx",
-        lambda: type("Ctx", (), {"batch": type("Batch", (), {"is_prefill": False})()})(),
+        lambda: type(
+            "Ctx", (), {"batch": type("Batch", (), {"is_prefill": False, "is_moe_prefill": False})()}
+        )(),
     )
 
     hidden = torch.zeros((1, 1, 4), dtype=torch.bfloat16)

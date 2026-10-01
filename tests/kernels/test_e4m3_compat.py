@@ -41,6 +41,24 @@ def _native_cc() -> bool:
     return torch.cuda.get_device_capability() >= (8, 9)
 
 
+def test_host_capability_selection_is_device_local(monkeypatch):
+    """An auxiliary pre-sm89 GPU must not inherit the assigned text GPU's mode."""
+    import freetoken.gpu_select as gpu_select
+    from freetoken.kernel.triton.e4m3_compat import e4m3_act_dtype, e4m3_native
+
+    monkeypatch.setattr(gpu_select, "assigned_visible_gpu", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device=None: (12, 0) if device in (None, 0, torch.device("cuda:0")) else (8, 0),
+    )
+    assert e4m3_native()
+    assert e4m3_native(torch.device("cuda:0"))
+    assert not e4m3_native(torch.device("cuda:1"))
+    assert e4m3_act_dtype(torch.device("cuda:0")) == torch.float8_e4m3fn
+    assert e4m3_act_dtype(torch.device("cuda:1")) == torch.bfloat16
+
+
 # ======================================================================================
 # 1. Primitives vs the native fp8 unit (needs sm_89+ hardware for the reference).
 # ======================================================================================
