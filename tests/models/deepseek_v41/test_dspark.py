@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,10 +12,12 @@ from torch import nn
 
 from freetoken import core
 from freetoken.core import Batch, Context
+from freetoken.engine.engine import Engine
 from freetoken.models.deepseek_v41.compress import Compressor
 from freetoken.models.deepseek_v41.dspark import (
     DSparkAcceptanceFallback,
     DSparkAdaptiveVerification,
+    DSparkDrafter,
     _MTP_EXPERT_RE,
     accepted_prefix,
     sampling_probs,
@@ -36,6 +39,30 @@ def test_greedy_acceptance_uses_free_bonus_after_full_match():
     assert accepted_prefix(_t(5, 6, 7), _t(5, 6, 7, 8)) == (3, 8)
 
 
+def test_greedy_draft_batch_does_not_require_probability_matrix():
+    proposed = _t(11, 12, 13, 14)
+    confidence = torch.ones(4)
+    engine = Engine.__new__(Engine)
+    engine._execution_plan = SimpleNamespace(is_expert_worker=False)
+    engine.ctx = SimpleNamespace(forward_batch=lambda batch: nullcontext())
+    engine.model = SimpleNamespace(
+        draft=lambda sampling_params: (proposed, None, confidence)
+    )
+    batch = SimpleNamespace(
+        speculative=True,
+        spec_block=4,
+        input_ids=torch.zeros(5, dtype=torch.long),
+        reqs=[SimpleNamespace(sampling_params=SimpleNamespace(is_greedy=True))],
+    )
+
+    returned = Engine.draft_into_batch(engine, batch)
+
+    assert returned is confidence
+    assert batch.input_ids.tolist() == [0, 11, 12, 13, 14]
+    assert torch.equal(batch.draft_tokens, proposed)
+    assert batch.draft_probs is None
+
+
 def test_sampling_probs_applies_temperature_top_k_and_top_p():
     logits = torch.tensor([[5.0, 4.0, 3.0, 2.0]])
     probs = sampling_probs(logits, temperature=1.0, top_p=0.8, top_k=3)
@@ -48,6 +75,22 @@ def test_acceptance_fallback_enters_and_leaves_cooldown():
     fallback = DSparkAcceptanceFallback(0.5, min_drafted=4, cooldown_steps=3)
     assert fallback.record(1, 4) == pytest.approx(0.25)
     assert [fallback.should_speculate() for _ in range(4)] == [False, False, False, True]
+
+
+def test_acceptance_fallback_can_use_cumulative_one_way_decision():
+    fallback = DSparkAcceptanceFallback(
+        0.5, min_drafted=4, cooldown_steps=3, cumulative=True
+    )
+    assert fallback.record(1, 4) == pytest.approx(0.25)
+    assert [fallback.should_speculate() for _ in range(5)] == [False] * 5
+
+    fallback.reset()
+    assert fallback.record(3, 4) is None
+    assert [fallback.should_speculate() for _ in range(5)] == [True] * 5
+    # The second window is poor, but the decision uses all eight proposals;
+    # once the cumulative rate crosses the threshold the bypass is permanent.
+    assert fallback.record(0, 4) == pytest.approx(3 / 8)
+    assert not fallback.should_speculate()
 
 
 def test_adaptive_verification_maximizes_expected_tokens_per_step_cost():
@@ -66,15 +109,38 @@ def test_adaptive_verification_makes_noisy_cost_curve_monotonic():
     assert adaptive.step_costs_ms == (5.0, 5.0, 7.0, 7.0, 9.0)
 
 
+def test_draft_graph_requires_a_complete_sliding_window():
+    drafter = SimpleNamespace(
+        _draft_graph=object(),
+        block_size=5,
+        args=SimpleNamespace(window_size=128),
+    )
+
+    assert not DSparkDrafter._can_replay_draft_graph(
+        drafter, torch.arange(127, 132)
+    )
+    assert DSparkDrafter._can_replay_draft_graph(
+        drafter, torch.arange(128, 133)
+    )
+    drafter._draft_graph = None
+    assert not DSparkDrafter._can_replay_draft_graph(
+        drafter, torch.arange(128, 133)
+    )
+
+
 def test_dspark_draft_positions_start_at_the_live_anchor(monkeypatch):
     class RecordingDrafter:
         def __init__(self):
             self.anchor = None
             self.positions = None
+            self.proposal_length = None
 
-        def propose(self, anchor, positions, sampling_params):
+        def propose(
+            self, anchor, positions, sampling_params, *, proposal_length=None
+        ):
             self.anchor = anchor.clone()
             self.positions = positions.clone()
+            self.proposal_length = proposal_length
             return "proposal"
 
     drafter = RecordingDrafter()
@@ -96,13 +162,16 @@ def test_dspark_draft_positions_start_at_the_live_anchor(monkeypatch):
     assert DeepseekV41ForCausalLM.draft(model, [object()]) == "proposal"
     assert drafter.anchor.tolist() == [71]
     assert drafter.positions.tolist() == [100, 101, 102, 103, 104]
+    assert drafter.proposal_length == 5
 
 
 def test_dspark_draft_keeps_full_confidence_span_when_verify_is_trimmed(monkeypatch):
     class RecordingDrafter:
-        def propose(self, anchor, positions, sampling_params):
+        def propose(
+            self, anchor, positions, sampling_params, *, proposal_length=None
+        ):
             del anchor, sampling_params
-            return positions.clone()
+            return positions.clone(), proposal_length
 
     batch = SimpleNamespace(
         spec_block=2,
@@ -119,8 +188,9 @@ def test_dspark_draft_keeps_full_confidence_span_when_verify_is_trimmed(monkeypa
         _args=SimpleNamespace(dspark_block_size=5),
     )
 
-    positions = DeepseekV41ForCausalLM.draft(model, [object()])
+    positions, proposal_length = DeepseekV41ForCausalLM.draft(model, [object()])
     assert positions.tolist() == [100, 101, 102, 103, 104]
+    assert proposal_length == 2
 
 
 def test_dsfp4_experts_honor_v41_activation_block_size(monkeypatch):

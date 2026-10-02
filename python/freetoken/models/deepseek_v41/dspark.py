@@ -35,6 +35,10 @@ from .moe import Gate, SharedExpert
 logger = init_logger(__name__)
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def sampling_probs(
     logits: torch.Tensor, temperature: float, top_p: float, top_k: int = -1
 ) -> torch.Tensor:
@@ -117,7 +121,14 @@ def rejection_accept_device(
 class DSparkAcceptanceFallback:
     """Request-local acceptance-rate circuit breaker from upstream PR #71."""
 
-    def __init__(self, threshold: float, min_drafted: int, cooldown_steps: int) -> None:
+    def __init__(
+        self,
+        threshold: float,
+        min_drafted: int,
+        cooldown_steps: int,
+        *,
+        cumulative: bool = False,
+    ) -> None:
         if not math.isfinite(threshold) or not 0 < threshold <= 1:
             raise ValueError("DSpark fallback threshold must be in (0, 1]")
         if min_drafted < 1 or cooldown_steps < 1:
@@ -125,25 +136,36 @@ class DSparkAcceptanceFallback:
         self.threshold = float(threshold)
         self.min_drafted = int(min_drafted)
         self.cooldown_steps = int(cooldown_steps)
+        self.cumulative = bool(cumulative)
         self.reset()
 
     def reset(self) -> None:
         self.accepted = 0
         self.drafted = 0
         self.cooldown_left = 0
+        self.disabled = False
 
     def should_speculate(self) -> bool:
+        if self.cumulative:
+            return not self.disabled
         if self.cooldown_left:
             self.cooldown_left -= 1
             return False
         return True
 
     def record(self, accepted: int, drafted: int) -> float | None:
+        if self.cumulative and self.disabled:
+            return None
         self.accepted += int(accepted)
         self.drafted += int(drafted)
         if self.drafted < self.min_drafted:
             return None
         rate = self.accepted / self.drafted
+        if self.cumulative:
+            if rate >= self.threshold:
+                return None
+            self.disabled = True
+            return rate
         self.accepted = self.drafted = 0
         if rate >= self.threshold:
             return None
@@ -317,6 +339,11 @@ class DSparkAttention(nn.Module):
             torch.zeros(args.window_size, args.head_dim, dtype=torch.bfloat16),
             persistent=False,
         )
+        self.register_buffer(
+            "_window_offsets",
+            torch.arange(-args.window_size, 0, dtype=torch.long),
+            persistent=False,
+        )
         self.freqs_cis: torch.Tensor | None = None
 
     def bind(self, device: torch.device) -> None:
@@ -360,7 +387,13 @@ class DSparkAttention(nn.Module):
             0, torch.remainder(positions.long(), self.window_size), kv
         )
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        fixed_window: bool = False,
+    ) -> torch.Tensor:
         from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
         from freetoken.kernel.triton.dsv4.sparse_attn import sparse_attn_paged
         from freetoken.models.deepseek_v4.ops import apply_rotary_emb_decode
@@ -379,9 +412,15 @@ class DSparkAttention(nn.Module):
         )
         block_kv = self._kv(x[0], flat_pos)
 
-        start = int(flat_pos[0].item())
-        lo = max(0, start - self.window_size)
-        context_pos = torch.arange(lo, start, device=x.device, dtype=torch.long)
+        if fixed_window:
+            # CUDA graph replay must derive the live ring rows from device data;
+            # baking ``positions[0].item()`` into capture would replay stale KV.
+            # The graph is used only once a complete 128-token window exists.
+            context_pos = flat_pos[:1] + self._window_offsets
+        else:
+            start = int(flat_pos[0].item())
+            lo = max(0, start - self.window_size)
+            context_pos = torch.arange(lo, start, device=x.device, dtype=torch.long)
         context = self.window_kv_cache.index_select(
             0, torch.remainder(context_pos, self.window_size)
         )
@@ -462,11 +501,20 @@ class DSparkBlock(nn.Module):
         )
 
     def forward(
-        self, hidden: torch.Tensor, incoming: torch.Tensor, positions: torch.Tensor
+        self,
+        hidden: torch.Tensor,
+        incoming: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        fixed_window: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden
         attn_pre, attn_post, attn_comb = self._mixes(hidden, "attn")
-        output = self.attn(self.attn_norm(hc_pre(hidden, incoming)), positions)
+        output = self.attn(
+            self.attn_norm(hc_pre(hidden, incoming)),
+            positions,
+            fixed_window=fixed_window,
+        )
         hidden = hc_post(output, residual, attn_post, attn_comb)
 
         residual = hidden
@@ -503,17 +551,321 @@ class DSparkDrafter(nn.Module):
         )
         self._target_embed = None
         self._target_logits = None
+        self._draft_graph_requested = _env_flag(
+            "FREETOKEN_DSV41_DSPARK_DRAFT_CUDA_GRAPH"
+        )
+        self.register_buffer(
+            "_local_target_embed_weight", None, persistent=False
+        )
+        self.register_buffer(
+            "_local_target_head_weight", None, persistent=False
+        )
+        self._draft_graph: torch.cuda.CUDAGraph | None = None
+        self._draft_graph_input_ids: torch.Tensor | None = None
+        self._draft_graph_positions: torch.Tensor | None = None
+        self._draft_graph_hidden: torch.Tensor | None = None
+        self._draft_graph_logits: torch.Tensor | None = None
+        self._greedy_graphs: dict[
+            int,
+            tuple[
+                torch.cuda.CUDAGraph,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+            ],
+        ] = {}
+        self._catch_up_graphs: dict[
+            int,
+            tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor],
+        ] = {}
+        self._needs_confidence = True
 
     def bind(
         self,
         target_embed,
         target_logits,
+        *,
+        target_embed_weight: torch.Tensor | None = None,
+        target_head_weight: torch.Tensor | None = None,
+        graph_lengths: Sequence[int] | None = None,
+        needs_confidence: bool = True,
     ) -> None:
         self.device = self.main_proj.weight.device
         self._target_embed = target_embed
         self._target_logits = target_logits
+        self._needs_confidence = bool(needs_confidence)
         for stage in self.stages:
             stage.attn.bind(self.device)
+        if self._draft_graph_requested:
+            if target_embed_weight is None or target_head_weight is None:
+                raise RuntimeError(
+                    "DSpark draft CUDA graph requires target embedding and head weights"
+                )
+            with torch.cuda.device(self.device):
+                self._local_target_embed_weight = (
+                    target_embed_weight.detach().to(self.device)
+                )
+                self._local_target_head_weight = (
+                    target_head_weight.detach().to(self.device)
+                )
+                lengths = tuple(
+                    sorted(set(graph_lengths or (self.block_size,)))
+                )
+                if not lengths or any(
+                    length < 1 or length > self.block_size for length in lengths
+                ):
+                    raise ValueError(
+                        f"DSpark draft graph lengths must be in [1, {self.block_size}]"
+                    )
+                # Adaptive verification always needs all confidence positions,
+                # regardless of the target prefix selected for the current step.
+                if self._needs_confidence:
+                    lengths = (self.block_size,)
+                self._capture_draft_graphs(lengths)
+                self._capture_catch_up_graphs()
+
+    def _forward_local_backbone(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        fixed_window: bool,
+        logits_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the three-stage draft stack entirely on the auxiliary GPU."""
+
+        if (
+            self._local_target_embed_weight is None
+            or self._local_target_head_weight is None
+        ):
+            raise RuntimeError("DSpark local target weights are not loaded")
+        embeds = F.embedding(input_ids.long(), self._local_target_embed_weight)
+        hidden = embeds.unsqueeze(2).repeat(1, 1, self.args.hc_mult, 1)
+        incoming = identity_pre_mix(hidden, self.args.hc_mult)
+        for stage in self.stages:
+            hidden, incoming = stage(
+                hidden,
+                incoming,
+                positions,
+                fixed_window=fixed_window,
+            )
+        head_hidden = hc_pre(hidden, incoming)
+        if logits_length is not None:
+            head_hidden = head_hidden[:, :logits_length]
+        normalized = self.norm(head_hidden)
+        base_logits = F.linear(normalized.float(), self._local_target_head_weight)
+        return head_hidden, base_logits
+
+    def _capture_draft_graphs(self, greedy_lengths: Sequence[int]) -> None:
+        """Capture the backbone and common full greedy draft shapes.
+
+        The backbone-only graph remains the exact fallback for arbitrary sampled
+        requests.  Greedy requests use one end-to-end graph per configured K,
+        including the sequential Markov dependency and argmax chain, matching
+        the scope of vLLM's DSpark graph rather than graphing verification alone.
+        """
+
+        ids = torch.full(
+            (1, self.block_size),
+            self.noise_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        ids[0, 0] = 0
+        positions = torch.arange(
+            self.args.window_size,
+            self.args.window_size + self.block_size,
+            dtype=torch.long,
+            device=self.device,
+        )
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(capture_stream):
+            # Warm every lazy module and allocator path before capture.
+            for _ in range(2):
+                self._forward_local_backbone(
+                    ids, positions, fixed_window=True
+                )
+        capture_stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            hidden, logits = self._forward_local_backbone(
+                ids, positions, fixed_window=True
+            )
+        capture_stream.synchronize()
+        self._draft_graph = graph
+        self._draft_graph_input_ids = ids
+        self._draft_graph_positions = positions
+        self._draft_graph_hidden = hidden
+        self._draft_graph_logits = logits
+
+        for length in greedy_lengths:
+            graph_ids = ids.clone()
+            graph_positions = positions.clone()
+            proposed = torch.empty(
+                length, dtype=torch.long, device=self.device
+            )
+            confidence = (
+                torch.empty(length, dtype=torch.float32, device=self.device)
+                if self._needs_confidence
+                else None
+            )
+            with torch.cuda.stream(capture_stream):
+                for _ in range(2):
+                    head_hidden, base_logits = self._forward_local_backbone(
+                        graph_ids,
+                        graph_positions,
+                        fixed_window=True,
+                        logits_length=length,
+                    )
+                    self._sample_greedy(
+                        graph_ids[0, :1],
+                        head_hidden,
+                        base_logits,
+                        proposed,
+                        confidence,
+                    )
+            capture_stream.synchronize()
+
+            greedy_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(greedy_graph, stream=capture_stream):
+                head_hidden, base_logits = self._forward_local_backbone(
+                    graph_ids,
+                    graph_positions,
+                    fixed_window=True,
+                    logits_length=length,
+                )
+                self._sample_greedy(
+                    graph_ids[0, :1],
+                    head_hidden,
+                    base_logits,
+                    proposed,
+                    confidence,
+                )
+            capture_stream.synchronize()
+            self._greedy_graphs[length] = (
+                greedy_graph,
+                graph_ids,
+                graph_positions,
+                proposed,
+                confidence,
+            )
+        resident = (
+            self._local_target_embed_weight.numel()
+            * self._local_target_embed_weight.element_size()
+            + self._local_target_head_weight.numel()
+            * self._local_target_head_weight.element_size()
+        )
+        logger.info_rank0(
+            "Captured DeepSeek-V4.1 DSpark draft backbone and greedy K=%s on %s; "
+            "local target embed/head %.2f GiB",
+            tuple(greedy_lengths),
+            self.device,
+            resident / (1 << 30),
+        )
+
+    def _catch_up_local(
+        self, hidden: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        main_x = self.combine_target_hidden(hidden.view(-1, hidden.shape[-1]))
+        for stage in self.stages:
+            stage.attn.catch_up(main_x, positions)
+
+    def _capture_catch_up_graphs(self) -> None:
+        """Capture the small steady-state target-context updates on the drafter."""
+
+        width = self.args.dim * len(self.target_layer_ids)
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(torch.cuda.current_stream(self.device))
+        for count in range(1, self.block_size + 2):
+            hidden = torch.zeros(
+                count, width, dtype=torch.bfloat16, device=self.device
+            )
+            positions = torch.arange(
+                count, dtype=torch.long, device=self.device
+            )
+            with torch.cuda.stream(capture_stream):
+                for _ in range(2):
+                    self._catch_up_local(hidden, positions)
+            capture_stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                self._catch_up_local(hidden, positions)
+            capture_stream.synchronize()
+            self._catch_up_graphs[count] = (graph, hidden, positions)
+        for stage in self.stages:
+            stage.attn.window_kv_cache.zero_()
+        logger.info_rank0(
+            "Captured DeepSeek-V4.1 DSpark context catch-up graphs for rows 1..%d",
+            self.block_size + 1,
+        )
+
+    def _can_replay_draft_graph(self, positions: torch.Tensor) -> bool:
+        if self._draft_graph is None or positions.numel() < self.block_size:
+            return False
+        # Short prefixes have a variable-width context and retain the eager path.
+        return int(positions[0].item()) >= int(self.args.window_size)
+
+    def _replay_greedy_graph(
+        self,
+        anchor: torch.Tensor,
+        positions: torch.Tensor,
+        proposal_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        entry = self._greedy_graphs.get(proposal_length)
+        if entry is None or not self._can_replay_draft_graph(positions):
+            return None
+        graph, ids, graph_positions, proposed, confidence = entry
+        ids.fill_(self.noise_token_id)
+        ids[0, 0].copy_(anchor.to(self.device).long().reshape(()))
+        graph_positions.copy_(positions[: self.block_size].to(self.device))
+        graph.replay()
+        return proposed, confidence
+
+    def _draft_backbone(
+        self,
+        anchor: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._can_replay_draft_graph(positions):
+            assert self._draft_graph_input_ids is not None
+            assert self._draft_graph_positions is not None
+            assert self._draft_graph_hidden is not None
+            assert self._draft_graph_logits is not None
+            self._draft_graph_input_ids.fill_(self.noise_token_id)
+            self._draft_graph_input_ids[0, 0].copy_(
+                anchor.to(self.device).long().reshape(())
+            )
+            self._draft_graph_positions.copy_(
+                positions[: self.block_size].to(self.device)
+            )
+            self._draft_graph.replay()
+            return self._draft_graph_hidden, self._draft_graph_logits
+
+        ids = torch.full(
+            (1, self.block_size),
+            self.noise_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        ids[0, 0].copy_(anchor.to(self.device).long().reshape(()))
+        local_positions = positions[: self.block_size].to(self.device).view(-1)
+        if self._local_target_embed_weight is not None:
+            return self._forward_local_backbone(
+                ids, local_positions, fixed_window=False
+            )
+
+        embeds = self._target_embed(ids.to(anchor.device)).to(self.device)
+        hidden = embeds.unsqueeze(2).repeat(1, 1, self.args.hc_mult, 1)
+        incoming = identity_pre_mix(hidden, self.args.hc_mult)
+        for stage in self.stages:
+            hidden, incoming = stage(hidden, incoming, local_positions)
+        head_hidden = hc_pre(hidden, incoming)
+        normalized = self.norm(head_hidden)
+        base_logits = self._target_logits(normalized.to(anchor.device)).to(self.device)
+        return head_hidden, base_logits
 
     def combine_target_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         expect = self.args.dim * len(self.target_layer_ids)
@@ -529,10 +881,46 @@ class DSparkDrafter(nn.Module):
         # on torch's current CUDA device rather than inferring it from every pointer,
         # so explicitly select the auxiliary GPU around all resident-drafter work.
         with torch.cuda.device(self.device):
-            main_x = self.combine_target_hidden(hidden.view(-1, hidden.shape[-1]))
-            positions = positions.to(self.device)
-            for stage in self.stages:
-                stage.attn.catch_up(main_x, positions)
+            count = int(positions.numel())
+            entry = self._catch_up_graphs.get(count)
+            if entry is not None:
+                graph, graph_hidden, graph_positions = entry
+                graph_hidden.copy_(hidden.view_as(graph_hidden).to(self.device))
+                graph_positions.copy_(positions.view_as(graph_positions).to(self.device))
+                graph.replay()
+                return
+            self._catch_up_local(
+                hidden.view(-1, hidden.shape[-1]).to(self.device),
+                positions.to(self.device),
+            )
+
+    def _sample_greedy(
+        self,
+        anchor: torch.Tensor,
+        head_hidden: torch.Tensor,
+        base_logits: torch.Tensor,
+        proposed: torch.Tensor,
+        confidence: torch.Tensor | None,
+    ) -> None:
+        previous = anchor.long().reshape(1)
+        for k in range(proposed.numel()):
+            markov = F.embedding(previous, self.markov_embed)
+            logits = (
+                base_logits[0, k].float()
+                + F.linear(markov, self.markov_head).squeeze(0).float()
+            )
+            token = logits.argmax().view(1)
+            proposed[k].copy_(token[0])
+            if confidence is not None:
+                confidence[k].copy_(
+                    F.linear(
+                        torch.cat(
+                            [head_hidden[0, k].float(), markov[0].float()]
+                        ),
+                        self.confidence_proj,
+                    ).squeeze()
+                )
+            previous = token
 
     @torch.inference_mode()
     def propose(
@@ -540,72 +928,95 @@ class DSparkDrafter(nn.Module):
         anchor: torch.Tensor,
         positions: torch.Tensor,
         sampling_params: Sequence,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        proposal_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         with torch.cuda.device(self.device):
-            return self._propose(anchor, positions, sampling_params)
+            return self._propose(
+                anchor,
+                positions,
+                sampling_params,
+                proposal_length=proposal_length,
+            )
 
     def _propose(
         self,
         anchor: torch.Tensor,
         positions: torch.Tensor,
         sampling_params: Sequence,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        proposal_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if len(sampling_params) != 1 or anchor.numel() != 1:
             raise ValueError("V4.1 auxiliary DSpark currently supports one request")
         if self._target_embed is None or self._target_logits is None:
             raise RuntimeError("DSpark target embedding/head callbacks are not bound")
-        ids = torch.full(
-            (1, self.block_size),
-            self.noise_token_id,
-            dtype=torch.long,
-            device=anchor.device,
-        )
-        ids[0, 0] = anchor.long().reshape(())
-        embeds = self._target_embed(ids).to(self.device)
-        positions = positions[: self.block_size].to(self.device).view(-1)
-        hidden = embeds.unsqueeze(2).repeat(1, 1, self.args.hc_mult, 1)
-        incoming = identity_pre_mix(hidden, self.args.hc_mult)
-        for stage in self.stages:
-            hidden, incoming = stage(hidden, incoming, positions)
-        head_hidden = hc_pre(hidden, incoming)
-        normalized = self.norm(head_hidden)
-        base_logits = self._target_logits(normalized.to(anchor.device)).to(self.device)
-
         params = sampling_params[0]
-        proposed = torch.empty(self.block_size, dtype=torch.long, device=self.device)
-        q = torch.empty(
-            self.block_size,
-            self.args.vocab_size,
-            dtype=torch.float32,
-            device=self.device,
+        requested = self.block_size if proposal_length is None else int(proposal_length)
+        if requested < 1 or requested > self.block_size:
+            raise ValueError(
+                f"DSpark proposal length {requested} is outside [1, {self.block_size}]"
+            )
+        length = self.block_size if self._needs_confidence else requested
+        if params.is_greedy:
+            replayed = self._replay_greedy_graph(anchor, positions, length)
+            if replayed is not None:
+                proposed, confidence = replayed
+                target_device = anchor.device
+                return (
+                    proposed.to(target_device),
+                    None,
+                    confidence.to(target_device)
+                    if confidence is not None
+                    else None,
+                )
+        head_hidden, base_logits = self._draft_backbone(anchor, positions)
+        head_hidden = head_hidden[:, :length]
+        base_logits = base_logits[:, :length]
+        proposed = torch.empty(length, dtype=torch.long, device=self.device)
+        q = (
+            None
+            if params.is_greedy
+            else torch.empty(
+                length,
+                self.args.vocab_size,
+                dtype=torch.float32,
+                device=self.device,
+            )
         )
-        confidence = torch.empty(
-            self.block_size, dtype=torch.float32, device=self.device
+        confidence = (
+            torch.empty(length, dtype=torch.float32, device=self.device)
+            if self._needs_confidence
+            else None
         )
         previous = anchor.to(self.device).long().reshape(1)
-        for k in range(self.block_size):
+        for k in range(length):
             markov = F.embedding(previous, self.markov_embed)
             logits = base_logits[0, k].float() + F.linear(markov, self.markov_head).squeeze(0).float()
-            q_k = sampling_probs(
-                logits.unsqueeze(0), params.temperature, params.top_p, params.top_k
-            )[0]
-            q[k].copy_(q_k)
-            token = (
-                q_k.argmax().view(1)
-                if params.is_greedy
-                else torch.multinomial(q_k, 1)
-            )
+            if params.is_greedy:
+                token = logits.argmax().view(1)
+            else:
+                assert q is not None
+                q_k = sampling_probs(
+                    logits.unsqueeze(0),
+                    params.temperature,
+                    params.top_p,
+                    params.top_k,
+                )[0]
+                q[k].copy_(q_k)
+                token = torch.multinomial(q_k, 1)
             proposed[k] = token[0]
-            confidence[k] = F.linear(
-                torch.cat([head_hidden[0, k].float(), markov[0].float()]),
-                self.confidence_proj,
-            ).squeeze()
+            if confidence is not None:
+                confidence[k] = F.linear(
+                    torch.cat([head_hidden[0, k].float(), markov[0].float()]),
+                    self.confidence_proj,
+                ).squeeze()
             previous = token
         target_device = anchor.device
         return (
             proposed.to(target_device),
-            q.to(target_device),
-            confidence.to(target_device),
+            q.to(target_device) if q is not None else None,
+            confidence.to(target_device) if confidence is not None else None,
         )
 
 

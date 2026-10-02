@@ -1546,7 +1546,24 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             loaded = load_dspark_checkpoint(
                 engine_config.model_path, self._drafter, self._dspark_device
             )
-        self._drafter.bind(self._target_embed, self._target_logits)
+        self._drafter.bind(
+            self._target_embed,
+            self._target_logits,
+            target_embed_weight=self._model.embed.weight,
+            target_head_weight=self._model.head,
+            graph_lengths=(
+                (self._args.dspark_block_size,)
+                if engine_config.dspark_adaptive_verification
+                else (
+                    engine_config.dspark_verification_schedule
+                    or (
+                        engine_config.dspark_verification_length
+                        or self._args.dspark_block_size,
+                    )
+                )
+            ),
+            needs_confidence=engine_config.dspark_adaptive_verification,
+        )
         return loaded
 
     def _target_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1609,6 +1626,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             # `start_pos + seqlen` row is positions[0], not positions[1].
             draft_positions,
             sampling_params,
+            proposal_length=batch.spec_block,
         )
 
     @torch.inference_mode()

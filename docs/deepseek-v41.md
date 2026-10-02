@@ -1,19 +1,49 @@
-# DeepSeek-V4.1-Flash experimental baseline
+# DeepSeek-V4.1-Flash experimental serving
 
-FreeToken's first DeepSeek-V4.1 gate serves ordinary text generation directly
-from the official safetensors checkpoint. It implements the main 40-layer model,
-CSA2 paged attention, DS-FP4 routed experts and the two row-sharded Engram tables.
-Vision and DSpark/MTP speculative decoding are intentionally outside this gate.
+FreeToken serves DeepSeek-V4.1 directly from the official safetensors checkpoint.
+It implements the main 40-layer model, CSA2 paged attention, DS-FP4 routed
+experts, the two row-sharded Engram tables, the native vision tower, and the
+checkpoint's DSpark/MTP speculative drafter.
 
-The current topology is exactly two ranks: rank 0 owns the complete TP1 text
-backbone, while both ranks own 192 routed experts per layer and half of every
-Engram table. Engram's three-token history has an address-stable graph input.
-Position-bucketed heterogeneous-EP CUDA graphs have passed exact real-checkpoint
-replay and long-generation gates on a qualified dual RTX 5090 setup. They remain
-an explicit opt-in because P2P, driver, allocator, and topology changes require
-requalification: set `FREETOKEN_DSV41_CUDA_GRAPH=1` and use
+In heterogeneous EP, one rank owns the complete TP1 text backbone while every
+rank can own an independently sized routed-expert shard and selected ranks own
+rows of each Engram table. Engram's three-token history has an address-stable
+graph input. Position-bucketed heterogeneous-EP CUDA graphs have passed exact
+real-checkpoint replay and long-generation gates on qualified RTX 5090 systems.
+They remain an explicit opt-in because P2P, driver, allocator, and topology
+changes require requalification: set `FREETOKEN_DSV41_CUDA_GRAPH=1` and use
 `--cuda-graph-max-bs 1` only after passing the correctness gates on the target
 machine.
+
+## Native vision and DSpark/MTP
+
+Pass `--vision-device` to load the checkpoint's native image encoder. The
+auxiliary device may sit outside the text EP group. Image requests deliberately
+use ordinary target decoding; the checkpoint's DSpark context path is text-only.
+
+DSpark is opt-in with `--speculative-dspark --dspark-device DEVICE` and currently
+requires `--max-running-requests 1`. The auxiliary device holds the MTP stack so
+it does not evict target experts. Set
+`FREETOKEN_DSV41_DSPARK_DRAFT_CUDA_GRAPH=1` to graph the resident draft backbone,
+greedy Markov chain, and context catch-up. Greedy drafting does not allocate a
+vocabulary-sized probability matrix; sampled decoding retains exact rejection
+sampling.
+
+Acceptance depends strongly on the request. A fixed verification length can be
+selected with `--dspark-verification-length`. For serving, the cumulative
+circuit breaker can permanently return an unprofitable request to ordinary
+decode:
+
+```bash
+--dspark-fallback-acceptance 0.52 \
+--dspark-fallback-min-drafted 16 \
+--dspark-fallback-cumulative
+```
+
+The threshold is topology-specific and should be derived from an A/B test. The
+qualified heterogeneous EP3 launcher in
+`scripts/run_dsv41_dspark_4090_candidate.sh` uses a four-token verification
+prefix and keeps multimodal serving enabled on the same auxiliary card.
 
 Authority EP can also overlap its decode-time expert-cache refill with the
 independent shared-expert projection by setting

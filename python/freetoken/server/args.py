@@ -517,6 +517,15 @@ def parse_args(
         help="Ordinary decode steps to run before probing DSpark again.",
     )
     parser.add_argument(
+        "--dspark-fallback-cumulative",
+        action="store_true",
+        default=ServerArgs.dspark_fallback_cumulative,
+        help=(
+            "Evaluate cumulative acceptance per request and permanently use "
+            "ordinary decode once the cumulative rate falls below threshold."
+        ),
+    )
+    parser.add_argument(
         "--dspark-verification-length",
         type=_positive_int,
         default=ServerArgs.dspark_verification_length,

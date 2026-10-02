@@ -6,7 +6,7 @@ for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
 |---|---|
-| DeepSeek-V4.1 | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (experimental text-only baseline; see [launch notes](deepseek-v41.md)) |
+| DeepSeek-V4.1 | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (experimental text, native image, and checkpoint DSpark/MTP support; see [launch notes](deepseek-v41.md)) |
 | DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) |
 | GLM-5.2 | [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) |
 | GLM-4.7 | [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4) |

@@ -86,6 +86,10 @@ class EngineConfig:
     dspark_fallback_acceptance: float = 0.6
     dspark_fallback_min_drafted: int = 32
     dspark_fallback_steps: int = 64
+    # Evaluate cumulative request acceptance and make fallback one-way.  A
+    # poor request stays on ordinary decode instead of paying for re-probes,
+    # while a single noisy window cannot disable an otherwise useful drafter.
+    dspark_fallback_cumulative: bool = False
     # Optional target verification prefix. None verifies the checkpoint's full
     # block and is the compatibility default; shorter values are useful for
     # profiling the per-length cost curve.

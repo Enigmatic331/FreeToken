@@ -452,6 +452,7 @@ class Engine:
                 config.dspark_fallback_acceptance,
                 config.dspark_fallback_min_drafted,
                 config.dspark_fallback_steps,
+                cumulative=config.dspark_fallback_cumulative,
             )
         self._dspark_adaptive = None
         self._dspark_adaptive_uid: int | None = None
@@ -1389,10 +1390,14 @@ class Engine:
             self._dspark_fallback_uid = req.uid
         rate = fallback.record(accepted, drafted)
         if rate is not None:
+            bypass = (
+                "for the rest of this request"
+                if fallback.cumulative
+                else f"for {fallback.cooldown_steps} decode steps"
+            )
             logger.warning_rank0(
                 f"DSpark acceptance {rate:.1%} fell below "
-                f"{fallback.threshold:.1%}; bypassing the drafter for "
-                f"{fallback.cooldown_steps} decode steps"
+                f"{fallback.threshold:.1%}; bypassing the drafter {bypass}"
             )
 
     def draft_into_batch(self, batch: Batch) -> torch.Tensor | None:
@@ -1426,7 +1431,11 @@ class Engine:
                 f"V4.1 DSpark verify has {batch.input_ids.numel()} rows, expected {span}"
             )
         proposed = proposed[:gamma]
-        q = q[:gamma]
+        # Greedy verification compares token ids only and deliberately skips the
+        # block_size x vocab draft-probability allocation/copy.  Sampled requests
+        # still carry the exact q distribution used by rejection sampling.
+        if q is not None:
+            q = q[:gamma]
         batch.input_ids[1:span].copy_(proposed.to(batch.input_ids.dtype))
         batch.draft_tokens = proposed
         batch.draft_probs = q

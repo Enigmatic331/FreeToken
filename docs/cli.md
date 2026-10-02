@@ -41,7 +41,12 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--vision-device` | off | Enable Qwen3.8 image input and place its Qwen3-VL encoder on this CUDA device (for example `0` or `cuda:2`) |
+| `--vision-device` | off | Enable supported native image input and place the vision encoder on this CUDA device (for example `0` or `cuda:2`) |
+| `--speculative-dspark` | off | Enable checkpoint-native DeepSeek-V4.1 DSpark/MTP block speculation; currently single-request only |
+| `--dspark-device` | off | Auxiliary CUDA device that owns the resident DeepSeek-V4.1 MTP stack |
+| `--dspark-verification-length` | checkpoint block size | Fixed number of DSpark proposals verified per target step |
+| `--dspark-fallback-acceptance` | 0.6 | Bypass DSpark when observed proposal acceptance falls below this rate; `0` disables the circuit breaker |
+| `--dspark-fallback-cumulative` | off | Make low-acceptance fallback one-way for the remainder of the request |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | remaining context | Default output budget for requests that omit one; unset continues until EOS or the remaining context boundary |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
