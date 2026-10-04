@@ -61,6 +61,7 @@ def _decode_dsfp4_moe_kernel(
     A_ROW_IS_ROUTE: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
+    SKIP_ZERO_WEIGHT: tl.constexpr = False,
 ):
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
@@ -69,6 +70,14 @@ def _decode_dsfp4_moe_kernel(
 
     offs_n = n_block_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     n_mask = offs_n < N
+    if SKIP_ZERO_WEIGHT:
+        weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+        if weight == 0.0:
+            # EP peers and CPU overflow routes have zero local contribution.
+            # Write every lane: graph replays may change which routes are local.
+            zero_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+            tl.store(zero_ptrs, 0.0, mask=(route_id < total_routes) & n_mask)
+            return
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
     a_row = route_id if A_ROW_IS_ROUTE else token_id

@@ -811,10 +811,14 @@ def test_frontend_tokenizer_concurrent_first_build_dedupes():
 
     orig_load, orig_tm = _utils.load_tokenizer, _tok.TokenizeManager
     _utils.load_tokenizer = _slow_load
-    _tok.TokenizeManager = lambda tok: tok
+    def _manager(tok, *, enable_multimodal):
+        assert enable_multimodal is False
+        return tok
+
+    _tok.TokenizeManager = _manager
     try:
         fm = FrontendManager(
-            config=SimpleNamespace(model_path="dedupe-test"),
+            config=SimpleNamespace(model_path="dedupe-test", vision_device=None),
             send_tokenizer=None,
             recv_tokenizer=None,
         )
@@ -831,6 +835,7 @@ def test_frontend_tokenizer_concurrent_first_build_dedupes():
         _utils.load_tokenizer = orig_load
         _tok.TokenizeManager = orig_tm
     assert len(calls) == 1
+    assert len(results) == 4
     assert len(set(id(r) for r in results)) == 1
 
 

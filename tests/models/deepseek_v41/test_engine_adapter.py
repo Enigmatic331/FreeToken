@@ -232,6 +232,57 @@ def test_engine_config_resolves_ep2_single_stream_and_safe_eager_default():
         distributed_info._TP_INFO = None
 
 
+@pytest.mark.parametrize("threshold", [0, 64, 256])
+def test_engine_config_accepts_dsfp4_ep_sparse_prefill(threshold):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config()
+    object.__setattr__(config, "moe_sparse_prefill_max_tokens", threshold)
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(config.dsv41_backbone_rank)
+        _adjust_config(config)
+        assert config.moe_sparse_prefill_max_tokens == threshold
+        assert config.model_config.expert_quant == "ds_fp4"
+        assert config.model_config.num_experts == 4
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_engine_config_accepts_selected_hybrid_worker():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config()
+    object.__setattr__(config, "moe_backend", "hybrid")
+    object.__setattr__(config, "moe_hybrid_ranks", (1,))
+    object.__setattr__(config, "moe_hybrid_max_bs", 1)
+    object.__setattr__(config, "moe_sparse_prefill_max_tokens", 256)
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(config.dsv41_backbone_rank)
+        _adjust_config(config)
+        assert config.moe_backend == "hybrid"
+        assert config.moe_hybrid_ranks == (1,)
+        assert config.moe_hybrid_max_bs == 1
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+@pytest.mark.parametrize("ranks", [(2,), (1, 1), ()])
+def test_engine_config_rejects_invalid_hybrid_ranks(ranks):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config()
+    object.__setattr__(config, "moe_backend", "hybrid")
+    object.__setattr__(config, "moe_hybrid_ranks", ranks)
+    with pytest.raises(ValueError, match="moe-hybrid-ranks"):
+        _adjust_config(config)
+
+
 def test_engine_config_exposes_true_model_tp_width_for_tp2_ep2():
     from freetoken.engine.engine import _adjust_config
 

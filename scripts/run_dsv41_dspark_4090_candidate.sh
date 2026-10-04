@@ -10,7 +10,10 @@ export PYTHONPATH="$repo_dir/python${PYTHONPATH:+:$PYTHONPATH}"
 export NCCL_P2P_DISABLE=0
 export NCCL_P2P_LEVEL=SYS
 export NCCL_IB_DISABLE=1
-export CUDA_MODULE_LOADING=EAGER
+case "${FREETOKEN_CUDA_MODULE_LOADING:-EAGER}" in
+  EAGER|LAZY) export CUDA_MODULE_LOADING="${FREETOKEN_CUDA_MODULE_LOADING:-EAGER}" ;;
+  *) echo "FREETOKEN_CUDA_MODULE_LOADING must be EAGER or LAZY" >&2; exit 2 ;;
+esac
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export FREETOKEN_LOAD_VISION=1
@@ -21,12 +24,42 @@ export MALLOC_ARENA_MAX=4
 export LOG_PID=1
 export FREETOKEN_DSV41_INDEXER_MAX_LOGITS_MB=256
 export FREETOKEN_DSV41_CUDA_GRAPH=1
-export FREETOKEN_DSV41_DSPARK_CUDA_GRAPH_LENGTHS="${DSPARK_VERIFY_LENGTH:-4}"
-export FREETOKEN_DSV41_DSPARK_DRAFT_CUDA_GRAPH=1
 export FREETOKEN_DSV41_DECODE_REFILL_OVERLAP=1
 export FREETOKEN_DSV41_FUSED_ROUTE_PREP=1
 export FREETOKEN_DSV41_FUSED_DECODE_DISPATCH=1
 export FREETOKEN_EP_PREFILL_ROUTE_TILE_TOKENS=4096
+
+speculative_args=()
+case "${DSPARK_ENABLED:-1}" in
+  1)
+    export FREETOKEN_DSV41_DSPARK_CUDA_GRAPH_LENGTHS="${DSPARK_VERIFY_LENGTH:-4}"
+    export FREETOKEN_DSV41_DSPARK_DRAFT_CUDA_GRAPH=1
+    speculative_args=(
+      --speculative-dspark --dspark-device 3
+      --dspark-verification-length "${DSPARK_VERIFY_LENGTH:-4}"
+      --dspark-fallback-acceptance "${DSPARK_FALLBACK_ACCEPTANCE:-0.52}"
+      --dspark-fallback-min-drafted "${DSPARK_FALLBACK_MIN_DRAFTED:-16}"
+      --dspark-fallback-steps "${DSPARK_FALLBACK_STEPS:-64}"
+      --dspark-fallback-cumulative
+    )
+    ;;
+  0)
+    # Omit DSpark entirely, not merely its proposals. This also avoids target
+    # feature capture and auxiliary draft residency while preserving all other
+    # placement, KV, short-prefill and opt-in CPU-assistance settings.
+    export FREETOKEN_DSV41_DSPARK_CUDA_GRAPH_LENGTHS=""
+    export FREETOKEN_DSV41_DSPARK_DRAFT_CUDA_GRAPH=0
+    ;;
+  *)
+    echo "DSPARK_ENABLED must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+
+hybrid_rank_args=()
+if [[ -n "${DSPARK_MOE_HYBRID_RANKS:-}" ]]; then
+  hybrid_rank_args=(--moe-hybrid-ranks "$DSPARK_MOE_HYBRID_RANKS")
+fi
 
 exec "$FREETOKEN_PYTHON" -m freetoken.cli serve \
   --model "$MODEL_PATH" \
@@ -44,13 +77,7 @@ exec "$FREETOKEN_PYTHON" -m freetoken.cli serve \
   --dsv41-expert-storage-ranges 0:128,32:256,192:192 \
   --dsv41-engram-ranks 0,1 \
   --vision-device 3 \
-  --speculative-dspark \
-  --dspark-device 3 \
-  --dspark-verification-length "${DSPARK_VERIFY_LENGTH:-4}" \
-  --dspark-fallback-acceptance "${DSPARK_FALLBACK_ACCEPTANCE:-0.52}" \
-  --dspark-fallback-min-drafted "${DSPARK_FALLBACK_MIN_DRAFTED:-16}" \
-  --dspark-fallback-steps "${DSPARK_FALLBACK_STEPS:-64}" \
-  --dspark-fallback-cumulative \
+  "${speculative_args[@]}" \
   --max-running-requests 1 \
   --max-seq-len-override 524288 \
   --max-prefill-length 8192 \
@@ -58,9 +85,14 @@ exec "$FREETOKEN_PYTHON" -m freetoken.cli serve \
   --swa-full-tokens-ratio 0.28125 \
   --memory-ratio 0.90 \
   --cache-type radix \
-  --moe-backend offload \
+  --moe-backend "${DSPARK_MOE_BACKEND:-offload}" \
+  --moe-cpu-threads "${DSPARK_MOE_CPU_THREADS:-0}" \
+  --moe-hybrid-max-fetch "${DSPARK_MOE_HYBRID_MAX_FETCH:--1}" \
+  --moe-hybrid-max-bs "${DSPARK_MOE_HYBRID_MAX_BS:-0}" \
+  "${hybrid_rank_args[@]}" \
   --moe-cache-sizes 256,1472,2350 \
   --moe-prefill-hit-d2d \
+  --moe-sparse-prefill-max-tokens "${DSPARK_SPARSE_PREFILL_MAX_TOKENS:-0}" \
   --expert-load serial \
   --attention-backend dsv4_sparse \
   --cuda-graph-max-bs 1 \

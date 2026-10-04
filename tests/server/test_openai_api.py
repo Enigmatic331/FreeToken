@@ -436,6 +436,7 @@ def test_omitted_max_tokens_uses_context_or_server_default():
 
 def test_models_route_returns_served_model_name():
     state = FakeState([])
+    del state.config.max_seq_len  # this fixture tests the missing-context case
     app = FastAPI()
     register_openai_routes(app, lambda: state, lambda: {})
 

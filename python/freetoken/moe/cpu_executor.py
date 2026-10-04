@@ -140,6 +140,26 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     return len(reps), list(reps)
 
 
+def partition_rank_affinity(
+    rank: int, ranks: tuple[int, ...], requested: int,
+) -> tuple[list[int], int]:
+    """Disjoint physical-core pools and one coordinator core per CPU EP rank."""
+    if not ranks or len(set(ranks)) != len(ranks) or rank not in ranks:
+        raise ValueError("CPU rank affinity needs unique participating ranks")
+    cores = physical_core_cpus()
+    index = sorted(ranks).index(rank)
+    chunk = cores[len(cores) * index // len(ranks):len(cores) * (index + 1) // len(ranks)]
+    if len(chunk) < 2:
+        raise ValueError("CPU MoE needs a worker and coordinator core per rank")
+    workers, coord = chunk[:-1], chunk[-1]
+    if requested < 0 or requested > len(workers):
+        raise ValueError(
+            f"--moe-cpu-threads {requested} exceeds rank {rank}'s "
+            f"{len(workers)} disjoint physical worker cores"
+        )
+    return workers[:requested] if requested else workers, coord
+
+
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
     (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
@@ -156,10 +176,52 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
+        dsfp4_activation_block_size: int = 128,
+        core_ids: list[int] | None = None,
+        coordinator_core: int | None = None,
+        return_route_outputs: bool = False,
+        dsfp4_gpu_order: bool = False,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
         fmt = cache.quant_format
+        self.return_route_outputs = bool(return_route_outputs)
+        self.dsfp4_gpu_order = bool(dsfp4_gpu_order)
+        self.dsfp4_route_parallel = (
+            self.dsfp4_gpu_order and self.return_route_outputs
+            and dsfp4_activation_block_size == 32
+            and os.getenv("FREETOKEN_DSV41_CPU_ROUTE_PARALLEL", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if self.dsfp4_route_parallel and not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_route_parallel"):
+            raise RuntimeError("V4.1 parallel CPU routes require a rebuilt _cpu_moe extension")
+        self.dsfp4_fuse_prep = (
+            self.dsfp4_gpu_order and self.return_route_outputs
+            and dsfp4_activation_block_size == 32
+            and os.getenv("FREETOKEN_DSV41_CPU_FUSE_PREP", "0") == "1"
+        )
+        if self.dsfp4_fuse_prep and not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_fuse_prep"):
+            raise RuntimeError("V4.1 fused CPU preparation requires a rebuilt _cpu_moe extension")
+        if self.dsfp4_gpu_order and (
+            fmt != "ds_fp4" or not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_gpu_order")
+        ):
+            raise RuntimeError("V4.1 GPU-order CPU arithmetic requires a rebuilt _cpu_moe extension")
+        if self.return_route_outputs and (
+            fmt != "ds_fp4" or not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_route_outputs")
+        ):
+            raise RuntimeError("CPU route outputs require DS-FP4 and a rebuilt _cpu_moe extension")
+        if dsfp4_activation_block_size not in (32, 128):
+            raise ValueError("DS-FP4 activation block size must be 32 or 128")
+        self.dsfp4_activation_block_size = int(dsfp4_activation_block_size)
+        if (
+            fmt == "ds_fp4"
+            and self.dsfp4_activation_block_size != 128
+            and not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_activation_block_size")
+        ):
+            raise RuntimeError(
+                "the compiled _cpu_moe extension does not support V4.1's 32-value "
+                "activation groups; rebuild it before using CPU or hybrid DS-FP4"
+            )
         if fmt not in _WFMT_IDS:
             raise NotImplementedError(
                 f"--moe-backend cpu/hybrid computes experts on the CPU and supports "
@@ -213,15 +275,27 @@ class CpuMoeExecutor:
                 )
                 self._flag_sync = False
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
-        coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
+        explicit_affinity = core_ids is not None
+        if explicit_affinity:
+            if not core_ids or len(set(core_ids)) != len(core_ids):
+                raise ValueError("CPU MoE needs nonempty, unique worker core ids")
+            if num_threads not in (0, len(core_ids)):
+                raise ValueError("CPU MoE worker core ids must match num_threads")
+            nthreads = len(core_ids)
+        else:
+            nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        coord_core = coordinator_core if self._flag_sync and coordinator_core is not None else -1
+        if self._flag_sync and not explicit_affinity and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
             # oversubscribing (workers drop from N to N-1).
             coord_core = core_ids[-1]
             nthreads -= 1
             core_ids = core_ids[:-1]
         self._coord_core = coord_core
+        self._mapped_handoff = (
+            self.dsfp4_gpu_order and self._flag_sync
+            and os.getenv("FREETOKEN_CPU_MOE_MAPPED_HANDOFF", "0") == "1"
+        )
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
             num_layers=self.num_layers,
@@ -239,6 +313,16 @@ class CpuMoeExecutor:
             **ptrs,
         )
         self.num_threads = nthreads
+        if fmt == "ds_fp4" and hasattr(self._ext, "set_dsfp4_activation_block_size"):
+            self._ext.set_dsfp4_activation_block_size(self.dsfp4_activation_block_size)
+        if self.return_route_outputs:
+            self._ext.set_dsfp4_route_outputs(True)
+        if self.dsfp4_gpu_order:
+            self._ext.set_dsfp4_gpu_order(True)
+        if self.dsfp4_route_parallel:
+            self._ext.set_dsfp4_route_parallel(True)
+        if self.dsfp4_fuse_prep:
+            self._ext.set_dsfp4_fuse_prep(True)
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
@@ -253,6 +337,7 @@ class CpuMoeExecutor:
 
         self._io: dict[int, dict[str, torch.Tensor]] = {}
         self._tasks: dict[tuple[int, int], int] = {}
+        self._mapped_active: dict[tuple[int, int], torch.Tensor] = {}
 
         # Flag-based handshake: mapped-pinned ready/done/err int64 arrays (one slot per
         # (MoE layer, decode batch size) pair, allocated as tasks are created) + a
@@ -458,10 +543,10 @@ class CpuMoeExecutor:
         return ptrs, (H, I)
 
     def _resolve_dsfp4_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
-        """DeepSeek-V4 ``ds_fp4`` schema: row-major e2m1 (2/byte) + e8m0 per-32 block
+        """DeepSeek-V4/V4.1 ``ds_fp4`` schema: row-major e2m1 + e8m0 per-32 block
         scales, no global, no bias. Layout matches nvfp4 (K contiguous per output row),
         so the C++ GEMV reads it in place. The kernel additionally FP8-round-trips the
-        activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
+        activations (V4 block 128, V4.1 block 32) to match the W4A8 reference."""
         gup, gus = banks["gate_up_packed"], banks["gate_up_scale"]
         dnp, dns = banks["down_packed"], banks["down_scale"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
@@ -469,7 +554,8 @@ class CpuMoeExecutor:
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
-        assert H % 128 == 0 and I % 128 == 0, (H, I)  # FP8 activation round-trip block=128
+        block = self.dsfp4_activation_block_size
+        assert H % block == 0 and I % block == 0, (H, I, block)
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
@@ -492,7 +578,10 @@ class CpuMoeExecutor:
                 "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
                 "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "y": alloc_pinned_tensor(
+                    *((bs, self.top_k, self.H) if self.return_route_outputs else (bs, self.H)),
+                    dtype=torch.bfloat16,
+                ),
             }
             self._io[bs] = io
         return io
@@ -533,7 +622,8 @@ class CpuMoeExecutor:
         the active CUDA graph (the two host nodes carry the data dependency on the
         pinned buffers, which hold this step's real routing on replay)."""
         pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
-        return self.decode_sync(pending)
+        output = self.decode_sync(pending)
+        return output.sum(dim=1) if self.return_route_outputs else output
 
     def decode_submit(
         self,
@@ -559,16 +649,30 @@ class CpuMoeExecutor:
             # pre-quantized activations and skips its serial scalar pass.
             from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
 
-            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
+            hidden_states = act_quant_fp8_roundtrip(
+                hidden_states, block=self.dsfp4_activation_block_size
+            )
 
+        task = self._task_for(layer_id, bs)
+        out = (
+            torch.empty(bs, self.top_k, self.H, dtype=hidden_states.dtype, device=self.device)
+            if self.return_route_outputs else torch.empty_like(hidden_states)
+        )
+        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
+        if self._mapped_handoff and bs == 1 and slot is not None:
+            from freetoken.moe import cpu_handoff
+            key = (layer_id, bs)
+            active = self._mapped_active.get(key)
+            if active is None:
+                active = torch.empty(1, dtype=torch.int32, device=self.device)
+                self._mapped_active[key] = active
+            cpu_handoff.submit(hidden_states, topk_ids.to(torch.int32),
+                topk_weights.to(torch.float32), io, self._done, self._ready, active, slot)
+            return (bs, task, out, slot, active)
         # D2H: ship this step's activations + routing to pinned host memory.
         io["x"].copy_(hidden_states, non_blocking=True)
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
-
-        task = self._task_for(layer_id, bs)
-        out = torch.empty_like(hidden_states)
-        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
             # doorbell). No kernel launched; no host-func round trip.
@@ -585,7 +689,7 @@ class CpuMoeExecutor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
         memop on done[slot] (set by the CPU coordinator); otherwise a cudaLaunchHostFunc."""
-        bs, task, out, slot = pending
+        bs, task, out, slot = pending[:4]
         if slot is not None:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
@@ -596,6 +700,10 @@ class CpuMoeExecutor:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
         io = self._io[bs]
+        if len(pending) == 5:
+            from freetoken.moe import cpu_handoff
+            cpu_handoff.pull(io, pending[4], out)
+            return out
         out.copy_(io["y"], non_blocking=True)
         return out
 

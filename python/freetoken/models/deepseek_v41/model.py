@@ -1437,19 +1437,29 @@ class DeepseekV41ExpertWorkerModel:
         ):
             return torch.zeros((1, 1), dtype=torch.float32, device=device)
         hidden_shape = (num_tokens, self.args.dim)
-        for layer_id, layer in enumerate(self.layers):
-            with profile_range(f"DSV41/Layer_{layer_id}/ExpertWorker"):
-                if layer_id in self.args.engram_layer_ids:
-                    if self.engram_coordinator.execution.participates_in_engram:
-                        with profile_range("DSV41/Engram/Worker"):
-                            self.engram_coordinator.worker_lookup(
-                                layer_id,
-                                num_tokens=num_tokens,
-                                hashes_per_token=self.args.engram_hashes_per_token,
-                                device=device,
-                            )
-                with profile_range("DSV41/MoE/Worker"):
-                    layer.worker_forward(hidden_shape, device)
+        try:
+            for layer_id, layer in enumerate(self.layers):
+                with profile_range(f"DSV41/Layer_{layer_id}/ExpertWorker"):
+                    if layer_id in self.args.engram_layer_ids:
+                        if self.engram_coordinator.execution.participates_in_engram:
+                            with profile_range("DSV41/Engram/Worker"):
+                                self.engram_coordinator.worker_lookup(
+                                    layer_id,
+                                    num_tokens=num_tokens,
+                                    hashes_per_token=self.args.engram_hashes_per_token,
+                                    device=device,
+                                )
+                    with profile_range("DSV41/MoE/Worker"):
+                        layer.worker_forward(hidden_shape, device)
+        finally:
+            # Rejoin every side stream before capture ends or the forward returns.
+            # This also seals cancellation/error boundaries. Shared-cache repeats
+            # are cheap no-ops after the first join; no idle CUDA work is added.
+            for layer in self.layers:
+                cache = getattr(getattr(layer, "experts", None), "offload_cache", None)
+                state = getattr(cache, "_dsv41_background_admission", None)
+                if state is not None:
+                    state.join()
         return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
 

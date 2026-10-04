@@ -38,13 +38,13 @@ class EngineConfig:
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 13.0
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
-    # Qwen EP block-FP8 only: prefills at or below this token count load just the
-    # routed experts into LRU slots and run the unchanged W8A8 grouped kernel over
-    # those slots. 0 disables the sparse short-prefill path.
+    # Qwen EP block-FP8 / DeepSeek-V4.1 EP DS-FP4: prefills at or below this token
+    # count load just routed experts into LRU slots, keeping the format's normal
+    # prefill kernels. 0 disables the sparse short-prefill path.
     moe_sparse_prefill_max_tokens: int = 0
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
-    # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
-    # the decode experts. 0 = auto (physical cores). Ignored by other backends.
+    # CPU/hybrid MoE: CPU worker threads per participating rank. 0 = auto,
+    # partitioning physical cores into disjoint pools for distributed execution.
     moe_cpu_threads: int = 0
     # Hybrid CPU/GPU decode (--moe-backend offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
@@ -58,6 +58,11 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # Restrict hybrid CPU assistance to these distributed ranks; None = all.
+    moe_hybrid_ranks: tuple[int, ...] | None = None
+    # 0 = any decode batch; a positive ceiling keeps larger verification batches
+    # on the original GPU path when CPU per-token GEMV cannot reuse expert rows.
+    moe_hybrid_max_bs: int = 0
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

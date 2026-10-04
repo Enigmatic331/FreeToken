@@ -920,8 +920,8 @@ def parse_args(
         type=int,
         default=ServerArgs.moe_cpu_threads,
         help=(
-            "Number of CPU worker threads for --moe-backend cpu decode experts. "
-            "0 = auto (physical cores)."
+            "Number of CPU worker threads per CPU/hybrid decode rank. "
+            "0 = auto (physical cores, partitioned across participating ranks)."
         ),
     )
 
@@ -953,6 +953,18 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--moe-hybrid-ranks",
+        type=_csv_nonnegative_ints,
+        default=ServerArgs.moe_hybrid_ranks,
+        help="Only these distributed ranks use hybrid CPU expert assistance; default: all.",
+    )
+    parser.add_argument(
+        "--moe-hybrid-max-bs",
+        type=_nonnegative_int,
+        default=ServerArgs.moe_hybrid_max_bs,
+        help="Largest hybrid decode batch; 0 = any, 1 keeps MTP verification on GPU.",
+    )
     parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
@@ -998,9 +1010,10 @@ def parse_args(
         type=_nonnegative_int,
         default=ServerArgs.moe_sparse_prefill_max_tokens,
         help=(
-            "For Qwen EP block-FP8 offload, prefills no larger than this many "
+            "For Qwen EP block-FP8 or DeepSeek-V4.1 EP DS-FP4 offload, "
+            "prefills no larger than this many "
             "tokens load only routed experts into the LRU cache and retain the "
-            "W8A8 grouped-prefill kernel. 0 (default) disables the path."
+            "normal prefill kernels. 0 (default) disables the path."
         ),
     )
 

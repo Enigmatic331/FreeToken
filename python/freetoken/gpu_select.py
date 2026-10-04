@@ -179,8 +179,8 @@ def rank_local_cuda_plan(
     """Return this rank's UUID visibility mask and local vision ordinal.
 
     The assigned text GPU is always first, hence local ``cuda:0``.  Only the
-    vision owner can see the auxiliary vision GPU; when text and vision share a
-    physical GPU its ordinal is also zero and the UUID is not duplicated.  With
+    vision owner loads the auxiliary vision tower. When its GPU is already in
+    the text peer list, reuse that ordinal rather than duplicating its UUID. With
     ``text_peer_visibility``, the other text GPUs follow the assigned GPU.  This
     preserves the local workload on ``cuda:0`` while giving NCCL a complete
     text topology for per-pair P2P validation.
@@ -210,9 +210,15 @@ def rank_local_cuda_plan(
         )
     vision_ordinal = None
     if rank == vision_owner_rank and vision_uuid is not None:
-        if vision_uuid.upper() != text_uuid.upper():
+        existing = next(
+            (index for index, uuid in enumerate(visible)
+             if uuid.upper() == vision_uuid.upper()),
+            None,
+        )
+        if existing is None:
             visible.append(vision_uuid)
-        vision_ordinal = len(visible) - 1
+            existing = len(visible) - 1
+        vision_ordinal = existing
     if rank == vision_owner_rank:
         known = {uuid.upper() for uuid in visible}
         for uuid in auxiliary_uuids:

@@ -860,6 +860,84 @@ dsdot_fn select_dsdot() {
   return dot_dsfp4_scalar;
 }
 
+#if CPU_MOE_X86
+// CPU vectorization across output rows preserves the production DSV4 decode
+// GEMV's reduction order (BN=16, KB=128, one warp). Transpose just eight native
+// rows into worker-local scratch; no second full-model weight bank is needed.
+inline void dsfp4_transpose8(uint8_t* dst, const uint8_t* src, int row_bytes) {
+  int j = 0;
+  for (; j + 16 <= row_bytes; j += 16) {
+    __m128i a[8], b[8];
+    for (int pair = 0; pair < 4; ++pair) {
+      auto x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + pair * 2 * row_bytes + j));
+      auto y = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + (pair * 2 + 1) * row_bytes + j));
+      a[pair * 2] = _mm_unpacklo_epi8(x, y);
+      a[pair * 2 + 1] = _mm_unpackhi_epi8(x, y);
+    }
+    for (int group = 0; group < 2; ++group) {
+      const int k = group * 4;
+      b[k] = _mm_unpacklo_epi16(a[k], a[k + 2]);
+      b[k + 1] = _mm_unpackhi_epi16(a[k], a[k + 2]);
+      b[k + 2] = _mm_unpacklo_epi16(a[k + 1], a[k + 3]);
+      b[k + 3] = _mm_unpackhi_epi16(a[k + 1], a[k + 3]);
+    }
+    for (int k = 0; k < 4; ++k) {
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + j * 8 + k * 32),
+                      _mm_unpacklo_epi32(b[k], b[k + 4]));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + j * 8 + k * 32 + 16),
+                      _mm_unpackhi_epi32(b[k], b[k + 4]));
+    }
+  }
+  for (; j < row_bytes; ++j)
+    for (int r = 0; r < 8; ++r) dst[j * 8 + r] = src[r * row_bytes + j];
+}
+
+__attribute__((target("avx2,fma")))
+void dsfp4_gpu_order_rows8(float* out, const uint8_t* native_p, const uint8_t* native_s,
+                           const float* xe, const float* xo, int K,
+                           const float* e2m1, const float* e8m0, float weight) {
+  thread_local std::vector<uint8_t> packed_temp, scale_temp;
+  if (packed_temp.size() < (size_t)K * 4) packed_temp.resize((size_t)K * 4);
+  if (scale_temp.size() < (size_t)(K / 32) * 8) scale_temp.resize((size_t)(K / 32) * 8);
+  dsfp4_transpose8(packed_temp.data(), native_p, K / 2);
+  dsfp4_transpose8(scale_temp.data(), native_s, K / 32);
+  const auto* packed = packed_temp.data();
+  const auto* scale = scale_temp.data();
+  const __m256 mag = _mm256_loadu_ps(e2m1);
+  const __m256i mask = _mm256_set1_epi32(15);
+  __m256 total = _mm256_setzero_ps();
+  for (int start = 0; start < K / 2; start += 128) {
+    __m256 sums[4], sc;
+    for (int t = 0; t < 64; ++t) {
+      const int j = start + (t == 0 ? 2 : t == 1 ? 0 : 2 * t);
+      if (t < 2 || (j % 16) == 0) {
+        const auto codes = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(scale + (j / 16) * 8)));
+        sc = _mm256_i32gather_ps(e8m0, codes, 4);
+      }
+      for (int parity = 0; parity < 2; ++parity) {
+        const auto p = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(packed + (j + parity) * 8)));
+        const auto lo = _mm256_mul_ps(e2m1_decode8(_mm256_and_si256(p, mask), mag), sc);
+        const auto hi = _mm256_mul_ps(e2m1_decode8(_mm256_srli_epi32(p, 4), mag), sc);
+        const auto a = _mm256_set1_ps(xe[j + parity]);
+        const auto b = _mm256_set1_ps(xo[j + parity]);
+        if (t == 0) {
+          sums[parity] = _mm256_mul_ps(lo, a);
+          sums[2 + parity] = _mm256_mul_ps(hi, b);
+        } else {
+          sums[parity] = _mm256_fmadd_ps(lo, a, sums[parity]);
+          sums[2 + parity] = _mm256_fmadd_ps(hi, b, sums[2 + parity]);
+        }
+      }
+    }
+    total = _mm256_add_ps(total, _mm256_add_ps(sums[0], sums[1]));
+    total = _mm256_add_ps(total, _mm256_add_ps(sums[2], sums[3]));
+  }
+  _mm256_storeu_ps(out, _mm256_mul_ps(total, _mm256_set1_ps(weight)));
+}
+#endif
+
 // ------------------------- mxfp4 (gpt-oss) GEMV -----------------------------
 // Transposed split-K layout: blk[Kpairs, N2] (N innermost), scl[Kpairs/16, N2]
 // e8m0 per 32-K. Computes out[c] = sum_kb (E2M1[lo]*x[2kb] + E2M1[hi]*x[2kb+1])
@@ -1047,11 +1125,12 @@ inline void deinterleave_bf16_f32(const bf16_t* src, float* even, float* odd, in
   }
 }
 
-// DeepSeek-V4 activation FP8 round-trip (bf16 in/out): per 128-block,
+// DeepSeek activation FP8 round-trip (bf16 in/out): V4 uses blocks of 128,
+// V4.1 uses blocks of 32, independently of the packed weight block geometry.
 // s = 2^ceil(log2(max(|x|,1e-4)/448)); y = round_e4m3(clamp(x/s,+-448)) * s.
-void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K) {
-  for (int b0 = 0; b0 < K; b0 += 128) {
-    const int b1 = std::min(K, b0 + 128);
+void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K, int block_size) {
+  for (int b0 = 0; b0 < K; b0 += block_size) {
+    const int b1 = std::min(K, b0 + block_size);
     float amax = 1e-4f;
     for (int i = b0; i < b1; ++i) amax = std::max(amax, std::fabs(bf16_to_f32(src[i])));
     const float s = std::ldexp(1.0f, ceil_log2_pos(amax * (1.0f / 448.0f)));
@@ -1259,6 +1338,13 @@ struct CpuMoeExecutor {
   // it to a captured GPU elementwise kernel removes it while keeping the official
   // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
+  int dsfp4_activation_block_size = 128;
+  bool dsfp4_route_outputs = false;
+  bool dsfp4_gpu_order = false;
+  bool dsfp4_route_parallel = false;
+  bool dsfp4_route_parallel_task = false;
+  bool dsfp4_fuse_prep = false;
+  bool dsfp4_fuse_prep_task = false;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
@@ -1767,6 +1853,36 @@ struct CpuMoeExecutor {
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const float lim = swiglu_limit;
+#if CPU_MOE_X86
+    if (dsfp4_gpu_order) {
+      for (int i = i0; i < i1; i += 8) {
+        float gates[8], ups[8];
+        dsfp4_gpu_order_rows8(gates, gp + (size_t)i * Hh, gs + (size_t)i * Hs,
+                             xe, xo, H, e2m1_lut, e8m0_lut, 1.f);
+        dsfp4_gpu_order_rows8(ups, gp + (size_t)(I + i) * Hh, gs + (size_t)(I + i) * Hs,
+                             xe, xo, H, e2m1_lut, e8m0_lut, 1.f);
+        for (int c = 0; c < 8; ++c) {
+          float gate = bf16_to_f32(f32_to_bf16(gates[c]));
+          float up = bf16_to_f32(f32_to_bf16(ups[c]));
+          if (lim > 0.f) {
+            gate = std::min(gate, lim);
+            up = std::min(std::max(up, -lim), lim);
+          }
+          g_row[i + c] = f32_to_bf16((gate / (1.f + std::exp(-gate))) * up);
+        }
+      }
+      if (dsfp4_fuse_prep_task) {
+        // IBLK equals the native 32-value activation group. Each worker owns a
+        // complete group, so its FP8 round-trip and deinterleave need no route-
+        // wide dependency. Keep every BF16 rounding and scalar operation intact.
+        fp8_roundtrip_bf16(g_row + i0, g_row + i0, i1 - i0, 32);
+        const size_t offset = ((size_t)tok * top_k + k) * (I / 2) + i0 / 2;
+        deinterleave_bf16_f32(g_row + i0, ge_scratch.data() + offset,
+                              go_scratch.data() + offset, i1 - i0);
+      }
+      return;
+    }
+#endif
     for (int i = i0; i < i1; ++i) {
       // gate_up is stored bf16 by the reference GEMV before swiglu; round to match.
       float gate = bf16_to_f32(f32_to_bf16(
@@ -1793,7 +1909,8 @@ struct CpuMoeExecutor {
                  gas_scratch.data() + (size_t)r * (I / 32));
       return;
     }
-    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
+    if (fmt == WF_DSFP4)
+      fp8_roundtrip_bf16(g, g, I, dsfp4_activation_block_size);
     float* ge = ge_scratch.data() + (size_t)r * (I / 2);
     float* go = go_scratch.data() + (size_t)r * (I / 2);
     deinterleave_bf16_f32(g, ge, go, I);
@@ -1804,7 +1921,10 @@ struct CpuMoeExecutor {
 
   void do_pass2_dsfp4(const MoeTask* t, int64_t p) {
     const int64_t hb = p % n_hblk;
-    const int tok = static_cast<int>(p / n_hblk);
+    const int row = static_cast<int>(p / n_hblk);
+    const int tok = dsfp4_route_parallel_task ? row / top_k : row;
+    const int first_route = dsfp4_route_parallel_task ? row % top_k : 0;
+    const int last_route = dsfp4_route_parallel_task ? first_route + 1 : top_k;
     const int Ih = I / 2, Is = I / 32;
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
@@ -1812,11 +1932,44 @@ struct CpuMoeExecutor {
     const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
     const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
+#if CPU_MOE_X86
+    if (dsfp4_gpu_order) {
+      for (int h = h0; h < h1; h += 8) {
+        float acc[8] = {};
+        for (int k = first_route; k < last_route; ++k) {
+          const int e = t->ids[(size_t)tok * top_k + k];
+          if (e < 0 || e >= num_experts) {
+            if (dsfp4_route_outputs)
+              std::fill_n(t->y + ((size_t)tok * top_k + k) * H + h, 8, bf16_t(0));
+            continue;
+          }
+          float part[8];
+          const auto* ge = ge_scratch.data() + ((size_t)tok * top_k + k) * Ih;
+          const auto* go = go_scratch.data() + ((size_t)tok * top_k + k) * Ih;
+          dsfp4_gpu_order_rows8(part, dn_packed_l + ((size_t)e * H + h) * Ih,
+                               dn_scale_l + ((size_t)e * H + h) * Is,
+                               ge, go, I, e2m1_lut, e8m0_lut, t->w[(size_t)tok * top_k + k]);
+          for (int c = 0; c < 8; ++c) {
+            const auto weighted = f32_to_bf16(part[c]);
+            if (dsfp4_route_outputs) t->y[((size_t)tok * top_k + k) * H + h + c] = weighted;
+            else acc[c] += bf16_to_f32(weighted);
+          }
+        }
+        if (!dsfp4_route_outputs)
+          for (int c = 0; c < 8; ++c) y_row[h + c] = f32_to_bf16(acc[c]);
+      }
+      return;
+    }
+#endif
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
         const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-        if (e < 0 || e >= num_experts) continue;
+        if (e < 0 || e >= num_experts) {
+          if (dsfp4_route_outputs)
+            t->y[((size_t)tok * top_k + k) * H + h] = bf16_t(0);
+          continue;
+        }
         const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
         const float* ge = ge_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
         const float* go = go_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
@@ -1824,9 +1977,13 @@ struct CpuMoeExecutor {
         const uint8_t* ds = dn_scale_l + (size_t)e * (size_t)H * Is + (size_t)h * Is;
         // The reference rounds each route's weighted down output to bf16 before the
         // fp32 sum over routes (down [T, top_k, H] bf16 -> .sum(dim=1)).
-        acc += bf16_to_f32(f32_to_bf16(dsdot(dp, ds, ge, go, I, e2m1_lut, e8m0_lut) * wt));
+        const bf16_t weighted = f32_to_bf16(dsdot(dp, ds, ge, go, I, e2m1_lut, e8m0_lut) * wt);
+        if (dsfp4_route_outputs)
+          t->y[((size_t)tok * top_k + k) * H + h] = weighted;
+        else
+          acc += bf16_to_f32(weighted);
       }
-      y_row[h] = f32_to_bf16(acc);
+      if (!dsfp4_route_outputs) y_row[h] = f32_to_bf16(acc);
     }
   }
 
@@ -1841,7 +1998,7 @@ struct CpuMoeExecutor {
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
     // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
     // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8) {
+    if ((needs_di || use_q4a8) && !dsfp4_fuse_prep_task) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
@@ -1880,6 +2037,21 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t) {
+    // Hybrid decode often has no overflow. Do not wake every worker or run
+    // three barriers for an empty task. The pool is idle at submit, and keeping
+    // cur_gen unchanged also prevents a spurious wake from running a stale task.
+    bool any_active = false;
+    for (int n = 0; n < t->num_tokens * top_k; ++n) {
+      if (t->ids[n] >= 0 && t->ids[n] < num_experts && t->w[n] != 0.0f) {
+        any_active = true;
+        break;
+      }
+    }
+    if (!any_active) {
+      std::fill_n(t->y, static_cast<size_t>(t->num_tokens) * H *
+                  (dsfp4_route_outputs ? top_k : 1), bf16_t(0));
+      return;
+    }
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -1889,6 +2061,16 @@ struct CpuMoeExecutor {
     if (need > g_scratch.size()) g_scratch.resize(need);
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
+    // Independent route outputs have disjoint writes. Scheduling a route/tile
+    // pair separately preserves each GEMV's accumulation and BF16 rounding,
+    // while letting idle workers take another route instead of a serial k loop.
+    // Larger token batches retain the existing, separately qualified schedule.
+    dsfp4_route_parallel_task = dsfp4_route_parallel && dsfp4_gpu_order &&
+        dsfp4_route_outputs && dsfp4_activation_block_size == 32 && t->num_tokens == 1;
+    dsfp4_fuse_prep_task = dsfp4_fuse_prep && fmt == WF_DSFP4 && dsfp4_gpu_order &&
+        dsfp4_route_outputs && dsfp4_activation_block_size == IBLK &&
+        IBLK == 32 && !use_vnni && t->num_tokens == 1;
+    if (dsfp4_route_parallel_task) p2_total *= top_k;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
@@ -1918,7 +2100,7 @@ struct CpuMoeExecutor {
         const bf16_t* src = t->x + (size_t)tok * H;
         if (ds) {  // DSV4 FP8-round-trips the input before the gate_up GEMV
           bf16_t* xq = xq_scratch.data() + (size_t)tok * H;
-          fp8_roundtrip_bf16(src, xq, H);
+          fp8_roundtrip_bf16(src, xq, H, dsfp4_activation_block_size);
           src = xq;
         }
         float* xe = xe_scratch.data() + (size_t)tok * (H / 2);
@@ -2134,6 +2316,46 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
+      .def("set_dsfp4_activation_block_size",
+           [](CpuMoeExecutor& e, int block_size) {
+             if (block_size != 32 && block_size != 128)
+               throw std::invalid_argument("DS-FP4 activation block size must be 32 or 128");
+             e.dsfp4_activation_block_size = block_size;
+           }, py::arg("block_size"))
+      .def("set_dsfp4_route_outputs",
+           [](CpuMoeExecutor& e, bool value) {
+             if (value && e.fmt != WF_DSFP4)
+               throw std::invalid_argument("route outputs require DS-FP4");
+             e.dsfp4_route_outputs = value;
+           }, py::arg("value"))
+      .def("set_dsfp4_gpu_order",
+           [](CpuMoeExecutor& e, bool value) {
+             if (value) {
+               if (e.fmt != WF_DSFP4 || e.H != 5120 || e.I != 2304)
+                 throw std::invalid_argument("GPU-order CPU kernel is qualified only for V4.1 H=5120 I=2304");
+#if CPU_MOE_X86
+               if (pick_isa() < ISA_AVX2)
+                 throw std::invalid_argument("GPU-order CPU kernel requires AVX2/FMA");
+#else
+               throw std::invalid_argument("GPU-order CPU kernel requires x86 AVX2/FMA");
+#endif
+             }
+             e.dsfp4_gpu_order = value;
+           }, py::arg("value"))
+      .def("set_dsfp4_route_parallel",
+           [](CpuMoeExecutor& e, bool value) {
+             if (value && (!e.dsfp4_gpu_order || !e.dsfp4_route_outputs ||
+                           e.dsfp4_activation_block_size != 32))
+               throw std::invalid_argument("parallel CPU routes require V4.1 GPU-order route outputs");
+             e.dsfp4_route_parallel = value;
+           }, py::arg("value"))
+      .def("set_dsfp4_fuse_prep",
+           [](CpuMoeExecutor& e, bool value) {
+             if (value && (!e.dsfp4_gpu_order || !e.dsfp4_route_outputs ||
+                           e.dsfp4_activation_block_size != 32))
+               throw std::invalid_argument("fused CPU preparation requires V4.1 GPU-order route outputs");
+             e.dsfp4_fuse_prep = value;
+           }, py::arg("value"))
       .def("isa_name", &CpuMoeExecutor::isa_name);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),

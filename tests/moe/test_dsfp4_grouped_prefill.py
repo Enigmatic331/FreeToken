@@ -147,3 +147,57 @@ def test_grouped_prefill_can_preserve_weighted_route_outputs():
 
     assert routes.shape == (*slots.shape, x.shape[-1])
     torch.testing.assert_close(routes.sum(dim=1), combined)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("geometry", [(1024, 512), (1024, 768), (5120, 2304)])
+@pytest.mark.parametrize("tokens", [128, 4096])
+def test_projection_workspace_exact_against_separate_buffers(geometry, tokens):
+    """Alias both width orders, including Flash's formerly unshared down buffer."""
+    import freetoken.moe.fused_ds_fp4 as fmod
+    from freetoken.kernel.triton.dsv4.fp8_linear import (
+        act_quant_fp8_inplace, act_quant_fp8_roundtrip,
+    )
+    from freetoken.kernel.triton.dsv4.fused_moe import fused_swiglu
+
+    hidden, intermediate = geometry
+    experts, routes = 8, 6
+    generator = torch.Generator(device="cpu").manual_seed(47)
+
+    def u8(*shape, low=0, high=256):
+        return torch.randint(low, high, shape, dtype=torch.uint8,
+                             generator=generator).cuda()
+
+    gu = u8(experts, 2 * intermediate, hidden // 2)
+    gus = u8(experts, 2 * intermediate, hidden // 32, low=122, high=129)
+    dp = u8(experts, hidden, intermediate // 2)
+    ds = u8(experts, hidden, intermediate // 32, low=122, high=129)
+    x = (torch.randn(tokens, hidden, dtype=torch.bfloat16,
+                     generator=generator) * .2).cuda()
+    slots = torch.randint(experts, (tokens, routes), dtype=torch.int32,
+                          generator=generator).cuda()
+    weights = torch.rand(tokens, routes, generator=generator).cuda()
+    weights /= weights.sum(-1, keepdim=True)
+    # Include inactive routes and duplicates in the full production-size tile.
+    weights[:, -1] = 0
+    slots[:, -1] = slots[:, 0]
+    cfg = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+               GROUP_SIZE_M=8, num_warps=8, num_stages=1)
+    si, ei, ntpp = fmod.moe_align_block_size(slots, 64, experts)
+    tw = weights.reshape(-1)
+    quantized = act_quant_fp8_roundtrip(x.clone(), 32)
+    gate_up = torch.empty(tokens, routes, 2 * intermediate,
+                          dtype=x.dtype, device=x.device)
+    fmod._grouped_prefill(quantized, gu, gus, gate_up, tw, si, ei, ntpp,
+                         tokens * routes, routes, False, cfg)
+    activation = fused_swiglu(gate_up, LIMIT).reshape(tokens * routes, intermediate)
+    act_quant_fp8_inplace(activation, 32)
+    separate = torch.empty(tokens, routes, hidden, dtype=x.dtype, device=x.device)
+    fmod._grouped_prefill(activation, dp, ds, separate, tw, si, ei, ntpp,
+                         tokens * routes, 1, True, cfg)
+    aliased = fmod.routed_experts_fp4_prefill(x.clone(), slots, weights,
+        gu, gus, dp, ds, LIMIT, experts, return_route_outputs=True,
+        activation_block_size=32)
+    torch.cuda.synchronize()
+    assert torch.isfinite(separate).all() and torch.isfinite(aliased).all()
+    assert torch.equal(separate, aliased)

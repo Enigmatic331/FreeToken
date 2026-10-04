@@ -240,7 +240,9 @@ def test_ep_offload_sanitizes_inactive_route_ids_before_kernels(monkeypatch, pat
     )
 
 
-def test_ep_fp8_short_prefill_uses_sparse_slot_cache_and_restores_sentinel():
+@pytest.mark.parametrize("quant_format", ["fp8_block", "ds_fp4"])
+@pytest.mark.parametrize("skip_inactive", [False, True])
+def test_ep_short_prefill_uses_sparse_slot_cache(quant_format, skip_inactive):
     calls = {}
 
     class FakeCache:
@@ -287,7 +289,8 @@ def test_ep_fp8_short_prefill_uses_sparse_slot_cache_and_restores_sentinel():
     layer = object.__new__(ExpertParallelOffloadMoELayer)
     layer.layer_id = 3
     layer.offload_cache = FakeCache()
-    layer.skip_inactive_prefill_routes = True
+    layer.offload_cache.quant_format = quant_format
+    layer.skip_inactive_prefill_routes = skip_inactive
     layer._expert_gemm = MethodType(fake_expert_gemm, layer)
     hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
     weights = torch.tensor([[0.2, 0.0, 0.3], [0.0, 0.4, 0.0]])
@@ -304,10 +307,12 @@ def test_ep_fp8_short_prefill_uses_sparse_slot_cache_and_restores_sentinel():
     assert calls["gemm"]["views"] == ("slot-banks",)
     assert calls["gemm"]["n"] == 32
     assert calls["gemm"]["is_prefill"] is True
-    assert torch.equal(
-        calls["gemm"]["ids"],
-        torch.tensor([[11, 32, 12], [32, 13, 32]], dtype=torch.int32),
+    expected = (
+        [[11, 32, 12], [32, 13, 32]]
+        if skip_inactive and quant_format == "fp8_block"
+        else [[11, 11, 12], [13, 13, 13]]
     )
+    assert torch.equal(calls["gemm"]["ids"], torch.tensor(expected, dtype=torch.int32))
 
 
 def test_ep_sparse_prefill_threshold_falls_back_to_whole_layer(monkeypatch):

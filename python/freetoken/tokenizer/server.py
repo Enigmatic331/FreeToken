@@ -53,6 +53,13 @@ def _prompt_admitted_reply(msg: PromptAdmittedMsg) -> UserReply:
 def _error_reply(msg: ErrorReplyMsg) -> UserReply:
     return UserReply(
         uid=msg.uid, incremental_output="", finished=True, error=msg.error, error_code=msg.code,
+        kv_used_pages=msg.kv_used_pages,
+        kv_total_pages=msg.kv_total_pages,
+        mamba_used_slots=msg.mamba_used_slots,
+        mamba_total_slots=msg.mamba_total_slots,
+        swa_used_tokens=msg.swa_used_tokens,
+        swa_total_tokens=msg.swa_total_tokens,
+        gpu_mem_bytes=msg.gpu_mem_bytes,
     )
 
 

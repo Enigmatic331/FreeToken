@@ -119,6 +119,9 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # An idle heartbeat does not mutate the cache. Check it once on entry,
+        # then leave the GPU asleep until messages or scheduled work resume.
+        self._idle_checks_done = False
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -153,9 +156,12 @@ class Scheduler(SchedulerIOMixin):
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
+        if self._idle_checks_done:
+            return
         self._log_moe_cache_stats()
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        self._idle_checks_done = True
 
     def _log_moe_cache_stats(self) -> None:
         cache = self.engine.moe_offload_cache
@@ -264,8 +270,17 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
         )
-        for msg in self.receive_msg(blocking=blocking):
+        messages = self.receive_msg(blocking=blocking)
+        if messages or not blocking:
+            self._idle_checks_done = False
+        for msg in messages:
             self._process_one_msg(msg)
+
+        # The CPU/Gloo heartbeat must keep progressing, but an empty idle
+        # iteration has no CUDA work to order. Recording stream events here
+        # would wake each GPU every second despite the unchanged cache.
+        if blocking and not messages:
+            return None
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -318,8 +333,15 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
         )
-        for msg in self.receive_msg(blocking=blocking):
+        messages = self.receive_msg(blocking=blocking)
+        if messages or not blocking:
+            self._idle_checks_done = False
+        for msg in messages:
             self._process_one_msg(msg)
+
+        if blocking and not messages:
+            self._flush_abort_acks()
+            return
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
@@ -1156,9 +1178,26 @@ class Scheduler(SchedulerIOMixin):
         pending = getattr(self, "_pending_abort_acks", None)
         if not pending:
             return
+        # This terminal barrier follows _process_last_data, including deferred
+        # frees. Report the actual pool snapshot, not zero by assumption: other
+        # requests or protected prefixes may still own pages. The empty idle
+        # heartbeat returns above and performs no occupancy/GPU-memory query.
+        used, total = self._kv_usage_pages()
+        mamba_used, mamba_total = self._mamba_slot_usage() or (0, 0)
+        swa_used, swa_total = self._swa_token_usage() or (0, 0)
+        mem = self._gpu_mem_bytes()
         uids = sorted(pending)
         pending.clear()
-        self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
+        self.send_result([
+            ErrorReplyMsg(
+                uid=uid, error="request aborted",
+                kv_used_pages=used, kv_total_pages=total,
+                mamba_used_slots=mamba_used, mamba_total_slots=mamba_total,
+                swa_used_tokens=swa_used, swa_total_tokens=swa_total,
+                gpu_mem_bytes=mem,
+            )
+            for uid in uids
+        ])
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input

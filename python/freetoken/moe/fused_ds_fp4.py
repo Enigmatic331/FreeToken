@@ -3,11 +3,14 @@
 Composes the DeepSeek-FP4 fused-MoE kernels (``dsv4_fused_moe``) into the full
 routed-expert path: ``gate_up -> swiglu(limit) -> down``, reading expert weights
 directly from the resident banks (no bf16 materialization). ``slots`` maps each
-(token, route) to a bank row: a cache slot for the decode GEMV path, a
-streamed full-layer position (== expert id) for the grouped prefill path.
+(token, route) to a bank row: a cache slot for decode or selective short prefill,
+or a streamed full-layer position (== expert id) for bulk prefill.
 """
 
 from __future__ import annotations
+
+from functools import lru_cache
+import os
 
 import torch
 import triton
@@ -25,6 +28,20 @@ from freetoken.kernel.triton.dsv4.fused_moe import (
 from freetoken.moe.fused import moe_align_block_size
 
 _TL_DTYPE = None
+_SKIP_ZERO_ROUTES = os.environ.get("FREETOKEN_DSV41_SKIP_ZERO_ROUTES", "0") == "1"
+
+
+@lru_cache(maxsize=None)
+def _zero_route_device_supported(device: torch.device) -> bool:
+    # Query only the input's device, never another rank's CUDA device.
+    return torch.cuda.get_device_capability(device) in ((12, 0), (8, 9))
+
+
+def _use_zero_route_skip(tokens: int, activation_block_size: int, device: torch.device) -> bool:
+    return (
+        _SKIP_ZERO_ROUTES and tokens == 1 and activation_block_size == 32
+        and device.type == "cuda" and _zero_route_device_supported(device)
+    )
 
 
 def _compute_type(dtype: torch.dtype):
@@ -46,6 +63,7 @@ def _grouped_decode(
     *,
     a_row_is_route: bool,
     mul_routed_weight: bool,
+    skip_zero_weight: bool = False,
 ) -> torch.Tensor:
     """Grouped per-route GEMM ``c[t,r,:] = a[row] @ dequant(W[slot])^T``.
 
@@ -59,6 +77,7 @@ def _grouped_decode(
     dtype = a.dtype
     out = torch.empty((T, top_k, N), dtype=dtype, device=a.device)
     if topk_weights is None:
+        assert not skip_zero_weight, "Zero-route skipping needs real route weights"
         topk_weights = out.new_empty((1, 1), dtype=torch.float32)
     scale_u8 = scale_cache.view(torch.uint8)
 
@@ -89,6 +108,7 @@ def _grouped_decode(
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_compute_type(dtype),
+        SKIP_ZERO_WEIGHT=skip_zero_weight,
         num_warps=_NW,
     )
     return out
@@ -105,6 +125,7 @@ def routed_experts_fp4(
     swiglu_limit: float,
     return_route_outputs: bool = False,
     activation_block_size: int = 128,
+    *, skip_zero_weight: bool | None = None,
 ) -> torch.Tensor:
     """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
@@ -117,13 +138,18 @@ def routed_experts_fp4(
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
+    skip_zero = (
+        _use_zero_route_skip(T, activation_block_size, x.device)
+        if skip_zero_weight is None else skip_zero_weight
+    )
 
     x = act_quant_fp8_roundtrip(
         x, activation_block_size
     )  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = _grouped_decode(
-        x, gate_up_packed, gate_up_scale, slots, None,
+        x, gate_up_packed, gate_up_scale, slots, topk_weights if skip_zero else None,
         a_row_is_route=False, mul_routed_weight=False,
+        skip_zero_weight=skip_zero,
     )  # [T, top_k, 2I]
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
     # SwiGLU writes independent storage.  End the larger gate/up tensor's
@@ -138,6 +164,7 @@ def routed_experts_fp4(
     down = _grouped_decode(
         act, down_packed, down_scale, slots, topk_weights,
         a_row_is_route=True, mul_routed_weight=True,
+        skip_zero_weight=skip_zero,
     )  # [T, top_k, H]
     return down if return_route_outputs else down.sum(dim=1)
 
@@ -228,7 +255,14 @@ def routed_experts_fp4_prefill(
         BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
         num_warps=8, num_stages=1,
     )
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(slots, cfg["BLOCK_SIZE_M"], num_rows)
+    # Slot caches can have thousands of rows rather than one layer's few
+    # hundred experts. The optional native aligner leaves routes unwritten at
+    # the large cache geometries; keep its qualified full-bank path unchanged
+    # and use the generic Triton sorter for these expanded slot dimensions.
+    align = moe_align_block_size
+    if num_rows >= 1024:
+        from freetoken.kernel.triton.moe_align import moe_align_block_size as align
+    sorted_ids, expert_ids, ntpp = align(slots, cfg["BLOCK_SIZE_M"], num_rows)
     tw = topk_weights.reshape(-1).contiguous()
 
     x = act_quant_fp8_roundtrip(

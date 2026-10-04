@@ -27,6 +27,56 @@ def _initialize(module):
             value.data.normal_(0, 0.03)
 
 
+@pytest.mark.parametrize("length", [80, 128])
+def test_startup_prefill_fits_reserved_page_without_real_slot_allocation(length):
+    from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
+    from freetoken.core import Context, get_global_ctx, set_global_ctx
+    from freetoken.engine.engine import _prefill_warmup_slot_start
+    from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
+    from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
+    from freetoken.models.deepseek_v41.args import DeepseekV41Args
+    from freetoken.models.deepseek_v41.attention_layout import AttentionLayout
+    from freetoken.models.deepseek_v41.model import Attention, shared_attention
+
+    args = DeepseekV41Args(max_batch_size=1, max_seq_len=256, vocab_size=64,
+        dim=64, moe_inter_dim=32, n_layers=3, n_heads=2, n_routed_experts=4,
+        n_activated_experts=2, q_lora_rank=64, head_dim=64, rope_head_dim=16,
+        o_groups=1, o_lora_rank=32, window_size=128, compress_ratios=(0, 2, 2),
+        kv_source_layers=(1,), index_source_layers=(1,), index_n_heads=2,
+        index_head_dim=32, index_topk=2, candidate_source_layer=1,
+        candidate_topk_blocks=1, candidate_block_size=2,
+        engram_layer_ids=(), engram_num_embeddings=())
+    sizes = dsv41_pool_sizes(3, args, 1.0, P=128, n_win_pages=3)
+    pool = DSV41PagedKVCache(sizes, args, torch.device("cuda"), P=128, n_scratch=2)
+    dummy_base = sizes.full_token - 128
+    window_base = sizes.n_win_slots - 128
+    pool.bind_window_pages(dummy_base, window_base)
+    pool.full_loc_map = torch.full((2, 256), dummy_base, device="cuda", dtype=torch.int32)
+    start = _prefill_warmup_slot_start(pool, dummy_base, length)
+    pool.full_loc_map[1, :length] = torch.arange(start, start + length, device="cuda")
+    try:
+        ctx = get_global_ctx()
+    except AssertionError:
+        ctx = Context(page_size=128)
+        set_global_ctx(ctx)
+    ctx.kv_cache = pool
+    ctx.attn_backend = DSV41SparseAttnBackend(SimpleNamespace(dsv41_args=args))
+    with torch.device("cuda"):
+        attention = Attention(args, 1, AttentionLayout(args))
+    _initialize(attention)
+    attention.bind(torch.device("cuda"))
+    shared_attention.reset()
+    hidden = torch.randn(1, length, 64, device="cuda", dtype=torch.bfloat16)
+    output = attention.prefill_single(hidden, start_pos=0, table_idx=1)
+    torch.cuda.synchronize()
+    assert output.shape == hidden.shape and torch.isfinite(output).all()
+    assert torch.all(pool.full_to_window[:dummy_base] == -1)
+    assert torch.count_nonzero(pool.window_pool[1][:window_base]) == 0
+    assert torch.count_nonzero(pool.cmp_pool[1][:dummy_base // 2]) == 0
+    assert torch.count_nonzero(pool.idx_pool[1][:dummy_base // 2]) == 0
+    assert torch.count_nonzero(pool.cmp_pool[1][dummy_base // 2:]) > 0
+
+
 def test_source_layer_prefill_populates_only_source_pools_and_attends():
     from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
     from freetoken.core import Context, get_global_ctx, set_global_ctx

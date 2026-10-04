@@ -7,6 +7,7 @@ per-step integer split (GPU kernel vs CPU reference mirror, and the balance rule
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +16,53 @@ from freetoken.moe.bench_profile import default_profile_path, load_backend_recom
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 Q = 1 << 16
+
+
+@pytest.mark.parametrize("route_executor,ep_routes", [(False, False), (True, False), (True, True)])
+def test_hybrid_merge_preserves_layer_output_contract(route_executor, ep_routes):
+    """EP keeps route geometry until its collective; ordinary layers reduce locally."""
+    from freetoken.layers.moe import OffloadMoELayer
+
+    gpu_routes = torch.tensor([[[1, 2, 3], [0, 0, 0], [4, 5, 6], [0, 0, 0]]],
+                              dtype=torch.bfloat16)
+    cpu_routes = torch.tensor([[[0, 0, 0], [7, 8, 9], [0, 0, 0], [0, 0, 0]]],
+                              dtype=torch.bfloat16)
+    weights = torch.tensor([[1, .5, .25, 0]], dtype=torch.float32)
+    ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+
+    def submit(layer_id, hidden, supplied_weights, cpu_ids):
+        assert layer_id == 0 and hidden.shape == (1, 3)
+        assert torch.equal(supplied_weights, weights)
+        # Do not compute inactive peer routes on CPU, even if they overflow.
+        assert torch.equal(cpu_ids, torch.tensor([[-1, 1, -1, -1]], dtype=torch.int32))
+        return "pending"
+
+    executor = SimpleNamespace(
+        return_route_outputs=route_executor,
+        decode_submit=submit,
+        decode_sync=lambda pending: cpu_routes if route_executor else cpu_routes.sum(dim=1),
+    )
+
+    def ensure(layer_id, route_ids):
+        assert layer_id == 0
+        route_ids.copy_(torch.tensor([[4, -1, 2, -1]], dtype=torch.int32))
+
+    def gemm(cache, hidden, gpu_weights, slots, **kwargs):
+        assert kwargs["return_route_outputs"] == route_executor
+        assert torch.equal(gpu_weights, torch.tensor([[1, 0, .25, 0]]))
+        assert torch.equal(slots, torch.tensor([[4, 0, 2, 0]], dtype=torch.int32))
+        return gpu_routes if route_executor else gpu_routes.sum(dim=1)
+
+    cache = SimpleNamespace(
+        cpu_executor=executor, collect_stats=False, ensure_experts_hybrid=ensure,
+        copy_missing=lambda: None, bank_views=lambda: (), alphas_for_slots=lambda _: None,
+    )
+    layer = SimpleNamespace(layer_id=0, return_route_outputs=ep_routes, _expert_gemm=gemm)
+    actual = OffloadMoELayer._decode_hybrid(layer, cache, torch.zeros(1, 3), weights, ids)
+    expected_routes = gpu_routes + cpu_routes
+    expected = expected_routes if ep_routes else expected_routes.sum(dim=1)
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
 
 
 def _balanced_fetch(num_missing: int, frac_q16: int) -> int:
@@ -126,3 +174,40 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("bs", [1, 5, 6])
+def test_hybrid_verification_window_deduplicates_misses_and_preserves_routes(bs):
+    """One window-wide admission decision must rewrite every repeated token route."""
+    torch.manual_seed(7331 + bs)
+
+    def make():
+        return OffloadMoeCache(
+            num_layers=2, num_experts=32, cache_size=40,
+            device=torch.device("cuda"), quant_format="ds_fp4",
+            decode_target="hybrid", hybrid_max_fetch=1, hybrid_max_bs=6,
+        )
+
+    gpu, reference = make(), make()
+    for step in range(64):
+        layer = step % 2
+        # Includes repeated experts within and across verification tokens, and
+        # alternates layers so admission eventually exercises real eviction.
+        ids = torch.randint(32, (bs, 6), dtype=torch.int32)
+        ids[:, 0] = step % 32
+        g, c = ids.cuda(), ids.clone()
+        gpu.ensure_experts_hybrid(layer, g)
+        reference.ensure_experts_hybrid(layer, c)
+        missing = int(gpu.num_missing_full.item())
+        fetched = int(gpu.num_indices.item())
+        assert missing == int(reference.num_missing_full.item())
+        assert fetched == int(reference.num_indices.item()) == min(1, missing)
+        assert torch.equal(g.cpu(), c)
+        assert torch.equal(gpu.slot_for_id.cpu(), reference.slot_for_id.cpu())
+        assert torch.equal(gpu.id_of_slot.cpu(), reference.id_of_slot.cpu())
+        valid = g.cpu() >= 0
+        assert torch.unique(ids[valid]).numel() == torch.unique(ids).numel() - missing + fetched
+        if valid.any():
+            owners = gpu.id_of_slot[g[g >= 0].long()].cpu()
+            assert torch.equal(owners, ids[valid] + layer * 32)

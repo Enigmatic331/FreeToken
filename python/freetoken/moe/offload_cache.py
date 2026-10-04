@@ -119,7 +119,7 @@ class OffloadMoeCache:
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
     # Maximum prefill rows eligible for a model-specific sparse slot-cache path.
-    # Zero disables it. Qwen EP block-FP8 is currently the only consumer.
+    # Zero disables it. Used by Qwen EP block-FP8 and DeepSeek-V4.1 EP DS-FP4.
     sparse_prefill_max_tokens: int = 0
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
@@ -148,6 +148,7 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    hybrid_max_bs: int = 0
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -155,6 +156,7 @@ class OffloadMoeCache:
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         assert self.sparse_prefill_max_tokens >= 0
+        assert self.hybrid_max_bs >= 0
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
@@ -338,6 +340,12 @@ class OffloadMoeCache:
         """
         from freetoken.moe.host_banks import HostResidency
 
+        self.finish_background_admission()
+        state = getattr(self, "_dsv41_background_admission", None)
+        if state is not None and self.bank_sources:
+            # Replacing host tensors needs a host fence: stream ordering alone
+            # cannot keep pinned source allocations alive after Python frees them.
+            state.stream.synchronize()
         assert set(sources) == set(self.bank_schema), (
             f"banks {sorted(sources)} do not match the {self.quant_format!r} "
             f"schema {self.bank_schema}"
@@ -473,6 +481,7 @@ class OffloadMoeCache:
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
+        self.finish_background_admission()
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
         self.prefill_copy_stream = None
@@ -520,6 +529,9 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        state = getattr(self, "_dsv41_background_admission", None)
+        if state is not None:
+            state.reset_stats()
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
@@ -718,6 +730,7 @@ class OffloadMoeCache:
         self.usage[slot_start:slot_end].zero_()
 
     def begin_prefill(self) -> None:
+        self.finish_background_admission()
         if not self.prefill_overlap:
             return
         self._prefill_buffer_layer = [None, None]
@@ -928,9 +941,20 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def finish_background_admission(self) -> None:
+        """Fence an optional decode fill before another operation uses this cache.
+
+        A settled state does no CUDA work, including on idle scheduler checks.
+        """
+        state = getattr(self, "_dsv41_background_admission", None)
+        if state is not None:
+            state.join()
+
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, *,
+                       route_weights: torch.Tensor | None = None) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
+        self.finish_background_admission()
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
@@ -939,6 +963,9 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         stats = self.lru_stats[layer_id] if self.collect_stats else None
+        if route_weights is not None:
+            from freetoken.moe.empty_admission import ensure_nonempty
+            return ensure_nonempty(self, layer_id, expert_ids, route_weights, stats=stats)
         ensure_experts(self, layer_id, expert_ids, stats=stats)
 
     def ensure_sparse_prefill_experts(
@@ -947,12 +974,18 @@ class OffloadMoeCache:
         """Admit sparse-prefill routes with a fixed-size LRU query and remap in place."""
         from freetoken.moe.offload_kernels import ensure_experts_sparse_prefill
 
+        self.finish_background_admission()
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         stats = self.sparse_prefill_stats[layer_id] if self.collect_stats else None
         ensure_experts_sparse_prefill(self, layer_id, expert_ids, stats=stats)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts_hybrid(
+        self, layer_id: int, expert_ids: torch.Tensor,
+        *, compute_misses_on_cpu: bool = False,
+        cpu_miss_limit: int = 0,
+        route_weights: torch.Tensor | None = None,
+    ) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -964,18 +997,31 @@ class OffloadMoeCache:
         miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
+        self.finish_background_admission()
         if self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        if route_weights is not None:
+            from freetoken.moe.empty_admission import ensure_nonempty
+            return ensure_nonempty(self, layer_id, expert_ids, route_weights, hybrid=True,
+                compute_misses_on_cpu=compute_misses_on_cpu, cpu_miss_limit=cpu_miss_limit)
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction,
+            compute_misses_on_cpu=compute_misses_on_cpu,
+            cpu_miss_limit=cpu_miss_limit,
+        )
+
+    def uses_hybrid(self, bs: int) -> bool:
+        return self.decode_target == "hybrid" and (
+            self.hybrid_max_bs == 0 or bs <= self.hybrid_max_bs
         )
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
+        self.finish_background_admission()
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
@@ -983,12 +1029,14 @@ class OffloadMoeCache:
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 
+        self.finish_background_admission()
         reset_cache(self)
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
 
     def reset_stats(self) -> None:
+        self.finish_background_admission()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()
@@ -1001,6 +1049,9 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        state = getattr(self, "_dsv41_background_admission", None)
+        if state is not None:
+            state.reset_stats()
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -1011,8 +1062,9 @@ class OffloadMoeCache:
 
     def record_decode_stats_hybrid(self, layer_id: int) -> None:
         """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
-        the active count. The CPU computes (missing - fetched) experts. Device-side;
-        accumulates both the scalar totals and the per-layer breakdown."""
+        the active count. Ordinarily CPU compute is (missing - fetched); optional
+        background admission separately records fetched rows computed on CPU.
+        Accumulates device-side scalar totals and the per-layer breakdown."""
         assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
         missing = self.num_missing_full.sum()
         fetched = self.num_indices.sum()
@@ -1034,14 +1086,16 @@ class OffloadMoeCache:
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
         fetched = int(self.stat_fetched.item())
+        state = getattr(self, "_dsv41_background_admission", None)
+        cpu_admitted = int(state.stat_cpu_admitted.sum().item()) if state is not None else 0
         return {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
             "missing_per_layer": (missing / calls) if calls else 0.0,
             "miss_rate": (missing / active) if active else 0.0,
-            # hybrid: how the misses split between PCIe fetch (GPU) and CPU compute.
+            # Background admission can fetch a row AND compute it on CPU this step.
             "fetched_per_layer": (fetched / calls) if calls else 0.0,
-            "cpu_per_layer": ((missing - fetched) / calls) if calls else 0.0,
+            "cpu_per_layer": ((missing - fetched + cpu_admitted) / calls) if calls else 0.0,
             "fetch_rate": (fetched / missing) if missing else 0.0,
             # prefill hit-D2D split: expert rows served from the cache (D2D) vs all
             # rows prefetched into the double buffer since the last reset.
@@ -1073,6 +1127,8 @@ class OffloadMoeCache:
             cols = self.lru_stats.t().tolist()
             active, missing, steps = cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.CALLS]
         fetched = self.stat_fetched_layer.tolist()
+        state = getattr(self, "_dsv41_background_admission", None)
+        cpu_admitted = state.stat_cpu_admitted.tolist() if state is not None else [0] * self.num_layers
         per_layer = []
         for L in range(self.num_layers):
             s, m, a, f = steps[L], missing[L], active[L], fetched[L]
@@ -1083,6 +1139,7 @@ class OffloadMoeCache:
                 "missing_per_step": (m / s) if s else 0.0,
                 "miss_rate": (m / a) if a else 0.0,
                 "fetched_per_step": (f / s) if s else 0.0,
+                "cpu_per_step": ((m - f + cpu_admitted[L]) / s) if s else 0.0,
             })
         return {"per_layer": per_layer}
 
@@ -1118,10 +1175,11 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
-    def copy_missing(self) -> None:
+    def copy_missing(self, *, num_indices: torch.Tensor | None = None) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        count = self.num_indices if num_indices is None else num_indices
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
@@ -1147,7 +1205,7 @@ class OffloadMoeCache:
                 self._copy_feat_bytes,
                 self.evict_slots,
                 self.src_indices,
-                self.num_indices,
+                count,
             )
             return
 
@@ -1159,7 +1217,7 @@ class OffloadMoeCache:
                 self.evict_slots,
                 per_layer[layer_id],
                 self.src_indices,
-                self.num_indices,
+                count,
             )
 
 

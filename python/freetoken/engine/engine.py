@@ -128,6 +128,18 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
 
 
+def _prefill_warmup_slot_start(kv_cache, dummy_slot: int, length: int) -> int:
+    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+
+    if isinstance(kv_cache, DSV4PagedKVCache):
+        # Logical slots 0..length are unallocated: their window translations
+        # remain -1. Only the reserved tail page is bound before admission.
+        if length > kv_cache.P:
+            raise ValueError("DSV4 prefill warmup must fit in its reserved dummy page")
+        return dummy_slot
+    return 0
+
+
 def _required_attn_types(model_config) -> frozenset[AttnType]:
     """Backend-driving attention types of this model, from the group-spec walk
     (single source shared with the pool factory and the KV cost model). getattr
@@ -499,8 +511,12 @@ class Engine:
                 self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
-        if config.speculative_dspark:
+        if config.speculative_dspark or (
+            self._dsv41_plan is not None and config.moe_backend == "hybrid"
+        ):
             self._warmup_dspark_moe_kernels(config)
+        if config.moe_sparse_prefill_max_tokens and self._dsv41_plan is not None:
+            self._warmup_sparse_prefill_moe_kernels(config)
 
         # ======================= KV cache initialization ========================
         new_free_pair = self._sync_get_memory()
@@ -627,8 +643,48 @@ class Engine:
             self.moe_offload_cache.preload_full()
 
     @torch.inference_mode()
+    def _warmup_sparse_prefill_moe_kernels(self, config: EngineConfig) -> None:
+        """Load DS-FP4 sparse modules before posting any prefill receives.
+
+        A first-use CUDA module load can context-synchronize behind an unmatched
+        NCCL receive. Exercise only local cache/compute here, then fence all EP
+        ranks before the real prefill warmup and request loop start.
+        """
+        cache = self.moe_offload_cache
+        if cache is None or cache.quant_format != "ds_fp4":
+            return
+        layer = next(self.model._iter_offload_moe_layers())
+        limit = int(config.moe_sparse_prefill_max_tokens)
+        top_k = int(layer.top_k)
+        from freetoken.kernel import moe_sum_reduce_triton
+        from freetoken.moe.fused_ds_fp4 import _GROUPED_MIN_ROUTES
+
+        grouped = (_GROUPED_MIN_ROUTES + top_k - 1) // top_k
+        align_large = 1024 // top_k + 1
+        lengths = sorted({min(n, limit) for n in (
+            1, 2, 3, 8, 16, 17, 32, 64, 80, grouped - 1, grouped,
+            grouped + 1, align_large - 1, align_large, limit,
+        ) if n > 0})
+        for rows in lengths:
+            cache.reset()
+            hidden = torch.zeros((rows, layer.hidden_size), dtype=self.dtype,
+                                 device=self.device)
+            weights = torch.zeros((rows, top_k), dtype=torch.float32, device=self.device)
+            weights[:, 0] = 1
+            ids = torch.zeros((rows, top_k), dtype=torch.int32, device=self.device)
+            routes = layer._prefill_routed(hidden, weights, ids)
+            output = hidden.new_empty(hidden.shape)
+            moe_sum_reduce_triton(routes, output)
+            torch.cuda.synchronize(self.device)
+        cache.reset()
+        torch.cuda.synchronize(self.device)
+        logger.info("DS-FP4 sparse-prefill local kernel warmup complete: %s", lengths)
+        if self._execution_plan.enabled:
+            torch.distributed.barrier(group=self.tp_cpu_group)
+
+    @torch.inference_mode()
     def _warmup_dspark_moe_kernels(self, config: EngineConfig) -> None:
-        """Load every local decode-MoE module DSpark can need before NCCL traffic.
+        """Load local DSV4.1 decode-MoE modules before NCCL traffic.
 
         A speculative target pass has ``1 + gamma`` rows while ordinary decode has
         one.  Triton's LRU admission kernel specializes on the next-power-of-two
@@ -636,7 +692,10 @@ class Engine:
         used by the 2..6-row DSpark passes.  Loading one of those modules after an
         NCCL kernel has been submitted can context-synchronize behind the collective
         and deadlock all ranks.  Exercise only the rank-local admission/copy/GEMV
-        path here, before requests exist, then restore a cold cache.
+        path here, before requests exist, then restore a cold cache. Target-only
+        hybrid serving also needs this fence: its CPU handoff and capped-fetch
+        kernels must not first load behind an unmatched collective. It warms
+        only ordinary decode/graph row sizes, not unused speculative geometry.
         """
 
         cache = self.moe_offload_cache
@@ -662,7 +721,15 @@ class Engine:
         )
 
         top_k = int(gpu_layer.top_k)
-        max_rows = int(args.dspark_block_size) + 1
+        if config.speculative_dspark:
+            max_rows = int(args.dspark_block_size) + 1
+        else:
+            max_rows = max(
+                config.max_running_req,
+                config.cuda_graph_max_bs or 0,
+                max(config.cuda_graph_bs or (0,)),
+                1,
+            )
         layer_id = int(gpu_layer.layer_id)
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
@@ -685,7 +752,14 @@ class Engine:
                 global_offset=0,
                 local_count=int(cache.num_experts),
             )
-            cache.ensure_experts(layer_id, local_ids)
+            # The empty-rank guard is a separate CUDA module. Load the exact
+            # BS1 admission path before any NCCL collective can be queued.
+            route_kwargs = (
+                {"route_weights": weights}
+                if rows == 1 and getattr(gpu_layer, "skip_empty_cache", False)
+                else {}
+            )
+            cache.ensure_experts(layer_id, local_ids, **route_kwargs)
             cache.copy_missing()
             route_outputs = gpu_layer._expert_gemm(
                 cache,
@@ -712,12 +786,33 @@ class Engine:
                 )
                 moe_sum_reduce_triton(route_outputs, reduced)
             torch.cuda.synchronize(self.device)
+        for rows in range(1, max_rows + 1):
+            if not cache.uses_hybrid(rows):
+                continue
+            # The capped-fetch kernel is a different module from ordinary LRU
+            # admission. Load the entire local hybrid path before any rank can
+            # queue NCCL, including the CPU flag handshake and overflow branch.
+            # Verification can use more rows than ordinary decode. Warming BS1
+            # alone misses its route-count specializations and DMA handoff path.
+            cache.reset()
+            hidden = torch.zeros(
+                (rows, int(args.dim)), dtype=self.dtype, device=self.device
+            )
+            weights = torch.full(
+                (rows, top_k), 1.0 / top_k, dtype=torch.float32, device=self.device
+            )
+            local_ids = (
+                torch.arange(top_k, dtype=torch.int32, device=self.device)
+                .remainder(int(cache.num_experts)).repeat(rows, 1)
+            )
+            gpu_layer._decode_hybrid(cache, hidden, weights, local_ids)
+            torch.cuda.synchronize(self.device)
         cache.reset()
         torch.cuda.synchronize(self.device)
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
-            "DSpark MoE kernel warmup complete for target rows 1..%d in %.3f s",
+            "DSV4.1 decode MoE kernel warmup complete for target rows 1..%d in %.3f s",
             max_rows,
             started.elapsed_time(ended) / 1000.0,
         )
@@ -838,7 +933,9 @@ class Engine:
             cpu_layer_ids = _auto_cpu_layers(
                 config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
             )
-        if config.moe_backend == "hybrid":
+        if config.moe_backend == "hybrid" and (
+            config.moe_hybrid_ranks is None or config.tp_info.rank in config.moe_hybrid_ranks
+        ):
             decode_target = "hybrid"
         elif cpu_layer_ids:
             decode_target = "cpu"
@@ -954,6 +1051,7 @@ class Engine:
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                hybrid_max_bs=config.moe_hybrid_max_bs,
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
@@ -979,6 +1077,7 @@ class Engine:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
             cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
+            cache.hybrid_max_bs = config.moe_hybrid_max_bs
             cache.cpu_layer_ids = cpu_layer_ids
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
@@ -1034,7 +1133,7 @@ class Engine:
         must be stable for the captured nodes. Buffers/tasks themselves are
         allocated lazily on the first (eager) forward at each batch size.
         """
-        from freetoken.moe.cpu_executor import CpuMoeExecutor
+        from freetoken.moe.cpu_executor import CpuMoeExecutor, partition_rank_affinity
 
         sample = layers[0]
         required = ("top_k", "activation", "apply_router_weight_on_input")
@@ -1046,6 +1145,16 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        core_ids = coordinator_core = None
+        if config.tp_info.size > 1:
+            ranks = (
+                config.moe_hybrid_ranks
+                if config.moe_backend == "hybrid" and config.moe_hybrid_ranks is not None
+                else tuple(range(config.tp_info.size))
+            )
+            core_ids, coordinator_core = partition_rank_affinity(
+                config.tp_info.rank, ranks, config.moe_cpu_threads
+            )
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -1057,6 +1166,13 @@ class Engine:
             device=self.device,
             swiglu_alpha=getattr(sample, "hidden_act_alpha", 1.702),
             swiglu_limit=getattr(sample, "swiglu_limit", None),
+            dsfp4_activation_block_size=getattr(
+                sample, "dsfp4_activation_block_size", 128
+            ),
+            core_ids=core_ids,
+            coordinator_core=coordinator_core,
+            return_route_outputs=cache.quant_format == "ds_fp4" and cache.decode_target == "hybrid",
+            dsfp4_gpu_order=getattr(config.model_config, "dsv41_args", None) is not None,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1691,8 +1807,9 @@ class Engine:
         started.record(self.stream)
         try:
             for length in warmup_lens:
+                slot_start = _prefill_warmup_slot_start(self.kv_cache, dummy_slot, length)
                 dummy_row[:length] = torch.arange(
-                    length, dtype=torch.int32, device=self.device
+                    slot_start, slot_start + length, dtype=torch.int32, device=self.device
                 )
                 warm_req = Req(
                     input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
@@ -1958,6 +2075,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_hybrid_ranks": None,
+    "moe_hybrid_max_bs": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "moe_sparse_prefill_max_tokens": 0,
@@ -1998,6 +2117,17 @@ def _adjust_config(config: EngineConfig):
     dspark_adaptive_costs = getattr(config, "dspark_adaptive_costs_ms", None)
     moe_cache_sizes = getattr(config, "moe_cache_sizes", None)
     tp_info = getattr(config, "tp_info", None)
+    hybrid_ranks = getattr(config, "moe_hybrid_ranks", None)
+    if hybrid_ranks is not None:
+        size = tp_info.size if tp_info is not None else 1
+        if (
+            config.moe_backend != "hybrid" or not hybrid_ranks
+            or len(set(hybrid_ranks)) != len(hybrid_ranks)
+            or any(rank < 0 or rank >= size for rank in hybrid_ranks)
+        ):
+            raise ValueError("--moe-hybrid-ranks needs unique, in-range ranks and --moe-backend hybrid")
+    if getattr(config, "moe_hybrid_max_bs", 0) < 0:
+        raise ValueError("--moe-hybrid-max-bs must be nonnegative")
 
     if qwen_backbone_rank is not None and dsv41_backbone_rank is not None:
         raise ValueError(
@@ -2079,9 +2209,9 @@ def _adjust_config(config: EngineConfig):
                 f"--dsv41-backbone-rank {dsv41_backbone_rank} is outside "
                 f"[0, {tp_info.size})"
             )
-        if config.moe_backend not in ("auto", "offload"):
+        if config.moe_backend not in ("auto", "offload", "hybrid"):
             raise ValueError(
-                "DeepSeek-V4.1 EP currently requires --moe-backend offload"
+                "DeepSeek-V4.1 EP requires --moe-backend offload or hybrid"
             )
         from freetoken.models.deepseek_v41.execution import get_execution_plan
 
@@ -2248,13 +2378,20 @@ def _adjust_config(config: EngineConfig):
 
     sparse_prefill_max_tokens = getattr(config, "moe_sparse_prefill_max_tokens", 0)
     if sparse_prefill_max_tokens and not (
-        config.moe_backend == "offload"
-        and qwen_backbone_rank is not None
-        and expert_quant == "fp8_block"
+        (
+            config.moe_backend == "offload"
+            and qwen_backbone_rank is not None and expert_quant == "fp8_block"
+        )
+        or (
+            config.moe_backend in ("offload", "hybrid")
+            and dsv41_args is not None
+            and dsv41_backbone_rank is not None
+            and expert_quant == "ds_fp4"
+        )
     ):
         raise ValueError(
-            "--moe-sparse-prefill-max-tokens currently requires the offload "
-            "backend with Qwen4Exp EP block-FP8 experts"
+            "--moe-sparse-prefill-max-tokens requires Qwen4Exp EP block-FP8 offload "
+            "or DeepSeek-V4.1 EP DS-FP4 offload/hybrid experts"
         )
 
     if not is_moe:

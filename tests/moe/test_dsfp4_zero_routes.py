@@ -1,0 +1,74 @@
+"""Opt-in zero local routes must not change active-route arithmetic or graph replay."""
+import pytest
+import torch
+
+from freetoken.moe import fused_ds_fp4 as fp4
+
+
+@pytest.mark.parametrize("enabled,tokens,block,kind,capability,expected", [
+    (False, 1, 32, "cuda", (12, 0), False),
+    (True, 2, 32, "cuda", (12, 0), False),
+    (True, 1, 128, "cuda", (12, 0), False),
+    (True, 1, 32, "cpu", (12, 0), False),
+    (True, 1, 32, "cuda", (8, 0), False),
+    (True, 1, 32, "cuda", (9, 0), False),
+    (True, 1, 32, "cuda", (12, 0), True),
+    (True, 1, 32, "cuda", (8, 9), True),
+])
+def test_zero_route_policy(monkeypatch, enabled, tokens, block, kind, capability, expected):
+    calls = []
+    device = torch.device(kind, 2) if kind == "cuda" else torch.device("cpu")
+    monkeypatch.setattr(fp4, "_SKIP_ZERO_ROUTES", enabled)
+    def probe(actual):
+        calls.append(actual)
+        return capability
+    monkeypatch.setattr(torch.cuda, "get_device_capability", probe)
+    fp4._zero_route_device_supported.cache_clear()
+    try:
+        for _ in range(2):
+            assert fp4._use_zero_route_skip(tokens, block, device) is expected
+        assert calls == ([device] if enabled and tokens == 1 and block == 32 and kind == "cuda" else [])
+    finally:
+        fp4._zero_route_device_supported.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("route_outputs", [False, True])
+def test_zero_routes_exact_replay(monkeypatch, dtype, route_outputs):
+    if torch.cuda.get_device_capability() not in ((12, 0), (8, 9)):
+        pytest.skip("qualified architectures only")
+    torch.manual_seed(4103)
+    device = torch.device("cuda", 0)
+    h, i, experts, topk = 1024, 512, 8, 6
+    banks = [torch.randint(0, 256, shape, dtype=torch.uint8, device=device) for shape in
+             [(experts, 2*i, h//2), (experts, h, i//2)]]
+    scales = [torch.randint(119, 123, shape, dtype=torch.uint8, device=device) for shape in
+              [(experts, 2*i, h//32), (experts, h, i//32)]]
+    x = torch.randn((1, h), dtype=dtype, device=device) * .3
+    ids = torch.arange(topk, device=device, dtype=torch.int32).unsqueeze(0)
+    # Non-contiguous route weights exercise actual weight strides in gate/up too.
+    weights = torch.ones((1, 2*topk), device=device)[:, ::2]
+    def run(enabled):
+        monkeypatch.setattr(fp4, "_SKIP_ZERO_ROUTES", enabled)
+        return fp4.routed_experts_fp4(x, ids, weights, banks[0], scales[0], banks[1], scales[1],
+                                     10., return_route_outputs=route_outputs, activation_block_size=32)
+    for _ in range(3):
+        run(False); run(True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(True)
+    # Both transitions matter: nonzero->zero must clear stale output lanes,
+    # zero->nonzero must not keep a captured mask or input.
+    for active in (6, 0, 1, 5, 2, 0, 3, 6):
+        x.normal_().mul_(.3)
+        ids.copy_((ids+1) % experts)
+        weights.zero_()
+        weights[:, :active] = .75
+        expected = run(False)
+        actual = run(True)
+        graph.replay()
+        assert torch.isfinite(expected).all()
+        assert torch.equal(expected, actual)
+        assert torch.equal(expected, captured)

@@ -121,7 +121,9 @@ def _remap_sparse_prefill_routes_kernel(
 
 
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0,
+    *, compute_misses_on_cpu: bool = False,
+    cpu_miss_limit: int = 0,
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -136,8 +138,12 @@ def ensure_experts_hybrid(
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
-        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        return _ensure_experts_hybrid_cpu(
+            cache, layer_id, expert_ids, max_fetch, frac_q16, compute_misses_on_cpu, cpu_miss_limit
+        )
+    _ensure_experts_hybrid_gpu(
+        cache, layer_id, expert_ids, max_fetch, frac_q16, compute_misses_on_cpu, cpu_miss_limit
+    )
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -182,7 +188,9 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    compute_misses_on_cpu: bool = False,
+    cpu_miss_limit: int = 0,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -208,12 +216,16 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        CPU_MISSES=compute_misses_on_cpu,
+        CPU_MISS_LIMIT=cpu_miss_limit,
         num_warps=num_warps,
     )
 
 
 def _ensure_experts_hybrid_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    compute_misses_on_cpu: bool = False,
+    cpu_miss_limit: int = 0,
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
@@ -237,6 +249,10 @@ def _ensure_experts_hybrid_cpu(
             cache.usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
+    original_misses = set(missing)
+    cpu_all_misses = compute_misses_on_cpu and (
+        cpu_miss_limit == 0 or len(missing) <= cpu_miss_limit
+    )
     if _HYBRID_FETCH_BY_RECENCY:
         rec = cache.expert_recency[layer_id].tolist()
         missing.sort(key=lambda e: (-rec[e], e))
@@ -272,7 +288,11 @@ def _ensure_experts_hybrid_cpu(
     # Overflow misses keep slot_for_id == -1, so the rewrite below yields -1 for them.
     flat = expert_ids.view(-1)
     for i in range(flat.numel()):
-        flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+        expert = int(flat[i].item())
+        flat[i] = (
+            -1 if cpu_all_misses and expert in original_misses
+            else int(cache.slot_for_id[layer_id, expert].item())
+        )
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
@@ -396,6 +416,8 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    CPU_MISSES: tl.constexpr = False,
+    CPU_MISS_LIMIT: tl.constexpr = 0,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -487,7 +509,16 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
     for i in tl.range(num_active):
         e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e)
+        if CPU_MISSES:
+            # Use the pre-admission snapshot. Newly admitted slots are reserved
+            # for future calls, not GPU operands in this call. The caller must
+            # fence its background copy before the next cache access.
+            s = tl.sum(tl.where(off_e == e, slot, 0))
+            if CPU_MISS_LIMIT > 0:
+                admitted = tl.load(slot_for_id_ptr + base + e)
+                s = tl.where(num_missing <= CPU_MISS_LIMIT, s, admitted)
+        else:
+            s = tl.load(slot_for_id_ptr + base + e)
         tl.store(expert_ids_ptr + i, s)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss

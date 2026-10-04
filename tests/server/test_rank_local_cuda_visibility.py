@@ -47,6 +47,37 @@ def test_shared_text_and_vision_gpu_is_not_duplicated():
     assert vision_ordinal == 0
 
 
+@pytest.mark.parametrize('vision_rank', [0, 1, 2, 3])
+def test_vision_reuses_existing_text_peer_ordinal(vision_rank):
+    text = (*TEXT, 'GPU-text3')
+    visible, vision_ordinal = rank_local_cuda_plan(
+        rank=0, text_uuids=text, vision_uuid=text[vision_rank],
+        vision_owner_rank=0, text_peer_visibility=True,
+    )
+    assert visible == text
+    assert vision_ordinal == vision_rank
+    assert len(set(visible)) == len(visible)
+
+
+def test_worker_sharing_vision_hardware_does_not_load_vision_tower():
+    text = (*TEXT, 'GPU-text3')
+    visible, vision_ordinal = rank_local_cuda_plan(
+        rank=3, text_uuids=text, vision_uuid=text[3],
+        vision_owner_rank=0, text_peer_visibility=True,
+    )
+    assert visible == (text[3], *text[:3])
+    assert vision_ordinal is None
+
+
+def test_vision_peer_uuid_matching_is_case_insensitive():
+    visible, vision_ordinal = rank_local_cuda_plan(
+        rank=0, text_uuids=TEXT, vision_uuid=TEXT[1].upper(),
+        vision_owner_rank=0, text_peer_visibility=True,
+    )
+    assert visible == TEXT
+    assert vision_ordinal == 1
+
+
 def test_authority_alone_sees_the_dspark_auxiliary_gpu():
     visible, _ = rank_local_cuda_plan(
         rank=0,

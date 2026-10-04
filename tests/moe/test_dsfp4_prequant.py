@@ -17,7 +17,8 @@ H, I, E, TOPK = 1024, 512, 16, 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_dsfp4_gpu_prequant_bit_parity():
+@pytest.mark.parametrize("activation_block_size", [32, 128])
+def test_dsfp4_gpu_prequant_bit_parity(activation_block_size):
     from freetoken.kernel.pinned import alloc_pinned_tensor
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
@@ -47,6 +48,7 @@ def test_dsfp4_gpu_prequant_bit_parity():
         ex = CpuMoeExecutor(
             cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False,
             num_threads=4, max_tokens=2, device=dev, swiglu_limit=10.0,
+            dsfp4_activation_block_size=activation_block_size,
         )
         assert ex._gpu_prequant, "ds_fp4 on CUDA should enable GPU prequant"
         if cpu_roundtrip:  # control: the original CPU-side scalar round-trip

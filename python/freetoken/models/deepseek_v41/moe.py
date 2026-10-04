@@ -33,6 +33,21 @@ def _fused_decode_dispatch_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _background_admission_enabled(execution) -> bool:
+    # Authority/backbone, other model families, prefill and multi-row paths keep
+    # their qualified implementations. This experimental policy is off by default.
+    return execution.is_expert_worker and os.getenv(
+        "FREETOKEN_DSV41_BACKGROUND_ADMISSION", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _background_admission_max_misses() -> int:
+    value = int(os.getenv("FREETOKEN_DSV41_BACKGROUND_MAX_MISSES", "1"))
+    if not 1 <= value <= 6:
+        raise ValueError("V4.1 background CPU miss limit must be between 1 and 6")
+    return value
+
+
 def _broadcast_decode_dispatch(
     communicator,
     execution,
@@ -234,6 +249,22 @@ class RoutedExperts(ExpertParallelOffloadMoELayer):
         # V4.1 uses one activation scale per 32 values.  Keep this model-local;
         # the shared DS-FP4 kernels retain V4's 128-value default.
         self.dsfp4_activation_block_size = int(args.weight_block_size[1])
+        self.skip_empty_cache = os.getenv("FREETOKEN_DSV41_SKIP_EMPTY_CACHE", "0") == "1"
+        self.background_admission_enabled = _background_admission_enabled(get_execution_plan())
+        self.background_admission_max_misses = (
+            _background_admission_max_misses() if self.background_admission_enabled else 1
+        )
+
+    def _decode_hybrid(self, cache, hidden_states, topk_weights, topk_ids):
+        if self.background_admission_enabled and hidden_states.shape[0] == 1:
+            from freetoken.moe.background_admission import BackgroundAdmission
+
+            state = getattr(cache, "_dsv41_background_admission", None)
+            if state is None:
+                state = BackgroundAdmission(cache, max_cpu_misses=self.background_admission_max_misses)
+                cache._dsv41_background_admission = state
+            return state.decode(self, hidden_states, topk_weights, topk_ids)
+        return super()._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
 
     def _maybe_all_reduce(self, routes: torch.Tensor) -> torch.Tensor:
         with profile_range("DSV41/EP/RouteAllReduce"):

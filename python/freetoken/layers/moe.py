@@ -392,9 +392,11 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-        if cache.decode_target == "hybrid":
+        if cache.uses_hybrid(hidden_states.shape[0]):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
+        route_kwargs = ({"route_weights": topk_weights}
+                        if getattr(self, "skip_empty_cache", False) and hidden_states.shape[0] == 1 else {})
+        cache.ensure_experts(self.layer_id, topk_ids, **route_kwargs)
         cache.copy_missing()
         return self._expert_gemm(
             cache,
@@ -419,10 +421,9 @@ class OffloadMoELayer(MoELayer):
         layers deliberately return ``None`` because their host-node choreography is
         not safe to split around unrelated GPU work.
         """
-        del topk_weights
         cache = self.offload_cache
         assert cache is not None
-        if cache.is_cpu_layer(self.layer_id) or cache.decode_target == "hybrid":
+        if cache.is_cpu_layer(self.layer_id) or cache.uses_hybrid(topk_ids.shape[0]):
             return None
         if not topk_ids.is_cuda:
             return None
@@ -431,7 +432,9 @@ class OffloadMoELayer(MoELayer):
         refill_stream = _decode_refill_stream(topk_ids.device)
         refill_stream.wait_stream(compute_stream)
         with torch.cuda.stream(refill_stream):
-            cache.ensure_experts(self.layer_id, topk_ids)
+            route_kwargs = ({"route_weights": topk_weights}
+                            if getattr(self, "skip_empty_cache", False) and topk_ids.shape[0] == 1 else {})
+            cache.ensure_experts(self.layer_id, topk_ids, **route_kwargs)
             cache.copy_missing()
         return RoutedDecodePlan(cache, topk_ids, refill_stream)
 
@@ -474,12 +477,16 @@ class OffloadMoELayer(MoELayer):
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        route_kwargs = ({"route_weights": topk_weights}
+                        if getattr(self, "skip_empty_cache", False) and hidden_states.shape[0] == 1 else {})
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids, **route_kwargs)  # -> slot or -1
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        cpu_ids = torch.where(
+            on_gpu | (topk_weights == 0), raw.new_full((), -1), raw
+        ).contiguous()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -500,9 +507,17 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
+            return_route_outputs=executor.return_route_outputs,
         )
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        merged = gpu_routed + cpu_routed
+        # Preserve the original route reduction: CPU/GPU choose which endpoint
+        # computes each BF16 route, not a new order of rounded partial sums.
+        # EP must retain [tokens, routes, hidden] until the cross-rank all-reduce;
+        # reducing locally would change both collective shape and BF16 rounding.
+        if executor.return_route_outputs and not getattr(self, "return_route_outputs", False):
+            return merged.sum(dim=1)
+        return merged
 
     def _prefill_routed(
         self,
@@ -572,6 +587,7 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
+        return_route_outputs: bool | None = None,
     ) -> torch.Tensor:
         fmt = cache.quant_format
         if fmt in ("nvfp4_marlin", "nvfp4_b12x"):
@@ -712,14 +728,21 @@ class OffloadMoELayer(MoELayer):
                 )
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
+            skip_kwargs = ({"skip_zero_weight": True}
+                           if getattr(self, "skip_empty_cache", False) and not is_prefill
+                           and hidden_states.shape[0] == 1 else {})
             return routed_experts_fp4(
                 hidden_states, topk_ids, topk_weights,
                 gate_up_packed, gate_up_scale, down_packed, down_scale,
                 self.swiglu_limit,
-                return_route_outputs=getattr(self, "return_route_outputs", False),
+                return_route_outputs=(
+                    getattr(self, "return_route_outputs", False)
+                    if return_route_outputs is None else return_route_outputs
+                ),
                 activation_block_size=getattr(
                     self, "dsfp4_activation_block_size", 128
                 ),
+                **skip_kwargs,
             )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"
         gate_up, down = views
@@ -1224,19 +1247,20 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         if (
             cache.sparse_prefill_max_tokens > 0
             and hidden_states.shape[0] <= cache.sparse_prefill_max_tokens
-            and cache.quant_format == "fp8_block"
+            and cache.quant_format in ("fp8_block", "ds_fp4")
             and not cache.is_unpinned_layer(self.layer_id)
         ):
-            # Preserve prefill numerics: unlike the W8A16 decode GEMV, the grouped
-            # W8A8 prefill kernel accepts cache-slot ids directly. Make the EP
-            # sentinel safe for LRU bookkeeping, remap expert ids to slots, then
-            # restore an out-of-range sentinel so the existing compact schedule
-            # can omit routes owned by the peer rank.
+            # Preserve each format's normal prefill numerics (including DS-FP4's
+            # existing small-route GEMV/grouped-GEMM crossover). Both prefill
+            # implementations accept cache-slot ids directly. Make the EP
+            # sentinel safe for LRU bookkeeping, then remap expert ids to slots.
+            # Only FP8's optional compact schedule accepts an out-of-range
+            # sentinel; DS-FP4 still needs valid ids even on zero-weight routes.
             inactive = topk_weights == 0
             route_ids = self._cache_safe_route_ids(topk_weights, topk_ids).contiguous()
             cache.ensure_sparse_prefill_experts(self.layer_id, route_ids)
             cache.copy_missing()
-            if self.skip_inactive_prefill_routes:
+            if self.skip_inactive_prefill_routes and cache.quant_format == "fp8_block":
                 route_ids.masked_fill_(inactive, cache.cache_size)
             return self._expert_gemm(
                 cache,

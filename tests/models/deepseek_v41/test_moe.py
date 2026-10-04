@@ -140,6 +140,39 @@ def test_multi_peer_packed_prefill_route_tiles_keep_global_owner_plan(monkeypatc
     ]
 
 
+def test_ep4_packed_prefill_combines_three_remote_peers(monkeypatch):
+    import freetoken.kernel as kernel_module
+    import freetoken.layers.moe as moe_module
+
+    monkeypatch.setattr(moe_module, "_EP_PACKED_PREFILL_OVERLAP", False)
+    monkeypatch.setattr(moe_module, "get_tp_info", lambda: SimpleNamespace(rank=0, size=4))
+    monkeypatch.setattr(moe_module, "get_global_ctx", lambda: SimpleNamespace(batch=SimpleNamespace(is_moe_prefill=True)))
+    monkeypatch.setattr(kernel_module, "moe_sum_reduce_triton", lambda routes, output: output.copy_(routes.sum(dim=1)))
+    payloads = {peer: torch.tensor([[peer * 10., peer * 100.], [peer * 10. + 1, peer * 100. + 1]]) for peer in (1, 2, 3)}
+    received = []
+
+    class Communicator:
+        def recv(self, output, peer):
+            received.append(peer)
+            output.copy_(payloads[peer])
+            return output
+
+    layer = ExpertParallelOffloadMoELayer(layer_id=0, num_experts=4, top_k=4, hidden_size=2, intermediate_size=8)
+    layer.packed_prefill_root = 0
+    layer.packed_prefill_peer_ranks = (1, 2, 3)
+    layer.packed_prefill_peer_ranges = ((1, 4, 8), (2, 8, 12), (3, 12, 16))
+    layer.prefill_communicator = Communicator()
+    weights = torch.tensor([[1., 0., 0., 0.], [1., 0., 0., 0.]])
+    ids = torch.tensor([[0, 4, 8, 12], [3, 7, 11, 15]], dtype=torch.int32)
+    layer.prepare_packed_prefill_receive(weights, torch.float32, global_topk_ids=ids)
+    assert [indices.tolist() for _, indices in layer._packed_prefill_remote_indices] == [[1, 5], [2, 6], [3, 7]]
+    routes = torch.zeros(2, 4, 2)
+    routes[:, 0] = torch.tensor([[1., 2.], [3., 4.]])
+    expected = routes[:, 0].clone() + sum(payloads.values())
+    torch.testing.assert_close(layer._maybe_combine_packed_prefill_routes(routes, weights), expected)
+    assert received == [1, 2, 3]
+
+
 def test_execution_plan_balances_global_experts_and_keeps_workers_in_engram():
     left = DeepseekV41ExecutionPlan(0, 2, backbone_rank=0).partition(385)
     right_plan = DeepseekV41ExecutionPlan(1, 2, backbone_rank=0)
@@ -218,9 +251,15 @@ def test_execution_plan_phase_splits_prefill_from_decode_storage():
     assert [plan.partition(8).local_count for plan in plans] == [3, 3, 2]
 
 
-@pytest.mark.parametrize("rank", (0, 1, 2))
-def test_all_active_phase_split_uses_world_broadcast(monkeypatch, rank):
+@pytest.mark.parametrize("shards,rank", [
+    ((3, 3, 2), rank) for rank in range(3)
+] + [
+    ((2, 2, 2, 2), rank) for rank in range(4)
+])
+@pytest.mark.parametrize("authority", (False, True))
+def test_all_active_phase_split_uses_world_broadcast(monkeypatch, shards, rank, authority):
     import freetoken.models.deepseek_v41.moe as moe_module
+    import freetoken.models.deepseek_v41.model as model_module
 
     calls = []
 
@@ -238,16 +277,16 @@ def test_all_active_phase_split_uses_world_broadcast(monkeypatch, rank):
 
     plan = DeepseekV41ExecutionPlan(
         rank,
-        3,
+        len(shards),
         backbone_rank=0,
-        expert_shards=(3, 3, 2),
-        prefill_expert_shards=(3, 3, 2),
-        expert_storage_ranges=((0, 3), (3, 3), (6, 2)),
+        expert_shards=shards,
+        prefill_expert_shards=shards,
+        expert_storage_ranges=tuple((sum(shards[:i]), count) for i, count in enumerate(shards)),
     )
     assert plan.phase_aware
     assert not plan.uses_prefill_subgroup
     monkeypatch.setattr(
-        moe_module,
+        model_module if authority else moe_module,
         "get_global_ctx",
         lambda: SimpleNamespace(batch=SimpleNamespace(is_moe_prefill=True)),
     )
@@ -258,7 +297,8 @@ def test_all_active_phase_split_uses_world_broadcast(monkeypatch, rank):
     )
     tensor = torch.arange(4)
 
-    assert MoE._phase_broadcast(layer, tensor) is tensor
+    broadcast = model_module.MoEState._phase_broadcast if authority else MoE._phase_broadcast
+    assert broadcast(layer, tensor) is tensor
     assert calls == [(tensor, 0)]
 
 

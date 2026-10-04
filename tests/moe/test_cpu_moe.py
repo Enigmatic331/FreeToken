@@ -368,10 +368,11 @@ def _make_dsfp4_cache(L, E, H, I, seed=0):
 
 
 @pytest.mark.parametrize("bs", [1, 3, 8])
-def test_cpu_decode_dsfp4_matches_gpu(bs):
+@pytest.mark.parametrize("activation_block_size", [32, 128])
+def test_cpu_decode_dsfp4_matches_gpu(bs, activation_block_size):
     """CPU ds_fp4 W4A8 GEMV vs. DeepSeek-V4 production ``routed_experts_fp4`` on
     byte-identical banks: same e2m1/e8m0 dequant, FP8-e4m3 activation round-trips
-    (block 128), silu-swiglu with clamp, router weight on the down output."""
+    (V4 block 128 or V4.1 block 32), silu-swiglu with clamp, router weight on output."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
@@ -391,6 +392,7 @@ def test_cpu_decode_dsfp4_matches_gpu(bs):
         max_tokens=bs,
         device=dev,
         swiglu_limit=swiglu_limit,
+        dsfp4_activation_block_size=activation_block_size,
     )
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
@@ -406,6 +408,7 @@ def test_cpu_decode_dsfp4_matches_gpu(bs):
         b["gate_up_packed"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
         b["down_packed"][layer].to(dev), b["down_scale"][layer].to(dev),
         swiglu_limit,
+        activation_block_size=activation_block_size,
     ).float()
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
@@ -566,7 +569,8 @@ def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     print("cpu moe cuda graph replay (mxfp4) OK")
 
 
-def test_cpu_moe_decode_cuda_graph_replay_dsfp4():
+@pytest.mark.parametrize("activation_block_size", [32, 128])
+def test_cpu_moe_decode_cuda_graph_replay_dsfp4(activation_block_size):
     """DeepSeek-V4 ds_fp4 path under capture/replay: the 4-phase pipeline (input
     FP8 round-trip -> gate_up -> intermediate FP8 round-trip -> down) must recompute
     from the freshly written pinned routing on each replay."""
@@ -586,13 +590,17 @@ def test_cpu_moe_decode_cuda_graph_replay_dsfp4():
         cache, top_k=top_k, activation="silu",
         apply_router_weight_on_input=False, num_threads=8, max_tokens=bs, device=dev,
         swiglu_limit=limit,
+        dsfp4_activation_block_size=activation_block_size,
     )
     b = cache.bank_sources
     layer_banks = [b[n][layer].to(dev) for n in (
         "gate_up_packed", "gate_up_scale", "down_packed", "down_scale")]
 
     def reference(hidden, ids, w):
-        return routed_experts_fp4(hidden, ids.clone(), w.contiguous(), *layer_banks, limit).float()
+        return routed_experts_fp4(
+            hidden, ids.clone(), w.contiguous(), *layer_banks, limit,
+            activation_block_size=activation_block_size,
+        ).float()
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
     ids = torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32)
@@ -631,11 +639,11 @@ if __name__ == "__main__":
         test_cpu_decode_mxfp4_matches_gpu_splitk(bs)
         print(f"mxfp4 bs={bs} OK")
     for bs in (1, 3, 8):
-        test_cpu_decode_dsfp4_matches_gpu(bs)
+        test_cpu_decode_dsfp4_matches_gpu(bs, 128)
         print(f"ds_fp4 bs={bs} OK")
     test_cpu_moe_decode_cuda_graph_replay()
     test_cpu_moe_decode_cuda_graph_replay_mxfp4()
-    test_cpu_moe_decode_cuda_graph_replay_dsfp4()
+    test_cpu_moe_decode_cuda_graph_replay_dsfp4(128)
 
 
 def test_cpu_moe_executor_is_collectable():
@@ -661,3 +669,146 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
+
+@pytest.mark.parametrize("route_outputs", [False, True])
+def test_dsfp4_empty_routes_then_active_graph_replay(route_outputs):
+    """Empty overflow must clear stale output without advancing the worker generation."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    cache = _make_dsfp4_cache(1, 8, 256, 256, seed=29)
+    ex = CpuMoeExecutor(
+        cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=1, device=torch.device("cuda"),
+        swiglu_limit=10.0, dsfp4_activation_block_size=32,
+        return_route_outputs=route_outputs,
+    )
+    # Also exercise scratch growth from max_tokens=1 to a verification batch.
+    x = torch.randn(5, 256, device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((5, 4), -1, device="cuda", dtype=torch.int32)
+    weights = torch.ones(5, 4, device="cuda")
+    ex.decode(0, x, weights, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = ex.decode(0, x, weights, ids)
+    for active in (True, False, True, False):
+        ids.fill_(0 if active else -1)
+        graph.replay()
+        torch.cuda.synchronize()
+        if active:
+            assert torch.isfinite(output).all() and output.abs().max() > 0
+        else:
+            assert torch.count_nonzero(output) == 0
+
+
+def test_dsfp4_per_route_cpu_gpu_merge():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
+
+    cache = _make_dsfp4_cache(1, 8, 256, 256, seed=30)
+    ex = CpuMoeExecutor(
+        cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=1, device=torch.device("cuda"),
+        swiglu_limit=10.0, dsfp4_activation_block_size=32, return_route_outputs=True,
+    )
+    banks = [cache.bank_sources[k][0].cuda() for k in (
+        "gate_up_packed", "gate_up_scale", "down_packed", "down_scale")]
+    x = torch.randn(1, 256, device="cuda", dtype=torch.bfloat16) * 0.1
+    ids = torch.tensor([[0, 1, 2, 3]], device="cuda", dtype=torch.int32)
+    weights = torch.tensor([[0.2, 0.3, 0.1, 0.4]], device="cuda")
+    reference = routed_experts_fp4(x, ids, weights, *banks, 10.0, activation_block_size=32)
+    for split in (0, 1, 3, 4):
+        cpu_ids = ids.clone()
+        cpu_ids[:, split:] = -1
+        gpu_w = weights.clone()
+        gpu_w[:, :split] = 0
+        pending = ex.decode_submit(0, x, weights, cpu_ids)
+        gpu = routed_experts_fp4(
+            x, ids, gpu_w, *banks, 10.0, activation_block_size=32,
+            return_route_outputs=True,
+        )
+        cpu = ex.decode_sync(pending)
+        assert cpu.shape == (1, 4, 256)
+        merged = (cpu + gpu).sum(dim=1)
+        torch.cuda.synchronize()
+        relative = (merged.float() - reference.float()).abs().max() / reference.abs().max()
+        assert relative < 0.04
+        assert torch.count_nonzero(cpu[:, split:]) == 0
+
+
+def test_dsfp4_gpu_order_rejects_unqualified_geometry():
+    from freetoken.kernel import _cpu_moe
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    if not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_gpu_order"):
+        pytest.skip("requires rebuilt GPU-order CPU extension")
+    with pytest.raises(ValueError, match="qualified only for V4.1"):
+        CpuMoeExecutor(
+            _make_dsfp4_cache(1, 2, 256, 256), top_k=2, activation="silu",
+            apply_router_weight_on_input=False, num_threads=2, max_tokens=1,
+            device=torch.device("cuda"), dsfp4_gpu_order=True,
+        )
+
+
+@pytest.mark.parametrize("bs", [1, 3, 5, 6])
+@pytest.mark.parametrize("route_parallel", [False, True])
+@pytest.mark.parametrize("fuse_prep", [False, True])
+def test_dsfp4_gpu_order_mapped_changing_graph_replay(monkeypatch, bs, route_parallel, fuse_prep):
+    """BS1 mapped and larger-batch DMA fallbacks preserve fresh route outputs."""
+    from freetoken.kernel import _cpu_moe
+    monkeypatch.setenv("FREETOKEN_DSV41_CPU_FUSE_PREP", "1" if fuse_prep else "0")
+    if fuse_prep and not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_fuse_prep"):
+        pytest.skip("Requires rebuilt fused-preparation extension")
+    monkeypatch.setenv("FREETOKEN_DSV41_CPU_ROUTE_PARALLEL", "1" if route_parallel else "0")
+    if route_parallel and not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_route_parallel"):
+        pytest.skip("Requires rebuilt route-parallel extension")
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
+
+    if not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_gpu_order"):
+        pytest.skip("requires rebuilt GPU-order CPU extension")
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_MAPPED_HANDOFF", "1")
+    H, I, E, top_k = 5120, 2304, 4, 4
+    cache = _make_dsfp4_cache(1, E, H, I, seed=7319)
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=bs, device=torch.device("cuda"),
+        swiglu_limit=10., dsfp4_activation_block_size=32,
+        return_route_outputs=True, dsfp4_gpu_order=True,
+    )
+    assert ex.dsfp4_route_parallel == route_parallel
+    assert ex.dsfp4_fuse_prep == fuse_prep
+    if not ex._mapped_handoff:
+        pytest.skip("mapped handoff requires CUDA stream memory operations")
+    banks = [cache.bank_sources[k][0].cuda() for k in (
+        "gate_up_packed", "gate_up_scale", "down_packed", "down_scale")]
+    x = torch.zeros(bs, H, device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((bs, top_k), -1, device="cuda", dtype=torch.int32)
+    w = torch.zeros(bs, top_k, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ex.decode_sync(ex.decode_submit(0, x, w, ids))
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = ex.decode_sync(ex.decode_submit(0, x, w, ids))
+    torch.cuda.current_stream().wait_stream(stream)
+    slot = ex._flag_slots[(0, bs)]
+    for n in (1, 0, 4, 2, 0, 3, 0, 4):
+        x.copy_(torch.randn_like(x) * .3)
+        rid = torch.randint(E, ids.shape, device="cuda", dtype=torch.int32)
+        ids.copy_(rid)
+        w.copy_(torch.rand_like(w) * .25)
+        w[:, n:] = 0
+        before = ex._ext.flag_served_count(slot)
+        reference = routed_experts_fp4(x, rid, w, *banks, 10.,
+            activation_block_size=32, return_route_outputs=True)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, reference)
+        assert torch.isfinite(output).all()
+        if bs == 1 and n == 0:
+            assert ex._ext.flag_served_count(slot) == before
+        ex.raise_if_unhealthy()
