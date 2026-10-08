@@ -858,7 +858,9 @@ def setup_offload_expert_banks(
                               parallel=parallel, workers=workers, chunk=chunk,
                               decode_target=decode_target, layer_sink=layer_sink)
     partition = _expert_partition(model_config)
-    if get_tp_info().size > 1 and partition.world_size == 1:
+    if get_tp_info().size > 1 and getattr(
+        partition, "world_size", get_tp_info().size
+    ) == 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.moe.expert_banks import ExpertBanks
 
@@ -895,7 +897,7 @@ def _expert_partition(model_config):
     plan = get_qwen4_exp_execution_plan()
     if not plan.enabled:
         return ExpertPartition(model_config.num_experts)
-    partition = plan.partition(qwen4_args.num_experts)
+    partition = plan.storage_partition(qwen4_args.num_experts)
     if partition.local_count != model_config.num_experts:
         raise ValueError(
             "Qwen4 EP config/loader disagree: "

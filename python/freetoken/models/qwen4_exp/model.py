@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
@@ -251,10 +252,24 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
+        def phase_barrier() -> None:
+            # In phase-aware EP, inactive prefill ranks skip the per-layer P2P
+            # sequence.  Rejoin the world communicator once per prefill forward
+            # so no rank can enqueue the following decode collective out of order.
+            if batch.is_prefill and self._execution.prefill_expert_shards is not None:
+                token = torch.zeros(
+                    (1,), dtype=torch.int32, device=batch.input_ids.device
+                )
+                DistributedCommunicator().all_reduce(token)
+
         if self._execution.is_expert_worker:
-            return self.model.forward(batch.input_ids, batch)
+            output = self.model.forward(batch.input_ids, batch)
+            phase_barrier()
+            return output
         assert self.lm_head is not None
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        hidden = self.model.forward(batch.input_ids, batch)
+        phase_barrier()
+        return self.lm_head.forward(hidden)
 
 
 __all__ = [

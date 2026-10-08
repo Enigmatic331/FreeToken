@@ -707,6 +707,48 @@ class Engine:
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            if self._qwen4_plan.prefill_expert_shards is not None:
+                total_experts = config.model_config.qwen4_args.num_experts
+                storage = self._qwen4_plan.storage_partition(total_experts)
+                prefill = self._qwen4_plan.partition(total_experts, prefill=True)
+                cache.set_prefill_expert_range(
+                    prefill.global_offset - storage.global_offset,
+                    prefill.local_count,
+                )
+                logger.info(
+                    "Qwen4Exp phase-aware EP rank=%d prefill local storage=[%d,%d)",
+                    config.tp_info.rank,
+                    prefill.global_offset - storage.global_offset,
+                    prefill.global_stop - storage.global_offset,
+                )
+            static_ranks_raw = os.environ.get(
+                "FREETOKEN_EP_STATIC_RESIDENT_RANKS", ""
+            ).strip()
+            if static_ranks_raw:
+                try:
+                    static_ranks = {
+                        int(item.strip())
+                        for item in static_ranks_raw.split(",")
+                        if item.strip()
+                    }
+                except ValueError as exc:
+                    raise ValueError(
+                        "FREETOKEN_EP_STATIC_RESIDENT_RANKS must be comma-separated "
+                        f"integer ranks, got {static_ranks_raw!r}"
+                    ) from exc
+                rank = config.tp_info.rank if config.tp_info is not None else 0
+                if rank in static_ranks:
+                    if config.qwen4_exp_backbone_rank is None:
+                        raise ValueError(
+                            "FREETOKEN_EP_STATIC_RESIDENT_RANKS is currently scoped "
+                            "to Qwen4Exp expert-parallel workers"
+                        )
+                    if rank == config.qwen4_exp_backbone_rank:
+                        raise ValueError(
+                            "the Qwen4Exp backbone rank cannot use experimental "
+                            "static-resident expert-worker mode"
+                        )
+                    cache.make_static_resident()
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -1351,18 +1393,26 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("Qwen4Exp EP currently requires --moe-backend offload")
         from freetoken.models.qwen4_exp.execution import get_qwen4_exp_execution_plan
 
-        partition = get_qwen4_exp_execution_plan().partition(qwen4_args.num_experts)
-        object.__setattr__(model_config, "num_experts", partition.local_count)
+        plan = get_qwen4_exp_execution_plan()
+        storage = plan.storage_partition(qwen4_args.num_experts)
+        decode_partition = plan.partition(qwen4_args.num_experts)
+        prefill_partition = plan.partition(qwen4_args.num_experts, prefill=True)
+        object.__setattr__(model_config, "num_experts", storage.local_count)
         if config.distributed_timeout == EngineConfig.distributed_timeout:
             override("distributed_timeout", 900.0)
         logger.info(
-            "Qwen4Exp EP rank=%d/%d backbone=%s experts=[%d,%d) local=%d",
+            "Qwen4Exp EP rank=%d/%d backbone=%s storage=[%d,%d) local=%d "
+            "prefill=[%d,%d) decode=[%d,%d)",
             tp_info.rank,
             tp_info.size,
             qwen_backbone_rank,
-            partition.global_offset,
-            partition.global_stop,
-            partition.local_count,
+            storage.global_offset,
+            storage.global_stop,
+            storage.local_count,
+            prefill_partition.global_offset,
+            prefill_partition.global_stop,
+            decode_partition.global_offset,
+            decode_partition.global_stop,
         )
 
     if moe_cache_sizes is not None:

@@ -368,6 +368,17 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        if getattr(cache, "static_resident", False):
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.static_layer_views(self.layer_id),
+                n=cache.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=False,
+            )
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -448,6 +459,17 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if getattr(cache, "static_resident", False):
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.static_layer_views(self.layer_id),
+                n=cache.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -670,13 +692,73 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     skip_inactive_prefill_routes = _EP_SKIP_INACTIVE_PREFILL_ROUTES
     compact_inactive_prefill_routes = _EP_COMPACT_INACTIVE_PREFILL_ROUTES
 
+    def _packed_prefill_peer_indices(
+        self,
+        local_topk_weights: torch.Tensor,
+        *,
+        token_offset: int = 0,
+    ) -> list[tuple[int, torch.Tensor]]:
+        """Return canonical flat-route indices owned by each non-root rank."""
+        root = getattr(self, "packed_prefill_root", None)
+        info = get_tp_info()
+        if root is None or info.rank != root:
+            raise RuntimeError("packed prefill peer indices are root-only")
+
+        global_ids = getattr(self, "_packed_prefill_global_topk_ids", None)
+        if global_ids is None:
+            # Preserve the established two-rank unit seam. With one worker every
+            # route not owned by root necessarily belongs to that worker.
+            if info.size != 2:
+                raise RuntimeError(
+                    "multi-worker packed prefill requires global route ownership"
+                )
+            owned = local_topk_weights.ne(0).reshape(-1)
+            return [(1 - root, torch.nonzero(~owned, as_tuple=False).flatten())]
+
+        if global_ids.shape != local_topk_weights.shape:
+            stop = token_offset + local_topk_weights.shape[0]
+            global_ids = global_ids[token_offset:stop]
+        if global_ids.shape != local_topk_weights.shape:
+            raise RuntimeError(
+                "global route ids and local weights disagree: "
+                f"{tuple(global_ids.shape)} != {tuple(local_topk_weights.shape)}"
+            )
+
+        shard_counts = getattr(self, "packed_prefill_shard_counts", None)
+        if shard_counts is None or len(shard_counts) != info.size:
+            raise RuntimeError(
+                "packed prefill shard counts must contain one entry per EP rank"
+            )
+        result = []
+        start = 0
+        for peer, count in enumerate(shard_counts):
+            stop = start + count
+            if peer != root:
+                owned = (global_ids >= start) & (global_ids < stop)
+                indices = torch.nonzero(
+                    owned.reshape(-1), as_tuple=False
+                ).flatten()
+                result.append((peer, indices))
+            start = stop
+        return result
+
     def prepare_packed_prefill_receive(
         self,
         local_topk_weights: torch.Tensor,
         route_dtype: torch.dtype,
+        *,
+        global_topk_ids: torch.Tensor | None = None,
+        token_offset: int = 0,
     ) -> None:
         root = getattr(self, "packed_prefill_root", None)
         info = get_tp_info()
+        if (
+            global_topk_ids is not None
+            and root is not None
+            and info.rank == root
+            and get_global_ctx().batch.is_prefill
+        ):
+            self._packed_prefill_global_topk_ids = global_topk_ids
         if (
             root is None
             or info.rank != root
@@ -684,8 +766,6 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             or not _EP_PACKED_PREFILL_OVERLAP
         ):
             return
-        if info.size != 2:
-            raise RuntimeError("packed prefill routes currently require exactly two EP ranks")
         if getattr(self, "_packed_prefill_pending", None) is not None:
             raise RuntimeError("packed prefill receive already pending")
 
@@ -694,46 +774,56 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         route_tile = self._prefill_route_tile_tokens(local_topk_weights.shape[0])
         if route_tile:
             local_topk_weights = local_topk_weights[:route_tile]
-
-        owned = local_topk_weights.ne(0).reshape(-1)
-        remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
-        if remote_indices.numel() == 0:
-            self._packed_prefill_pending = (remote_indices, None, None, None)
+        peer_indices = self._packed_prefill_peer_indices(
+            local_topk_weights,
+            token_offset=token_offset,
+        )
+        if not any(indices.numel() for _, indices in peer_indices):
+            self._packed_prefill_pending = []
+            self._packed_prefill_recv_stream = None
             return
 
         current = torch.cuda.current_stream(local_topk_weights.device)
         recv_stream = _ep_packed_recv_stream(local_topk_weights.device)
         recv_stream.wait_stream(current)
-        if _EP_PACKED_WIRE_DTYPE == "fp8":
-            elements = remote_indices.numel() * self.hidden_size
-            if elements % 4 != 0:
-                raise RuntimeError("FP8 route payload must pack evenly into int32 elements")
-            scale = torch.empty(
-                remote_indices.numel(),
-                dtype=torch.bfloat16,
-                device=local_topk_weights.device,
-            )
-            packed = torch.empty(
-                elements // 4,
-                dtype=torch.int32,
-                device=local_topk_weights.device,
-            )
-            with torch.cuda.stream(recv_stream):
-                # The native NCCL wrapper has no FP8/uint8 datatype mapping. Four
-                # E4M3 values are therefore carried losslessly as one int32 word.
-                communicator = DistributedCommunicator()
-                communicator.recv(scale, 1 - root)
-                communicator.recv(packed, 1 - root)
-        else:
-            scale = None
-            packed = torch.empty(
-                (remote_indices.numel(), self.hidden_size),
-                dtype=route_dtype,
-                device=local_topk_weights.device,
-            )
-            with torch.cuda.stream(recv_stream):
-                DistributedCommunicator().recv(packed, 1 - root)
-        self._packed_prefill_pending = (remote_indices, packed, scale, recv_stream)
+        pending = []
+        with torch.cuda.stream(recv_stream):
+            communicator = DistributedCommunicator()
+            for peer, remote_indices in peer_indices:
+                if remote_indices.numel() == 0:
+                    pending.append((peer, remote_indices, None, None))
+                    continue
+                if _EP_PACKED_WIRE_DTYPE == "fp8":
+                    elements = remote_indices.numel() * self.hidden_size
+                    if elements % 4 != 0:
+                        raise RuntimeError(
+                            "FP8 route payload must pack evenly into int32 elements"
+                        )
+                    scale = torch.empty(
+                        remote_indices.numel(),
+                        dtype=torch.bfloat16,
+                        device=local_topk_weights.device,
+                    )
+                    packed = torch.empty(
+                        elements // 4,
+                        dtype=torch.int32,
+                        device=local_topk_weights.device,
+                    )
+                    # The native NCCL wrapper has no FP8/uint8 datatype mapping.
+                    # Four E4M3 values are carried losslessly as one int32 word.
+                    communicator.recv(scale, peer)
+                    communicator.recv(packed, peer)
+                else:
+                    scale = None
+                    packed = torch.empty(
+                        (remote_indices.numel(), self.hidden_size),
+                        dtype=route_dtype,
+                        device=local_topk_weights.device,
+                    )
+                    communicator.recv(packed, peer)
+                pending.append((peer, remote_indices, packed, scale))
+        self._packed_prefill_pending = pending
+        self._packed_prefill_recv_stream = recv_stream
 
     def routed_forward(
         self,
@@ -749,7 +839,9 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                     hidden_states, topk_weights, topk_ids, route_tile
                 )
             routes = self._prefill_routed(hidden_states, topk_weights, topk_ids)
-            return self._maybe_combine_packed_prefill_routes(routes, topk_weights)
+            combined = self._maybe_combine_packed_prefill_routes(routes, topk_weights)
+            self._packed_prefill_global_topk_ids = None
+            return combined
         routes = self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(routes)
 
@@ -763,8 +855,6 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             return self._maybe_all_reduce(routes)
 
         info = get_tp_info()
-        if info.size != 2:
-            raise RuntimeError("packed prefill routes currently require exactly two EP ranks")
         if routes.ndim != 3:
             raise RuntimeError(f"expected per-route outputs, got shape {tuple(routes.shape)}")
         if routes.shape[:2] != local_topk_weights.shape:
@@ -792,9 +882,13 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         pending = getattr(self, "_packed_prefill_pending", None)
         self._packed_prefill_pending = None
         if pending is not None:
-            remote_indices, packed, scale, recv_stream = pending
-            if packed is not None:
+            recv_stream = getattr(self, "_packed_prefill_recv_stream", None)
+            self._packed_prefill_recv_stream = None
+            if recv_stream is not None:
                 torch.cuda.current_stream(routes.device).wait_stream(recv_stream)
+            for _, remote_indices, packed, scale in pending:
+                if packed is None:
+                    continue
                 if scale is not None:
                     packed = _dequantize_ep_routes(
                         packed,
@@ -804,10 +898,13 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                     )
                 flat_routes.index_copy_(0, remote_indices, packed)
         else:
-            remote_indices = torch.nonzero(~owned, as_tuple=False).flatten()
-            if remote_indices.numel() != 0:
+            for peer, remote_indices in self._packed_prefill_peer_indices(
+                local_topk_weights
+            ):
+                if remote_indices.numel() == 0:
+                    continue
                 packed = routes.new_empty((remote_indices.numel(), routes.shape[-1]))
-                communicator.recv(packed, 1 - root)
+                communicator.recv(packed, peer)
                 flat_routes.index_copy_(0, remote_indices, packed)
 
         from freetoken.kernel import moe_sum_reduce_triton
@@ -838,7 +935,9 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         """
         cache = self.offload_cache
         assert cache is not None
-        if cache.prefill_overlap:
+        if getattr(cache, "static_resident", False):
+            views = cache.static_layer_views(self.layer_id)
+        elif cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
         else:
             cache.materialize_layer(self.layer_id)
@@ -862,7 +961,11 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             tile_weights = topk_weights[start:end]
             tile_ids = topk_ids[start:end]
             if is_root and getattr(self, "_packed_prefill_pending", None) is None:
-                self.prepare_packed_prefill_receive(tile_weights, hidden_states.dtype)
+                self.prepare_packed_prefill_receive(
+                    tile_weights,
+                    hidden_states.dtype,
+                    token_offset=start,
+                )
             route_ids = (
                 tile_ids
                 if skip_inactive
@@ -900,6 +1003,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             )
         if cache.prefill_overlap:
             cache.release_prefill_layer(self.layer_id)
+        self._packed_prefill_global_topk_ids = None
         if output is not None:
             return output
         assert last is not None
@@ -987,6 +1091,12 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
     ) -> torch.Tensor:
         cache = self.offload_cache
         assert cache is not None
+        if getattr(cache, "static_resident", False):
+            return super()._prefill_routed(
+                hidden_states,
+                topk_weights,
+                self._cache_safe_route_ids(topk_weights, topk_ids),
+            )
         if (
             cache.sparse_prefill_max_tokens > 0
             and hidden_states.shape[0] <= cache.sparse_prefill_max_tokens

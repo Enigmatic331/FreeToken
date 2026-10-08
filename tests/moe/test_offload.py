@@ -663,6 +663,203 @@ def test_offload_cache_rebuild_resizes_and_preserves_sources():
     assert torch.all(cache.id_of_slot == -1)
 
 
+def test_static_resident_cache_preloads_layer_major_and_forbids_host_copies():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    num_layers, num_experts = 2, 3
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=num_layers * num_experts,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    gate_up = [
+        torch.full((num_experts, 4, 2), float(10 + layer))
+        for layer in range(num_layers)
+    ]
+    down = [
+        torch.full((num_experts, 2, 2), float(20 + layer))
+        for layer in range(num_layers)
+    ]
+    cache.set_bank_sources({"gate_up": gate_up, "down": down})
+
+    cache.make_static_resident()
+
+    assert cache.static_resident is True
+    assert cache.prefill_overlap is False
+    assert cache.static_resident_bytes == sum(
+        tensor.numel() * tensor.element_size()
+        for layers in (gate_up, down)
+        for tensor in layers
+    )
+    assert cache.slot_for_id.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert cache.id_of_slot.tolist() == [0, 1, 2, 3, 4, 5]
+    for layer_id in range(num_layers):
+        got_gate_up, got_down = cache.static_layer_views(layer_id)
+        assert torch.equal(got_gate_up, gate_up[layer_id])
+        assert torch.equal(got_down, down[layer_id])
+
+    cache.reset()
+    assert cache.slot_for_id.tolist() == [[0, 1, 2], [3, 4, 5]]
+    with pytest.raises(RuntimeError, match="request-time expert copy"):
+        cache.copy_missing()
+    with pytest.raises(ValueError, match="cannot resize"):
+        cache.rebuild(num_layers * num_experts)
+
+
+def test_static_resident_cache_requires_full_local_bank_capacity():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=3,
+        cache_size=5,
+        device=torch.device("cpu"),
+    )
+    cache.set_bank_sources(
+        {
+            "gate_up": [torch.randn(3, 4, 2) for _ in range(2)],
+            "down": [torch.randn(3, 2, 2) for _ in range(2)],
+        }
+    )
+    with pytest.raises(ValueError, match="required=6"):
+        cache.make_static_resident()
+
+
+def test_phase_aware_prefill_copies_only_owned_storage_slice():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=6,
+        cache_size=12,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    gate_up = [torch.arange(24).view(6, 4) + layer * 100 for layer in range(2)]
+    down = [torch.arange(12).view(6, 2) + layer * 100 for layer in range(2)]
+    cache.set_bank_sources({"gate_up": gate_up, "down": down})
+    cache.set_prefill_expert_range(2, 3)
+    for bank in cache.bank_caches.values():
+        bank.fill_(-1)
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    got_gate_up, got_down = cache.wait_prefill_layer(0)
+
+    assert torch.equal(got_gate_up[2:5], gate_up[0][2:5])
+    assert torch.equal(got_down[2:5], down[0][2:5])
+    assert torch.all(got_gate_up[:2] == -1) and torch.all(got_gate_up[5:] == -1)
+    assert torch.all(got_down[:2] == -1) and torch.all(got_down[5:] == -1)
+
+
+def test_static_resident_layer_uses_preloaded_slice_without_copy(monkeypatch):
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    num_layers, num_experts = 2, 3
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=num_layers * num_experts,
+        device=torch.device("cpu"),
+    )
+    gate_up = [torch.randn(num_experts, 8, 4) for _ in range(num_layers)]
+    down = [torch.randn(num_experts, 4, 4) for _ in range(num_layers)]
+    cache.set_bank_sources({"gate_up": gate_up, "down": down})
+    cache.make_static_resident()
+
+    layer = OffloadMoELayer(
+        layer_id=1,
+        num_experts=num_experts,
+        top_k=2,
+        hidden_size=4,
+        intermediate_size=4,
+    )
+    layer.offload_cache = cache
+    calls = {}
+
+    def fake_fused(hidden, got_gate_up, got_down, weights, ids, activation, apply):
+        calls["gate_up"] = got_gate_up.clone()
+        calls["down"] = got_down.clone()
+        calls["ids"] = ids.clone()
+        return hidden
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+    monkeypatch.setattr(
+        cache,
+        "copy_missing",
+        lambda: (_ for _ in ()).throw(AssertionError("static path attempted H2D")),
+    )
+    hidden = torch.randn(1, 4)
+    weights = torch.tensor([[0.7, 0.3]])
+    ids = torch.tensor([[2, 0]], dtype=torch.int32)
+
+    output = layer._prefill_routed(hidden, weights, ids)
+
+    assert torch.equal(output, hidden)
+    assert torch.equal(calls["gate_up"], gate_up[1])
+    assert torch.equal(calls["down"], down[1])
+    assert calls["ids"].tolist() == [[2, 0]]
+
+
+def test_static_resident_tiled_prefill_uses_preloaded_slice_without_copy(monkeypatch):
+    from freetoken.layers.moe import ExpertParallelOffloadMoELayer
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    num_layers, num_experts = 2, 3
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=num_layers * num_experts,
+        device=torch.device("cpu"),
+    )
+    gate_up = [torch.randn(num_experts, 8, 4) for _ in range(num_layers)]
+    down = [torch.randn(num_experts, 4, 4) for _ in range(num_layers)]
+    cache.set_bank_sources({"gate_up": gate_up, "down": down})
+    cache.make_static_resident()
+
+    layer = ExpertParallelOffloadMoELayer(
+        layer_id=1,
+        num_experts=num_experts,
+        top_k=2,
+        hidden_size=4,
+        intermediate_size=4,
+    )
+    layer.offload_cache = cache
+    calls = {}
+
+    def fake_fused(hidden, got_gate_up, got_down, weights, ids, activation, apply):
+        calls["gate_up"] = got_gate_up.clone()
+        calls["down"] = got_down.clone()
+        calls["ids"] = ids.clone()
+        return hidden
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+    monkeypatch.setattr(
+        cache,
+        "copy_missing",
+        lambda: (_ for _ in ()).throw(AssertionError("static tiled path attempted H2D")),
+    )
+    monkeypatch.setattr(layer, "_maybe_all_reduce", lambda routes: routes)
+    hidden = torch.randn(1, 4)
+    weights = torch.tensor([[0.7, 0.3]])
+    ids = torch.tensor([[2, 0]], dtype=torch.int32)
+
+    output = layer._prefill_routed_tiled(hidden, weights, ids, tile_tokens=1)
+
+    assert torch.equal(output, hidden)
+    assert torch.equal(calls["gate_up"], gate_up[1])
+    assert torch.equal(calls["down"], down[1])
+    assert calls["ids"].tolist() == [[2, 0]]
+
+
 def test_offload_cache_rebuild_disables_prefill_overlap_when_too_small():
     from freetoken.moe.offload_cache import OffloadMoeCache
 

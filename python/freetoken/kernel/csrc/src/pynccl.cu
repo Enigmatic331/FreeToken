@@ -81,15 +81,29 @@ public:
     m_comm = {comm, template_fn<::ncclCommDestroy>};
 
     void *buf;
-    NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
-    m_sym_mem = {buf, template_fn<::ncclMemFree>};
+    if (m_world_size == 2) {
+      NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
+      m_sym_mem = {buf, template_fn<::ncclMemFree>};
 
-    ncclWindow_t win;
-    NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
-                                        NCCL_WIN_COLL_SYMMETRIC));
-    m_win = {win, [comm = m_comm](ncclWindow_t w) {
-               return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
-             }};
+      ncclWindow_t win;
+      NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
+                                          NCCL_WIN_COLL_SYMMETRIC));
+      m_win = {win, [comm = m_comm](ncclWindow_t w) {
+                 return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
+               }};
+    } else {
+      // NCCL 2.28/2.31 symmetric VA registration fails with invalid-device
+      // ordinal when this machine's Blackwell pair shares a communicator with
+      // the Ada display GPU. The wrapper uses this allocation only as an
+      // ordinary all-reduce scratch buffer, so a regular device allocation is
+      // equivalent and leaves send/recv transport selection to NCCL.
+      host::CUDA_CHECK(::cudaMalloc(&buf, max_bytes));
+      m_sym_mem = {buf, [](void *ptr) {
+                     if (ptr != nullptr) {
+                       ::cudaFree(ptr);
+                     }
+                   }};
+    }
   }
 
   auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {

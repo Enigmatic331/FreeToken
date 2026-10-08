@@ -18,8 +18,10 @@ from freetoken.models.qwen4_exp import execution
 from freetoken.models.qwen4_exp.execution import Qwen4ExpExecutionPlan
 from freetoken.moe.partition import (
     ExpertPartition,
+    ExpertStorageRange,
     cache_safe_route_ids,
     localize_expert_routes,
+    localize_expert_routes_to_storage,
 )
 
 
@@ -96,6 +98,61 @@ def test_ep_offload_packs_remote_prefill_routes_in_canonical_order(monkeypatch):
     )
 
 
+def test_ep_offload_combines_multiple_workers_in_canonical_order(monkeypatch):
+    class FakeCommunicator:
+        def __init__(self):
+            self.messages = {}
+
+        def send(self, tensor, dst):
+            src = distributed_info._TP_INFO.rank
+            assert dst == 0
+            self.messages[(src, dst)] = tensor.clone()
+            return tensor
+
+        def recv(self, tensor, src):
+            dst = distributed_info._TP_INFO.rank
+            tensor.copy_(self.messages[(src, dst)])
+            return tensor
+
+    fake = FakeCommunicator()
+    monkeypatch.setattr(DistributedCommunicator, "plugins", [fake])
+
+    def sum_routes(routes, output):
+        output.copy_(routes.float().sum(dim=1).to(output.dtype))
+
+    monkeypatch.setattr(freetoken_kernel, "moe_sum_reduce_triton", sum_routes)
+    layer = object.__new__(ExpertParallelOffloadMoELayer)
+    layer.packed_prefill_root = 0
+    layer.packed_prefill_shard_counts = (2, 2, 2)
+
+    global_ids = torch.tensor([[0, 2, 4], [5, 1, 3]])
+    full_routes = torch.arange(24, dtype=torch.float32).view(2, 3, 4).to(torch.bfloat16)
+    masks = [
+        (global_ids >= 0) & (global_ids < 2),
+        (global_ids >= 2) & (global_ids < 4),
+        (global_ids >= 4) & (global_ids < 6),
+    ]
+
+    for rank in (1, 2):
+        monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(rank, 3))
+        worker_routes = torch.where(masks[rank].unsqueeze(-1), full_routes, 0)
+        worker_weights = masks[rank].to(torch.float32)
+        worker_output = layer._maybe_combine_packed_prefill_routes(
+            worker_routes, worker_weights
+        )
+        assert worker_output is worker_routes
+
+    monkeypatch.setattr(distributed_info, "_TP_INFO", DistributedInfo(0, 3))
+    layer._packed_prefill_global_topk_ids = global_ids
+    root_routes = torch.where(masks[0].unsqueeze(-1), full_routes, 0)
+    root_output = layer._maybe_combine_packed_prefill_routes(
+        root_routes, masks[0].to(torch.float32)
+    )
+    torch.testing.assert_close(
+        root_output, full_routes.float().sum(dim=1).to(torch.bfloat16)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_ep_worker_async_send_preserves_owned_route_order(monkeypatch):
     class FakeCommunicator:
@@ -155,6 +212,51 @@ def test_heterogeneous_partition_validation():
     assert (partition.global_offset, partition.global_stop) == (0, 96)
     with pytest.raises(ValueError, match="must sum"):
         ExpertPartition(512, world_size=2, rank=0, shard_counts=(100, 400))
+
+
+def test_phase_aware_partition_uses_overlapping_storage():
+    layout = dict(
+        backbone_rank=0,
+        expert_shards=(208, 208, 96),
+        prefill_expert_shards=(256, 256, 0),
+        expert_storage_ranges=((0, 256), (208, 304), (416, 96)),
+    )
+    plan = Qwen4ExpExecutionPlan(1, 3, **layout)
+
+    storage = plan.storage_partition(512)
+    prefill = plan.partition(512, prefill=True)
+    decode = plan.partition(512)
+
+    assert storage == ExpertStorageRange(512, 208, 304)
+    assert (prefill.global_offset, prefill.local_count) == (256, 256)
+    assert (decode.global_offset, decode.local_count) == (208, 208)
+    assert plan.prefill_active_ranks(512) == (0, 1)
+
+    weights = torch.ones((1, 4))
+    ids = torch.tensor([[208, 255, 256, 415]])
+    prefill_weights, prefill_ids = localize_expert_routes_to_storage(
+        weights, ids, prefill, storage
+    )
+    assert torch.equal(prefill_weights, torch.tensor([[0.0, 0.0, 1.0, 1.0]]))
+    assert torch.equal(prefill_ids, torch.tensor([[304, 304, 48, 207]]))
+    decode_weights, decode_ids = localize_expert_routes_to_storage(
+        weights, ids, decode, storage
+    )
+    assert torch.equal(decode_weights, torch.tensor([[1.0, 1.0, 1.0, 1.0]]))
+    assert torch.equal(decode_ids, torch.tensor([[0, 47, 48, 207]]))
+
+
+def test_phase_aware_partition_rejects_unstored_ownership():
+    plan = Qwen4ExpExecutionPlan(
+        1,
+        3,
+        backbone_rank=0,
+        expert_shards=(208, 208, 96),
+        prefill_expert_shards=(256, 256, 0),
+        expert_storage_ranges=((0, 256), (256, 208), (416, 96)),
+    )
+    with pytest.raises(ValueError, match="prefill ownership"):
+        plan.storage_partition(512)
 
 
 def test_qwen_fp8_loader_uses_rank_local_partition(monkeypatch):

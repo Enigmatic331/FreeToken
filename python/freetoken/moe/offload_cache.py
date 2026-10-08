@@ -302,6 +302,26 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Experimental EP worker mode: every (layer, local-expert) row is copied
+        # once into a deterministic layer-major slot and request-time host-bank
+        # access is forbidden.  This is deliberately opt-in; normal offload
+        # caches retain their existing LRU and prefill-double-buffer behaviour.
+        self.static_resident = False
+        self.static_resident_bytes = 0
+        # Optional phase-aware EP slice.  Long prefill copies only the experts
+        # owned by this rank during prefill, while decode may use a different
+        # subset of an overlapping stored range.
+        self.prefill_expert_start = 0
+        self.prefill_expert_count = self.num_experts
+
+    def set_prefill_expert_range(self, start: int, count: int) -> None:
+        if start < 0 or count < 0 or start + count > self.num_experts:
+            raise ValueError(
+                f"prefill expert range [{start}, {start + count}) is outside "
+                f"stored experts [0, {self.num_experts})"
+            )
+        self.prefill_expert_start = start
+        self.prefill_expert_count = count
 
     def set_bank_sources(
         self,
@@ -366,6 +386,75 @@ class OffloadMoeCache:
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def make_static_resident(self) -> None:
+        """Preload every local expert and forbid request-time host-bank copies.
+
+        Slots are ``layer_id * num_experts + expert_id``.  Keeping each layer's
+        rows contiguous lets both grouped prefill and decode kernels consume a
+        normal ``[num_experts, ...]`` view without LRU remapping.  The source
+        banks remain allocated only because the surrounding loader owns them;
+        no request path may read them after this method returns.
+        """
+        assert self.banks, "set_bank_sources must register the banks first"
+        required = self.num_layers * self.num_experts
+        if self.cache_size < required:
+            raise ValueError(
+                "static-resident MoE needs one slot for every layer-local expert: "
+                f"cache_size={self.cache_size}, required={required}"
+            )
+        if self.decode_target != "gpu" or self.cpu_layer_ids:
+            raise ValueError("static-resident MoE requires all-GPU expert execution")
+
+        # Prefill overlap borrows/invalidates the first 2E cache slots.  Static
+        # residency instead addresses immutable per-layer slices directly.
+        self.prefill_overlap = False
+        self.prefill_bank_buffers = []
+        self.prefill_copy_stream = None
+        self.prefill_begin_event = None
+        self.prefill_ready_events = []
+        self.prefill_release_events = []
+        self._prefill_buffer_layer = [None, None]
+        self._prefill_buffer_released = [True, True]
+        self._prefill_buffer_has_release_event = [False, False]
+
+        copied = 0
+        for per_layer, resident in self.banks:
+            row_bytes = per_layer[0][0].numel() * per_layer[0].element_size()
+            for layer_id, source in enumerate(per_layer):
+                start = layer_id * self.num_experts
+                stop = start + self.num_experts
+                resident[start:stop].copy_(
+                    source, non_blocking=self.device.type == "cuda"
+                )
+                copied += self.num_experts * row_bytes
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+        ids = torch.arange(required, dtype=torch.int32, device=self.device)
+        self.slot_for_id.copy_(ids.view(self.num_layers, self.num_experts))
+        self.id_of_slot.fill_(-1)
+        self.id_of_slot[:required].copy_(ids)
+        self.usage.zero_()
+        self.static_resident = True
+        self.static_resident_bytes = copied
+        logger.info(
+            "Static-resident MoE ready: %d layers x %d experts, %.2f GiB copied once; "
+            "request-time expert H2D disabled",
+            self.num_layers,
+            self.num_experts,
+            copied / 2**30,
+        )
+
+    def static_layer_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """Contiguous immutable bank views for one fully resident layer."""
+        if not self.static_resident:
+            raise RuntimeError("MoE cache is not static-resident")
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError(f"layer_id {layer_id} out of range [0, {self.num_layers})")
+        start = layer_id * self.num_experts
+        stop = start + self.num_experts
+        return tuple(cache[start:stop] for _, cache in self.banks)
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -457,6 +546,8 @@ class OffloadMoeCache:
         ``ctx.moe_offload_cache`` stay valid.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
+        if self.static_resident:
+            raise ValueError("cannot resize a static-resident MoE cache")
         self.validate_rebuild(cache_size)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
@@ -669,8 +760,12 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
+            start = self.prefill_expert_start
+            stop = start + self.prefill_expert_count
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                buffer[buffer_id, start:stop].copy_(
+                    per_layer[layer_id][start:stop], non_blocking=True
+                )
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -879,6 +974,11 @@ class OffloadMoeCache:
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
+        if self.static_resident:
+            # Graph warmup/capture resets must not discard the immutable map.
+            self.reset_stats()
+            self.expert_recency.fill_(-1)
+            return
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
@@ -1017,6 +1117,10 @@ class OffloadMoeCache:
         }
 
     def copy_missing(self) -> None:
+        if self.static_resident:
+            raise RuntimeError(
+                "request-time expert copy attempted on a static-resident MoE cache"
+            )
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
