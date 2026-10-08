@@ -199,6 +199,7 @@ def _prefill_dsfp4_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    INACTIVE_EXPERT: tl.constexpr = -1,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -223,6 +224,15 @@ def _prefill_dsfp4_moe_kernel(
     route_rows = offs_route // top_k
 
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if INACTIVE_EXPERT >= 0:
+        # The aligner includes a dedicated out-of-bank bucket for zero-weight
+        # routes. Never dereference that bank row, and explicitly overwrite
+        # every valid output lane (including when storage is reused).
+        if slot == INACTIVE_EXPERT:
+            zero_ptrs = c_ptr + stride_cm * offs_route[:, None] + stride_cn * offs_n[None, :]
+            zero_mask = route_mask[:, None] & (offs_n[None, :] < N)
+            tl.store(zero_ptrs, tl.full((BLOCK_SIZE_M, BLOCK_SIZE_N), 0, compute_type), mask=zero_mask)
+            return
     a_ptrs = a_ptr + route_rows[:, None] * stride_am + offs_k[None, :] * stride_ak
     # B tile is built transposed [BN, ...]: the packed bytes then read
     # contiguously along their K-major axis (one byte per two k-values, loaded

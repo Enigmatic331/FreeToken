@@ -46,10 +46,38 @@
 #else
 #define CPU_MOE_X86 0
 #endif
+// C3 warm wait (default off) uses AMD user-mode MONITORX/MWAITX.
+#if CPU_MOE_X86 && !defined(_MSC_VER)
+#include <cpuid.h>
+#include <x86intrin.h>
+#define CPU_MOE_WARM 1
+#else
+#define CPU_MOE_WARM 0
+#endif
 
 namespace {
 
 using bf16_t = uint16_t;
+
+#if CPU_MOE_WARM
+// C3 warm wait primitives.  MONITORX arms a cache-line monitor; MWAITX (timer
+// enabled, C1 hint) halts this logical CPU until that line is written or the
+// TSC-cycle budget elapses.  A halted SMT thread yields the core to its sibling,
+// and the shallow state avoids the deep-idle exit and clock ramp a futex sleep
+// longer than ~1 ms incurs.  Callers re-check their condition between arm and wait.
+inline bool cpu_has_monitorx() {
+  unsigned a, b, c, d;
+  return __get_cpuid(0x80000001u, &a, &b, &c, &d) && (c & (1u << 29));
+}
+__attribute__((target("mwaitx"))) inline void warm_arm(const void* line) {
+  _mm_monitorx(const_cast<void*>(line), 0, 0);
+}
+__attribute__((target("mwaitx"))) inline void warm_halt(uint32_t tsc_cycles) {
+  _mm_mwaitx(2, 0, tsc_cycles);
+}
+// Longest single MWAITX slice: bounds shutdown latency of a warm worker.
+constexpr uint64_t kWarmSliceCycles = 100000;
+#endif
 
 inline float bf16_to_f32(bf16_t v) {
   uint32_t u = static_cast<uint32_t>(v) << 16;
@@ -936,6 +964,203 @@ void dsfp4_gpu_order_rows8(float* out, const uint8_t* native_p, const uint8_t* n
   }
   _mm256_storeu_ps(out, _mm256_mul_ps(total, _mm256_set1_ps(weight)));
 }
+
+// Optional C2 layout bank: the SAME eight-row byte transpose that
+// dsfp4_gpu_order_rows8 performs per call, done once at load into a CPU-only
+// copy (dsfp4_layout_copy below uses dsfp4_transpose8 itself, so the bytes are
+// identical by construction).  This body is the dot loop of
+// dsfp4_gpu_order_rows8, verbatim, reading the pre-transposed tile directly;
+// accumulation order, FMAs and the final weight multiply are unchanged.  The
+// default function above is deliberately left untouched.
+__attribute__((target("avx2,fma")))
+void dsfp4_layout_rows8(float* out, const uint8_t* packed, const uint8_t* scale,
+                        const float* xe, const float* xo, int K,
+                        const float* e2m1, const float* e8m0, float weight) {
+  const __m256 mag = _mm256_loadu_ps(e2m1);
+  const __m256i mask = _mm256_set1_epi32(15);
+  __m256 total = _mm256_setzero_ps();
+  for (int start = 0; start < K / 2; start += 128) {
+    __m256 sums[4], sc;
+    for (int t = 0; t < 64; ++t) {
+      const int j = start + (t == 0 ? 2 : t == 1 ? 0 : 2 * t);
+      if (t < 2 || (j % 16) == 0) {
+        const auto codes = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(scale + (j / 16) * 8)));
+        sc = _mm256_i32gather_ps(e8m0, codes, 4);
+      }
+      for (int parity = 0; parity < 2; ++parity) {
+        const auto p = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(packed + (j + parity) * 8)));
+        const auto lo = _mm256_mul_ps(e2m1_decode8(_mm256_and_si256(p, mask), mag), sc);
+        const auto hi = _mm256_mul_ps(e2m1_decode8(_mm256_srli_epi32(p, 4), mag), sc);
+        const auto a = _mm256_set1_ps(xe[j + parity]);
+        const auto b = _mm256_set1_ps(xo[j + parity]);
+        if (t == 0) {
+          sums[parity] = _mm256_mul_ps(lo, a);
+          sums[2 + parity] = _mm256_mul_ps(hi, b);
+        } else {
+          sums[parity] = _mm256_fmadd_ps(lo, a, sums[parity]);
+          sums[2 + parity] = _mm256_fmadd_ps(hi, b, sums[2 + parity]);
+        }
+      }
+    }
+    total = _mm256_add_ps(total, _mm256_add_ps(sums[0], sums[1]));
+    total = _mm256_add_ps(total, _mm256_add_ps(sums[2], sums[3]));
+  }
+  _mm256_storeu_ps(out, _mm256_mul_ps(total, _mm256_set1_ps(weight)));
+}
+
+// Optional C3 two-tile kernel: two independent eight-row transposed tiles that read
+// the same activations (gate+up tiles in pass 1, adjacent down tiles in pass 2).
+// Tiles come from the C2 layout bank or, without it, from the same per-call
+// dsfp4_transpose8 that dsfp4_gpu_order_rows8 uses (dsfp4_native_rows8x2).
+// Every lane executes the floating-point sequence of dsfp4_layout_rows8 exactly:
+// lo/hi = scale * e2m1, t==0 product, FMA chains in the same t/parity order and the
+// same block-end additions.  The arithmetic is pinned with inline asm to the
+// operand forms of the qualified binary (cad52fa2: vmulps scale,e2m1;
+// vmulps lo,a; vfmadd231ps acc,lo,a; (s0+s1)+total, total+(s2+s3);
+// weight*total) so NaN-payload propagation matches as well as ordinary values.
+// The e2m1 decode drops two masks that vpermps ignores, and the e8m0 scale is
+// built with integer shifts equal to e8m0_lut for every code (setter self-check).
+// Only the shared activation broadcasts and the code generation differ.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 dsfp4_x2_dec_lo(__m256i p, __m256 mag8, __m256i sign) {
+  const __m256 m = _mm256_permutevar8x32_ps(mag8, p);
+  return _mm256_xor_ps(m, _mm256_castsi256_ps(_mm256_and_si256(_mm256_slli_epi32(p, 28), sign)));
+}
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 dsfp4_x2_dec_hi(__m256i p, __m256 mag8, __m256i sign) {
+  const __m256 m = _mm256_permutevar8x32_ps(mag8, _mm256_srli_epi32(p, 4));
+  return _mm256_xor_ps(m, _mm256_castsi256_ps(_mm256_and_si256(_mm256_slli_epi32(p, 24), sign)));
+}
+// 2^(min(c,254)-127) as fp32 bits; c == 0 is the subnormal 2^-127 (0x00400000).
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 dsfp4_x2_e8m0(const uint8_t* s) {
+  __m256i c = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s)));
+  c = _mm256_min_epu32(c, _mm256_set1_epi32(254));
+  const __m256i zero = _mm256_and_si256(_mm256_cmpeq_epi32(c, _mm256_setzero_si256()),
+                                        _mm256_set1_epi32(0x00400000));
+  return _mm256_castsi256_ps(_mm256_or_si256(_mm256_slli_epi32(c, 23), zero));
+}
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 dsfp4_x2_mul(__m256 s1, __m256 s2) {
+  __m256 d;
+  asm("vmulps %2, %1, %0" : "=x"(d) : "x"(s1), "x"(s2));
+  return d;
+}
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 dsfp4_x2_add(__m256 s1, __m256 s2) {
+  __m256 d;
+  asm("vaddps %2, %1, %0" : "=x"(d) : "x"(s1), "x"(s2));
+  return d;
+}
+__attribute__((target("avx2,fma"), always_inline))
+inline void dsfp4_x2_fma(__m256& acc, __m256 lo, __m256 a) {
+  asm("vfmadd231ps %2, %1, %0" : "+x"(acc) : "x"(lo), "x"(a));
+}
+
+__attribute__((target("avx2,fma")))
+void dsfp4_rows8x2(float* out0, float* out1, const uint8_t* p0, const uint8_t* s0,
+                   const uint8_t* p1, const uint8_t* s1, const float* xe, const float* xo,
+                   int K, const float* e2m1, float weight) {
+  const __m256 mag = _mm256_loadu_ps(e2m1);
+  const __m256i sign = _mm256_set1_epi32(static_cast<int>(0x80000000u));
+  __m256 total0 = _mm256_setzero_ps(), total1 = _mm256_setzero_ps();
+  for (int start = 0; start < K / 2; start += 128) {
+    __m256 u[4], v[4], sc0, sc1;
+    for (int t = 0; t < 64; ++t) {
+      const int j = start + (t == 0 ? 2 : t == 1 ? 0 : 2 * t);
+      if (t < 2 || (j % 16) == 0) {
+        sc0 = dsfp4_x2_e8m0(s0 + (j / 16) * 8);
+        sc1 = dsfp4_x2_e8m0(s1 + (j / 16) * 8);
+      }
+      for (int parity = 0; parity < 2; ++parity) {
+        const auto a = _mm256_set1_ps(xe[j + parity]);
+        const auto b = _mm256_set1_ps(xo[j + parity]);
+        const auto q0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(p0 + (j + parity) * 8)));
+        const auto q1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(p1 + (j + parity) * 8)));
+        const auto lo0 = dsfp4_x2_mul(sc0, dsfp4_x2_dec_lo(q0, mag, sign));
+        const auto hi0 = dsfp4_x2_mul(sc0, dsfp4_x2_dec_hi(q0, mag, sign));
+        const auto lo1 = dsfp4_x2_mul(sc1, dsfp4_x2_dec_lo(q1, mag, sign));
+        const auto hi1 = dsfp4_x2_mul(sc1, dsfp4_x2_dec_hi(q1, mag, sign));
+        if (t == 0) {
+          u[parity] = dsfp4_x2_mul(lo0, a);
+          u[2 + parity] = dsfp4_x2_mul(hi0, b);
+          v[parity] = dsfp4_x2_mul(lo1, a);
+          v[2 + parity] = dsfp4_x2_mul(hi1, b);
+        } else {
+          dsfp4_x2_fma(u[parity], lo0, a);
+          dsfp4_x2_fma(u[2 + parity], hi0, b);
+          dsfp4_x2_fma(v[parity], lo1, a);
+          dsfp4_x2_fma(v[2 + parity], hi1, b);
+        }
+      }
+    }
+    total0 = dsfp4_x2_add(dsfp4_x2_add(dsfp4_x2_add(u[0], u[1]), total0), dsfp4_x2_add(u[2], u[3]));
+    total1 = dsfp4_x2_add(dsfp4_x2_add(dsfp4_x2_add(v[0], v[1]), total1), dsfp4_x2_add(v[2], v[3]));
+  }
+  const __m256 w = _mm256_set1_ps(weight);
+  _mm256_storeu_ps(out0, dsfp4_x2_mul(w, total0));
+  _mm256_storeu_ps(out1, dsfp4_x2_mul(w, total1));
+}
+
+// Native (no layout bank) form: transpose both tiles exactly as
+// dsfp4_gpu_order_rows8 does, into worker-local scratch, then the two-tile dot.
+__attribute__((target("avx2,fma")))
+void dsfp4_native_rows8x2(float* out0, float* out1, const uint8_t* native_p0,
+                          const uint8_t* native_s0, const uint8_t* native_p1,
+                          const uint8_t* native_s1, const float* xe, const float* xo, int K,
+                          const float* e2m1, float weight) {
+  thread_local std::vector<uint8_t> packed0, scale0, packed1, scale1;
+  const size_t pb = (size_t)K * 4, sb = (size_t)(K / 32) * 8;
+  if (packed0.size() < pb) { packed0.resize(pb); packed1.resize(pb); }
+  if (scale0.size() < sb) { scale0.resize(sb); scale1.resize(sb); }
+  dsfp4_transpose8(packed0.data(), native_p0, K / 2);
+  dsfp4_transpose8(scale0.data(), native_s0, K / 32);
+  dsfp4_transpose8(packed1.data(), native_p1, K / 2);
+  dsfp4_transpose8(scale1.data(), native_s1, K / 32);
+  dsfp4_rows8x2(out0, out1, packed0.data(), scale0.data(), packed1.data(), scale1.data(), xe, xo,
+                K, e2m1, weight);
+}
+
+// Setter self-check: the shift-built scale must equal the executor's LUT bits.
+__attribute__((target("avx2,fma")))
+bool dsfp4_x2_e8m0_matches(const float* e8m0) {
+  for (int c = 0; c < 256; ++c) {
+    uint8_t s[8];
+    std::fill_n(s, 8, static_cast<uint8_t>(c));
+    float v[8];
+    _mm256_storeu_ps(v, dsfp4_x2_e8m0(s));
+    for (float f : v)
+      if (std::memcmp(&f, &e8m0[c], sizeof(float)) != 0) return false;
+  }
+  return true;
+}
+
+// Build a layout copy: rows must be a multiple of 8 and every 8-row tile is
+// independent, so experts (N % 8 == 0) never share a tile.  Called once per
+// (layer, bank) at executor construction, never on the decode path.
+void dsfp4_layout_copy(uintptr_t dst_addr, uintptr_t src_addr, int64_t rows, int row_bytes,
+                       int threads) {
+  if (rows <= 0 || rows % 8 != 0 || row_bytes <= 0)
+    throw std::invalid_argument("layout copy needs a positive multiple of 8 rows");
+  auto* dst = reinterpret_cast<uint8_t*>(dst_addr);
+  const auto* src = reinterpret_cast<const uint8_t*>(src_addr);
+  const int64_t tiles = rows / 8;
+  const int n = std::max(1, std::min<int>(threads, static_cast<int>(std::min<int64_t>(tiles, 64))));
+  std::vector<std::thread> pool;
+  for (int w = 0; w < n; ++w) {
+    pool.emplace_back([=]() {
+      for (int64_t tile = w; tile < tiles; tile += n) {
+        const size_t offset = static_cast<size_t>(tile) * 8 * static_cast<size_t>(row_bytes);
+        dsfp4_transpose8(dst + offset, src + offset, row_bytes);
+      }
+    });
+  }
+  for (auto& thread : pool) thread.join();
+}
 #endif
 
 // ------------------------- mxfp4 (gpt-oss) GEMV -----------------------------
@@ -1321,6 +1546,25 @@ struct CpuMoeExecutor {
   const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp16 row globals
   const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
   const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
+  // Optional C2 layout tables: [num_layers * num_experts] base addresses of a
+  // pre-transposed CPU-only copy of one expert (0 = not covered).  The native
+  // tables above stay authoritative and are what GPU refill/prefill also read.
+  const uint64_t* lay_gu_p_tbl = nullptr;
+  const uint64_t* lay_gu_s_tbl = nullptr;
+  const uint64_t* lay_dn_p_tbl = nullptr;
+  const uint64_t* lay_dn_s_tbl = nullptr;
+  bool dsfp4_layout = false;
+  bool dsfp4_layout_task = false;   // whole task covered: every valid route has a layout
+  int64_t layout_tasks = 0, layout_fallback_tasks = 0;
+  bool layout_served_logged = false, layout_fallback_logged = false;
+  // C3 (default off): serve GPU-order DS-FP4 tasks with the two-tile kernel, from
+  // the layout bank when the task is covered, otherwise from native rows.
+  bool dsfp4_x2 = false;
+  int64_t x2_tasks = 0;
+  bool x2_logged = false;
+  inline const uint8_t* lay_at(const uint64_t* tbl, int layer_id, int e) const {
+    return reinterpret_cast<const uint8_t*>(tbl[static_cast<size_t>(layer_id) * num_experts + e]);
+  }
   float swiglu_alpha;
   float swiglu_limit;          // +inf == no clamp
   dot_fn dot;
@@ -1345,6 +1589,8 @@ struct CpuMoeExecutor {
   bool dsfp4_route_parallel_task = false;
   bool dsfp4_fuse_prep = false;
   bool dsfp4_fuse_prep_task = false;
+  bool dsfp4_compact_active_routes = false;
+  bool dsfp4_compact_active_routes_task = false;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
@@ -1373,6 +1619,14 @@ struct CpuMoeExecutor {
   MoeTask* cur_task = nullptr;
   std::atomic<uint64_t> submitted{0};
   std::atomic<uint64_t> completed{0};
+  // C3 warm wait (default off, set before the first task).  submit() publishes
+  // cur_gen here with release order after writing cur_task, so a warm worker that
+  // acquires a new value may read cur_task without task_mtx; the pool is idle at
+  // submit, so cur_task cannot change before every worker has taken it.
+  alignas(64) std::atomic<uint64_t> doorbell{0};
+  std::atomic<uint64_t> warm_cycles{0};
+  std::atomic<bool> warm_stop{false};
+  alignas(64) uint64_t warm_tsc_hz = 0;
 
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
@@ -1385,6 +1639,11 @@ struct CpuMoeExecutor {
 
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
+  // First-stage DS-FP4 queue entries can omit GPU-owned routes during one-token
+  // hybrid decode. Entries retain the original flattened (token, route) index,
+  // so every scratch/output address and the complete down-pass schedule stay
+  // unchanged. submit() fills this only while the worker pool is idle.
+  std::vector<int> dsfp4_active_route_positions;
 
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
   // A tiny GPU kernel bumps ready_flags[slot] at submit; this coordinator thread busy-polls
@@ -1618,6 +1877,7 @@ struct CpuMoeExecutor {
   ~CpuMoeExecutor() {
     coord_stop.store(true);
     if (coord_thread.joinable()) coord_thread.join();
+    warm_stop.store(true);
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       stop = true;
@@ -1835,7 +2095,9 @@ struct CpuMoeExecutor {
 
   void do_pass1_dsfp4(const MoeTask* t, int64_t p) {
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
+    int64_t tk = p / n_iblk;
+    if (dsfp4_compact_active_routes_task)
+      tk = dsfp4_active_route_positions[static_cast<size_t>(tk)];
     const int k = static_cast<int>(tk % top_k);
     const int tok = static_cast<int>(tk / top_k);
     const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
@@ -1849,6 +2111,11 @@ struct CpuMoeExecutor {
     const float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
     const uint8_t* gp = gu_packed_l + (size_t)e * N2 * Hh;
     const uint8_t* gs = gu_scale_l + (size_t)e * N2 * Hs;
+    const bool lay = dsfp4_layout_task;  // implies dsfp4_gpu_order (setter contract)
+    if (lay) {
+      gp = lay_at(lay_gu_p_tbl, t->layer_id, e);
+      gs = lay_at(lay_gu_s_tbl, t->layer_id, e);
+    }
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
@@ -1857,10 +2124,24 @@ struct CpuMoeExecutor {
     if (dsfp4_gpu_order) {
       for (int i = i0; i < i1; i += 8) {
         float gates[8], ups[8];
-        dsfp4_gpu_order_rows8(gates, gp + (size_t)i * Hh, gs + (size_t)i * Hs,
+        // Same tile offsets in both layouts: a layout tile replaces native rows
+        // i..i+7.  Direct calls keep the default path's code generation unchanged.
+        if (dsfp4_x2) {
+          // C3: the gate tile and the up tile share the activations.
+          (lay ? dsfp4_rows8x2 : dsfp4_native_rows8x2)(
+              gates, ups, gp + (size_t)i * Hh, gs + (size_t)i * Hs,
+              gp + (size_t)(I + i) * Hh, gs + (size_t)(I + i) * Hs, xe, xo, H, e2m1_lut, 1.f);
+        } else if (lay) {
+          dsfp4_layout_rows8(gates, gp + (size_t)i * Hh, gs + (size_t)i * Hs,
                              xe, xo, H, e2m1_lut, e8m0_lut, 1.f);
-        dsfp4_gpu_order_rows8(ups, gp + (size_t)(I + i) * Hh, gs + (size_t)(I + i) * Hs,
+          dsfp4_layout_rows8(ups, gp + (size_t)(I + i) * Hh, gs + (size_t)(I + i) * Hs,
                              xe, xo, H, e2m1_lut, e8m0_lut, 1.f);
+        } else {
+          dsfp4_gpu_order_rows8(gates, gp + (size_t)i * Hh, gs + (size_t)i * Hs,
+                               xe, xo, H, e2m1_lut, e8m0_lut, 1.f);
+          dsfp4_gpu_order_rows8(ups, gp + (size_t)(I + i) * Hh, gs + (size_t)(I + i) * Hs,
+                               xe, xo, H, e2m1_lut, e8m0_lut, 1.f);
+        }
         for (int c = 0; c < 8; ++c) {
           float gate = bf16_to_f32(f32_to_bf16(gates[c]));
           float up = bf16_to_f32(f32_to_bf16(ups[c]));
@@ -1933,6 +2214,50 @@ struct CpuMoeExecutor {
     const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
 #if CPU_MOE_X86
+    if (dsfp4_gpu_order && dsfp4_x2 && (h1 - h0) % 16 == 0) {
+      // C3: adjacent down tiles h..h+7 and h+8..h+15 share the route's activations.
+      // Per route and per output element this is the rows8 path below: same BF16
+      // rounding, same zero fill for invalid routes and the same route order.
+      const bool lay = dsfp4_layout_task;
+      for (int h = h0; h < h1; h += 16) {
+        float acc0[8] = {}, acc1[8] = {};
+        for (int k = first_route; k < last_route; ++k) {
+          const int e = t->ids[(size_t)tok * top_k + k];
+          if (e < 0 || e >= num_experts) {
+            if (dsfp4_route_outputs)
+              std::fill_n(t->y + ((size_t)tok * top_k + k) * H + h, 16, bf16_t(0));
+            continue;
+          }
+          float part0[8], part1[8];
+          const auto* ge = ge_scratch.data() + ((size_t)tok * top_k + k) * Ih;
+          const auto* go = go_scratch.data() + ((size_t)tok * top_k + k) * Ih;
+          const uint8_t* dp = lay ? lay_at(lay_dn_p_tbl, t->layer_id, e)
+                                  : dn_packed_l + (size_t)e * H * Ih;
+          const uint8_t* ds = lay ? lay_at(lay_dn_s_tbl, t->layer_id, e)
+                                  : dn_scale_l + (size_t)e * H * Is;
+          (lay ? dsfp4_rows8x2 : dsfp4_native_rows8x2)(
+              part0, part1, dp + (size_t)h * Ih, ds + (size_t)h * Is,
+              dp + (size_t)(h + 8) * Ih, ds + (size_t)(h + 8) * Is,
+              ge, go, I, e2m1_lut, t->w[(size_t)tok * top_k + k]);
+          for (int c = 0; c < 8; ++c) {
+            const auto weighted = f32_to_bf16(part0[c]);
+            if (dsfp4_route_outputs) t->y[((size_t)tok * top_k + k) * H + h + c] = weighted;
+            else acc0[c] += bf16_to_f32(weighted);
+          }
+          for (int c = 0; c < 8; ++c) {
+            const auto weighted = f32_to_bf16(part1[c]);
+            if (dsfp4_route_outputs) t->y[((size_t)tok * top_k + k) * H + h + 8 + c] = weighted;
+            else acc1[c] += bf16_to_f32(weighted);
+          }
+        }
+        if (!dsfp4_route_outputs)
+          for (int c = 0; c < 8; ++c) {
+            y_row[h + c] = f32_to_bf16(acc0[c]);
+            y_row[h + 8 + c] = f32_to_bf16(acc1[c]);
+          }
+      }
+      return;
+    }
     if (dsfp4_gpu_order) {
       for (int h = h0; h < h1; h += 8) {
         float acc[8] = {};
@@ -1946,9 +2271,14 @@ struct CpuMoeExecutor {
           float part[8];
           const auto* ge = ge_scratch.data() + ((size_t)tok * top_k + k) * Ih;
           const auto* go = go_scratch.data() + ((size_t)tok * top_k + k) * Ih;
-          dsfp4_gpu_order_rows8(part, dn_packed_l + ((size_t)e * H + h) * Ih,
-                               dn_scale_l + ((size_t)e * H + h) * Is,
+          if (dsfp4_layout_task)
+            dsfp4_layout_rows8(part, lay_at(lay_dn_p_tbl, t->layer_id, e) + (size_t)h * Ih,
+                               lay_at(lay_dn_s_tbl, t->layer_id, e) + (size_t)h * Is,
                                ge, go, I, e2m1_lut, e8m0_lut, t->w[(size_t)tok * top_k + k]);
+          else
+            dsfp4_gpu_order_rows8(part, dn_packed_l + ((size_t)e * H + h) * Ih,
+                                 dn_scale_l + ((size_t)e * H + h) * Is,
+                                 ge, go, I, e2m1_lut, e8m0_lut, t->w[(size_t)tok * top_k + k]);
           for (int c = 0; c < 8; ++c) {
             const auto weighted = f32_to_bf16(part[c]);
             if (dsfp4_route_outputs) t->y[((size_t)tok * top_k + k) * H + h + c] = weighted;
@@ -2017,8 +2347,28 @@ struct CpuMoeExecutor {
     pin_self(tid);
     uint64_t my_gen = 0;
     for (;;) {
-      MoeTask* t;
-      {
+      MoeTask* t = nullptr;
+#if CPU_MOE_WARM
+      // C3: wait warm for the next generation for up to warm_cycles, then fall back
+      // to the unchanged condvar sleep below.
+      if (const uint64_t budget = warm_cycles.load(std::memory_order_relaxed)) {
+        const uint64_t start = __rdtsc();
+        for (;;) {
+          const uint64_t g = doorbell.load(std::memory_order_acquire);
+          if (g != my_gen) {
+            my_gen = g;
+            t = cur_task;
+            break;
+          }
+          const uint64_t spent = __rdtsc() - start;
+          if (spent >= budget || warm_stop.load(std::memory_order_relaxed)) break;
+          warm_arm(&doorbell);
+          if (doorbell.load(std::memory_order_acquire) != my_gen) continue;
+          warm_halt(static_cast<uint32_t>(std::min(budget - spent, kWarmSliceCycles)));
+        }
+      }
+#endif
+      if (t == nullptr) {
         std::unique_lock<std::mutex> lk(task_mtx);
         task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
         if (stop) return;
@@ -2037,6 +2387,11 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t) {
+    // Reset observable scheduling state even when the empty-task fast path
+    // returns before waking the pool.
+    dsfp4_compact_active_routes_task = false;
+    dsfp4_active_route_positions.clear();
+    p1_total = 0;
     // Hybrid decode often has no overflow. Do not wake every worker or run
     // three barriers for an empty task. The pool is idle at submit, and keeping
     // cur_gen unchanged also prevents a spurious wake from running a stale task.
@@ -2059,7 +2414,6 @@ struct CpuMoeExecutor {
     // this happens at most once, before any capture, while the pool is idle).
     const size_t need = static_cast<size_t>(t->num_tokens) * top_k * I;
     if (need > g_scratch.size()) g_scratch.resize(need);
-    p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
     // Independent route outputs have disjoint writes. Scheduling a route/tile
     // pair separately preserves each GEMV's accumulation and BF16 rounding,
@@ -2070,6 +2424,74 @@ struct CpuMoeExecutor {
     dsfp4_fuse_prep_task = dsfp4_fuse_prep && fmt == WF_DSFP4 && dsfp4_gpu_order &&
         dsfp4_route_outputs && dsfp4_activation_block_size == IBLK &&
         IBLK == 32 && !use_vnni && t->num_tokens == 1;
+    dsfp4_compact_active_routes_task = dsfp4_compact_active_routes &&
+        fmt == WF_DSFP4 && dsfp4_gpu_order && dsfp4_route_outputs &&
+        dsfp4_activation_block_size == IBLK && IBLK == 32 && t->num_tokens == 1;
+    // C2: use the layout copy only if EVERY valid route of this task is covered
+    // (including zero-weight routes, which pass 1 still computes); otherwise the
+    // whole task takes the unchanged native path.  Tasks with no valid route are
+    // neither counted nor logged.  Submit is single-threaded per executor, so the
+    // counters and the two one-time journal markers need no atomics.
+    dsfp4_layout_task = false;
+    if (dsfp4_layout && dsfp4_gpu_order && fmt == WF_DSFP4) {
+      int valid = 0, uncovered = -1;
+      for (int n = 0; n < t->num_tokens * top_k; ++n) {
+        const int e = t->ids[n];
+        if (e < 0 || e >= num_experts) continue;
+        ++valid;
+        if (!(lay_at(lay_gu_p_tbl, t->layer_id, e) && lay_at(lay_gu_s_tbl, t->layer_id, e) &&
+              lay_at(lay_dn_p_tbl, t->layer_id, e) && lay_at(lay_dn_s_tbl, t->layer_id, e))) {
+          uncovered = e;
+          break;
+        }
+      }
+      if (valid > 0) {
+        dsfp4_layout_task = uncovered < 0;
+        if (dsfp4_layout_task) {
+          ++layout_tasks;
+          if (!layout_served_logged) {
+            layout_served_logged = true;
+            std::fprintf(stderr, "[cpu-layout] first task served from layout bank: layer=%d\n",
+                         t->layer_id);
+            std::fflush(stderr);
+          }
+        } else {
+          ++layout_fallback_tasks;
+          if (!layout_fallback_logged) {
+            layout_fallback_logged = true;
+            std::fprintf(stderr, "[cpu-layout] first native fallback: layer=%d expert=%d uncovered\n",
+                         t->layer_id, uncovered);
+            std::fflush(stderr);
+          }
+        }
+      }
+    }
+    // C3: count tasks with a valid route that the two-tile kernel serves.
+    if (dsfp4_x2 && dsfp4_gpu_order && fmt == WF_DSFP4) {
+      bool valid = false;
+      for (int n = 0; n < t->num_tokens * top_k && !valid; ++n)
+        valid = t->ids[n] >= 0 && t->ids[n] < num_experts;
+      if (valid) {
+        ++x2_tasks;
+        if (!x2_logged) {
+          x2_logged = true;
+          std::fprintf(stderr, "[cpu-x2] first task served by two-tile kernel: layer=%d %s\n",
+                       t->layer_id, dsfp4_layout_task ? "layout" : "native");
+          std::fflush(stderr);
+        }
+      }
+    }
+    if (dsfp4_compact_active_routes_task) {
+      dsfp4_active_route_positions.reserve(static_cast<size_t>(top_k));
+      for (int route = 0; route < top_k; ++route) {
+        const int e = t->ids[route];
+        if (e >= 0 && e < num_experts)
+          dsfp4_active_route_positions.push_back(route);
+      }
+      p1_total = static_cast<int64_t>(dsfp4_active_route_positions.size()) * n_iblk;
+    } else {
+      p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
+    }
     if (dsfp4_route_parallel_task) p2_total *= top_k;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
@@ -2129,12 +2551,29 @@ struct CpuMoeExecutor {
       cur_task = t;
       ++cur_gen;
       submitted.store(cur_gen, std::memory_order_release);
+      if (warm_cycles.load(std::memory_order_relaxed))
+        doorbell.store(cur_gen, std::memory_order_release);
     }
     task_cv.notify_all();
   }
 
   void sync() {
     const uint64_t target = submitted.load(std::memory_order_acquire);
+#if CPU_MOE_WARM
+    // C3: the submitter waits warm on `completed` (stored by the last worker before
+    // its condvar notify) for up to warm_cycles, then falls back to the condvar.
+    if (const uint64_t budget = warm_cycles.load(std::memory_order_relaxed)) {
+      const uint64_t start = __rdtsc();
+      for (;;) {
+        if (completed.load(std::memory_order_acquire) >= target) return;
+        const uint64_t spent = __rdtsc() - start;
+        if (spent >= budget) break;
+        warm_arm(&completed);
+        if (completed.load(std::memory_order_acquire) >= target) return;
+        warm_halt(static_cast<uint32_t>(std::min(budget - spent, kWarmSliceCycles)));
+      }
+    }
+#endif
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
   }
@@ -2356,6 +2795,83 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                throw std::invalid_argument("fused CPU preparation requires V4.1 GPU-order route outputs");
              e.dsfp4_fuse_prep = value;
            }, py::arg("value"))
+      .def("set_dsfp4_compact_active_routes",
+           [](CpuMoeExecutor& e, bool value) {
+             if (value && (!e.dsfp4_gpu_order || !e.dsfp4_route_outputs ||
+                           e.dsfp4_activation_block_size != 32))
+               throw std::invalid_argument(
+                   "active-route compaction requires V4.1 GPU-order route outputs");
+             e.dsfp4_compact_active_routes = value;
+           }, py::arg("value"))
+      .def("set_dsfp4_layout",
+           [](CpuMoeExecutor& e, uintptr_t gu_p, uintptr_t gu_s, uintptr_t dn_p, uintptr_t dn_s) {
+             const bool on = gu_p != 0;
+             if (on != (gu_s != 0) || on != (dn_p != 0) || on != (dn_s != 0))
+               throw std::invalid_argument("layout tables must be all set or all zero");
+             if (on && (!e.dsfp4_gpu_order || !e.dsfp4_route_outputs ||
+                        e.dsfp4_activation_block_size != 32))
+               throw std::invalid_argument("CPU layout bank requires V4.1 GPU-order route outputs");
+             static_assert(IBLK % 8 == 0 && HBLK % 8 == 0, "layout tiles are eight rows");
+             e.lay_gu_p_tbl = reinterpret_cast<const uint64_t*>(gu_p);
+             e.lay_gu_s_tbl = reinterpret_cast<const uint64_t*>(gu_s);
+             e.lay_dn_p_tbl = reinterpret_cast<const uint64_t*>(dn_p);
+             e.lay_dn_s_tbl = reinterpret_cast<const uint64_t*>(dn_s);
+             e.dsfp4_layout = on;
+           }, py::arg("gate_up_packed"), py::arg("gate_up_scale"), py::arg("down_packed"),
+           py::arg("down_scale"))
+      .def("layout_task_counts",
+           [](const CpuMoeExecutor& e) {
+             return std::make_pair(e.layout_tasks, e.layout_fallback_tasks);
+           })
+      .def("set_dsfp4_x2",
+           [](CpuMoeExecutor& e, bool value) {
+             if (value) {
+               if (!e.dsfp4_gpu_order || !e.dsfp4_route_outputs ||
+                   e.dsfp4_activation_block_size != 32)
+                 throw std::invalid_argument("two-tile CPU kernel requires V4.1 GPU-order route outputs");
+#if CPU_MOE_X86
+               if (!dsfp4_x2_e8m0_matches(e.e8m0_lut))
+                 throw std::invalid_argument("two-tile CPU kernel scale does not match e8m0_lut");
+#else
+               throw std::invalid_argument("two-tile CPU kernel requires x86 AVX2/FMA");
+#endif
+             }
+             e.dsfp4_x2 = value;
+           }, py::arg("value"))
+      .def("x2_task_count",
+           [](const CpuMoeExecutor& e) { return e.x2_tasks; })
+      .def("set_warm_wait_us",
+           [](CpuMoeExecutor& e, int64_t us) {
+             if (us < 0 || us > 100000)
+               throw std::invalid_argument("warm wait must be 0..100000 us");
+#if CPU_MOE_WARM
+             if (us > 0 && !cpu_has_monitorx())
+               throw std::invalid_argument("warm wait requires MONITORX/MWAITX");
+             std::lock_guard<std::mutex> lk(e.task_mtx);
+             if (e.cur_gen != 0)
+               throw std::invalid_argument("warm wait must be configured before the first task");
+             if (us > 0 && e.warm_tsc_hz == 0) {
+               // Calibrate the TSC against steady_clock once (~20 ms).
+               const auto t0 = std::chrono::steady_clock::now();
+               const uint64_t c0 = __rdtsc();
+               std::this_thread::sleep_for(std::chrono::milliseconds(20));
+               const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+               e.warm_tsc_hz = static_cast<uint64_t>(static_cast<double>(__rdtsc() - c0) / s);
+             }
+             e.doorbell.store(e.cur_gen, std::memory_order_release);
+             e.warm_cycles.store(us > 0 ? static_cast<uint64_t>(us) * e.warm_tsc_hz / 1000000 : 0);
+#else
+             if (us > 0) throw std::invalid_argument("warm wait requires x86 MONITORX/MWAITX");
+#endif
+           }, py::arg("us"))
+      .def("warm_wait_cycles",
+           [](const CpuMoeExecutor& e) { return e.warm_cycles.load(); })
+      .def("first_stage_job_count",
+           [](const CpuMoeExecutor& e) { return e.p1_total; })
+      .def("active_route_count",
+           [](const CpuMoeExecutor& e) {
+             return static_cast<int64_t>(e.dsfp4_active_route_positions.size());
+           })
       .def("isa_name", &CpuMoeExecutor::isa_name);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
@@ -2369,4 +2885,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
+#if CPU_MOE_X86
+  m.def("dsfp4_layout_copy", &dsfp4_layout_copy, py::arg("dst"), py::arg("src"),
+        py::arg("rows"), py::arg("row_bytes"), py::arg("threads"));
+#endif
 }

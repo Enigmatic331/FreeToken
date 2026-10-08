@@ -118,6 +118,21 @@ class EngramCoordinator:
         self.tables = dict(tables)
         self.execution = execution or get_execution_plan()
         self.communicator = communicator or DistributedCommunicator()
+        self.worker_prefill_scratch = None
+        if (os.getenv("FREETOKEN_DSV41_WORKER_ENGRAM_SCRATCH", "0") == "1"
+                and self.execution.is_expert_worker
+                and self.execution.participates_in_engram):
+            if (self.execution.world_size != 4 or self.execution.engram_world_size != 2
+                    or not isinstance(self.communicator, TorchProcessGroupCommunicator)
+                    or set(self.tables) != {1, 14}
+                    or any(not isinstance(table, EngramHostTable)
+                           or table.plan.dim != 256 or table.plan.world_size != 2
+                           for table in self.tables.values())):
+                raise ValueError("worker Engram scratch requires native EP4/two-rank Engram tables")
+            from .worker_engram_scratch import WorkerPrefillScratch
+
+            self.worker_prefill_scratch = WorkerPrefillScratch()
+            logger.info("DSV41 worker-only eager Engram scratch sharing enabled")
 
     def _table(self, layer_id: int) -> EngramHostTable:
         try:
@@ -152,6 +167,7 @@ class EngramCoordinator:
         num_tokens: int,
         hashes_per_token: int,
         device: torch.device,
+        is_prefill: bool = False,
     ) -> None:
         if not self.execution.is_expert_worker:
             raise RuntimeError("worker_lookup called on the V4.1 backbone authority")
@@ -162,6 +178,12 @@ class EngramCoordinator:
         )
         with profile_range("DSV41/Engram/RowIdBroadcast"):
             row_ids = self.communicator.broadcast(row_ids, self.execution.backbone_rank)
+        if is_prefill and self.worker_prefill_scratch is not None:
+            with profile_range("DSV41/Engram/SharedWorkerPrefill"):
+                self.worker_prefill_scratch.lookup_and_discard(
+                    self._table(layer_id), row_ids, self.communicator
+                )
+            return
         self._table(layer_id).lookup(
             row_ids,
             reduce=True,

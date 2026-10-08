@@ -10,6 +10,24 @@ import torch.nn.functional as F
 
 INDEXER_PREFILL_MAX_LOGITS_MB_ENV = "FREETOKEN_DSV41_INDEXER_MAX_LOGITS_MB"
 DEFAULT_INDEXER_PREFILL_MAX_LOGITS_MB = 512
+COMPACT_PREFILL_CANDIDATES_ENV = "FREETOKEN_DSV41_COMPACT_PREFILL_CANDIDATES"
+BITPACKED_PREFILL_CANDIDATES_ENV = "FREETOKEN_DSV41_BITPACKED_PREFILL_CANDIDATES"
+
+
+def compact_prefill_candidates_enabled() -> bool:
+    """Default-off, prefill-only storage experiment; freeze at model creation."""
+    raw = os.getenv(COMPACT_PREFILL_CANDIDATES_ENV, "0")
+    if raw not in ("0", "1"):
+        raise ValueError(f"{COMPACT_PREFILL_CANDIDATES_ENV} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
+def bitpacked_prefill_candidates_enabled() -> bool:
+    """Default-off lossless storage; production integration requires compact mode."""
+    raw = os.getenv(BITPACKED_PREFILL_CANDIDATES_ENV, "0")
+    if raw not in ("0", "1"):
+        raise ValueError(f"{BITPACKED_PREFILL_CANDIDATES_ENV} must be 0 or 1, got {raw!r}")
+    return raw == "1"
 
 
 def indexer_prefill_max_logits_bytes() -> int:
@@ -64,13 +82,13 @@ def visible_compressed_lengths(positions: torch.Tensor, ratio: int) -> torch.Ten
     return torch.div(positions + 1, ratio, rounding_mode="floor")
 
 
-def select_candidate_blocks(
+def select_candidate_block_mask(
     logits: torch.Tensor,
     compressed_lengths: torch.Tensor | int,
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Publish DeepSeek's level-one mask, pinning each query's newest block."""
+    """Select level-one blocks, pinning the newest, without expanding key rows."""
 
     if block_size <= 0 or topk_blocks <= 0:
         raise ValueError("candidate block size and top-k must be positive")
@@ -93,7 +111,30 @@ def select_candidate_blocks(
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    return keep
+
+
+def expand_candidate_block_mask(
+    mask: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """Expand only a consumed query-row tile; preserve the original mask bits."""
+    if width < 0 or block_size <= 0:
+        raise ValueError("candidate width must be nonnegative and block size positive")
+    expected = (width + block_size - 1) // block_size
+    if mask.shape[-1] != expected:
+        raise ValueError(f"candidate block mask width {mask.shape[-1]} != {expected}")
+    return mask.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compressed_lengths: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """The unchanged expanded-mask interface for decode and verification."""
+    keep = select_candidate_block_mask(logits, compressed_lengths, topk_blocks, block_size)
+    return expand_candidate_block_mask(keep, logits.shape[-1], block_size)
 
 
 def select_index_topk(
@@ -150,6 +191,13 @@ class CandidateRuntime:
 
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
+        self.prefill_block_mask: torch.Tensor | None = None
+        self.prefill_packed_mask: torch.Tensor | None = None
+
+    def reset(self) -> None:
+        self.mask = None
+        self.prefill_block_mask = None
+        self.prefill_packed_mask = None
 
     def publish(
         self,
@@ -175,10 +223,16 @@ class CandidateRuntime:
 
 __all__ = [
     "CandidateRuntime",
+    "COMPACT_PREFILL_CANDIDATES_ENV",
+    "BITPACKED_PREFILL_CANDIDATES_ENV",
+    "bitpacked_prefill_candidates_enabled",
     "DEFAULT_INDEXER_PREFILL_MAX_LOGITS_MB",
     "INDEXER_PREFILL_MAX_LOGITS_MB_ENV",
+    "compact_prefill_candidates_enabled",
+    "expand_candidate_block_mask",
     "indexer_prefill_chunk_rows",
     "indexer_prefill_max_logits_bytes",
+    "select_candidate_block_mask",
     "select_candidate_blocks",
     "select_index_topk",
     "visible_compressed_lengths",

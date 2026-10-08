@@ -32,6 +32,44 @@ def test_zero_route_policy(monkeypatch, enabled, tokens, block, kind, capability
         fp4._zero_route_device_supported.cache_clear()
 
 
+@pytest.mark.parametrize("enabled,capability,sms,expected", [
+    (False, (8, 9), 128, (16, 128, 1)),
+    (True, (12, 0), 128, (16, 128, 1)),
+    (True, (8, 9), 80, (16, 128, 1)),
+    (True, (8, 9), 128, (8, 128, 1)),
+])
+def test_decode_launch_geometry(monkeypatch, enabled, capability, sms, expected):
+    calls = []
+    device = torch.device("cuda", 2)
+    monkeypatch.setattr(fp4, "_SM89_WIDE_GRID", enabled)
+
+    def capability_probe(actual):
+        calls.append(("capability", actual))
+        return capability
+
+    class Properties:
+        multi_processor_count = sms
+
+    def properties_probe(actual):
+        calls.append(("properties", actual))
+        return Properties()
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability_probe)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties_probe)
+    fp4._decode_launch_geometry.cache_clear()
+    try:
+        assert fp4._decode_launch_geometry(device) == expected
+        assert fp4._decode_launch_geometry(device) == expected
+        if not enabled:
+            assert calls == []
+        elif capability != (8, 9):
+            assert calls == [("capability", device)]
+        else:
+            assert calls == [("capability", device), ("properties", device)]
+    finally:
+        fp4._decode_launch_geometry.cache_clear()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("route_outputs", [False, True])

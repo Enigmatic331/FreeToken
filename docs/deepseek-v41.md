@@ -108,6 +108,43 @@ silently applying V4's 128-value groups. `--moe-hybrid-ranks` can exclude the
 backbone authority, and distributed CPU pools receive disjoint physical-core
 affinities. `--moe-cpu-threads` is a per-participating-rank worker count.
 
+Linux distributed serving can optionally set `FREETOKEN_RANK_MAIN_CPUS` to a
+CPU list such as `56-82,84-110`. This limits only each rank's calling main thread;
+it does not repin existing expert workers, coordinators or I/O helpers. The list
+is validated against the inherited allowed mask and existing CPU-pool allocation
+before model initialization, then applied after scheduler initialization and the
+all-rank startup barrier, before readiness. Leaving it unset preserves the
+original behavior. Exact logical-CPU overlap with workers/coordinators is rejected,
+but physical-core sharing through SMT siblings is allowed: this is not a core
+reservation, CPU quota, NUMA policy or governor change. Select CPUs for the actual
+host topology rather than copying this example blindly. Helpers created later can
+inherit the main mask, so qualify cold startup, sustained decode before and after
+long prefill, native vision and idle/wake before production use. No idle polling
+or recurring affinity updates are introduced.
+
+Alternatively, `FREETOKEN_RANK_MAIN_EXCLUDE_COORDINATORS=1` derives a narrower
+main-thread mask by removing only the CPU pools' coordinator logical CPUs from
+the inherited mask. Worker CPUs and coordinator SMT siblings remain available.
+It uses the same pre-initialization pool partition and late application point;
+it does not move workers, reserve physical cores, or change existing helpers.
+This switch requires distributed CPU pools, defaults to `0`, and is mutually
+exclusive with `FREETOKEN_RANK_MAIN_CPUS`. It is an opt-in qualification candidate,
+not a claim that all historical throughput drift came from coordinator overlap.
+
+The explicit SMT-heavy mask remains experimental: a local four-rank cold-start trial preserved exact
+outputs and sustained decode speed, but failed its 17.5K prefill performance
+gate. It was rolled back before full-capacity qualification. Do not treat the
+example mask as a qualified production policy or a proven fix for performance
+drift.
+
+The narrower coordinator-only mode subsequently passed exact decode/artifact/
+vision, matched cold 17.5K and 520K prefill, post-capacity sustained decode and
+service operations. It was nevertheless **not promoted**: a corrected PCIe
+BadTLP on an auxiliary GPU link failed the clean-hardware gate. A prior event on
+that link predates the affinity patch. Original placement was restored; this
+mode remains opt-in and must not be advertised as a fully qualified production
+policy or as a substantial throughput improvement.
+
 `--moe-hybrid-max-bs 1` limits CPU assistance to ordinary one-token decode while
 larger speculative verification batches retain GPU offload and refill overlap.
 Prefill and KV allocation are unchanged. DS-FP4 merges individual weighted BF16
@@ -141,9 +178,19 @@ Two additional switches are opt-in and default off:
   FP8 round-trip and deinterleave. This removes the separate per-route preparation
   pass and one worker barrier, with the same BF16 rounding and accumulation.
   Larger batches keep the original preparation schedule.
+- `FREETOKEN_DSV41_CPU_COMPACT_ACTIVE_ROUTES=1` compacts only the first-stage
+  one-token CPU queue to routes actually assigned to the CPU. Original route
+  positions, scratch/output addresses, the down-pass schedule, BF16 rounding,
+  and route reduction order are unchanged. Larger batches retain the original
+  queue. The switch requires a rebuilt GPU-order CPU extension.
 
 These switches change different parts of execution and should be qualified
 independently before combination. No throughput gain is implied by enabling them.
+
+On the four-GPU EP4 production geometry, active-route queue compaction preserved
+all exact outputs but regressed the four-workload decode mean by 0.52%. It is
+therefore retained only as a default-off experimental path, not a recommended
+production setting.
 On the October 3 two-5090/48-GiB-4090 single-miss admission trial, one warmup and
 three measured rounds gave +0.42% mean relative decode speed for the empty-rank
 guard, +1.93% for CPU preparation fusion, and +2.93% together. All four workloads
@@ -355,6 +402,70 @@ top-k rows immediately. One chunk is capped at 512 MiB by default; set
 GPU needs tighter transient-memory headroom. This is an operator-internal
 workspace limit, not a scheduler prefill-chunk setting, so it does not replay
 the expert bank.
+
+`FREETOKEN_DSV41_COMPACT_PREFILL_CANDIDATES=1` is an experimental, default-off
+prefill-only workspace option. It retains hierarchical candidate selections as
+one boolean per candidate block, expanding only the bounded logits row tile for
+each consumer. Selection math, decode/verification publications and scheduler
+chunks are unchanged. For block size 8 at 8,192 query rows by 520,000 keys, the
+published tensor shrinks from 3.967 to 0.496 GiB. This is tensor-size arithmetic,
+not a measured total peak-memory saving or a serving-performance claim. Keep it
+off until exact full-model, long-context and operational qualification passes.
+
+## Native BF16 output head
+
+`FREETOKEN_DSV41_NATIVE_BF16_HEAD=1` is a default-off storage/kernel option for
+ordinary target-only generation. It retains the released BF16 head values
+instead of expanding them to FP32, saving 1,262.5 MiB of parameter storage for
+Flash. It uses CUDA `torch.mm(..., out_dtype=torch.float32)`, preserving FP32
+logits without changing global matmul precision settings. Qualification used
+PyTorch 2.11 on an SM120 authority; other stacks require separate testing.
+
+The one-row primitive passed real-checkpoint numerical and graph-replay gates;
+the batched primitive did not. Multiple rows therefore execute independently
+and may be slower. The option explicitly rejects MTP/DSpark and rejects FP32
+hidden states rather than silently rounding them. Keep it disabled for MTP.
+The default path remains the original FP32 linear projection. Correctness,
+capacity, vision and operational qualification remain mandatory before enabling
+it on another placement; exact tested answers do not prove universal bitwise
+equivalence of logits or arbitrary future generations.
+
+## Phase-local cache replacement priority
+
+`FREETOKEN_DSV41_PHASE_CACHE_PRIORITY=1` is a default-off option for the
+qualified native DS-FP4, phase-aware EP4, single-request, target-only path.
+After prefill and before the first decode, it lowers the replacement priority
+of occupied entries outside the rank's decode ownership. Storage-local ranges
+are derived from the actual execution plan; the option does not change cache
+budgets, weights, ownership maps, recency or miss counters.
+
+Background admission and prefill copy streams are joined before the update.
+The small operation is warmed before graph capture and runs once per phase
+transition outside capture, not on every replay or during idle. MTP and other
+unsupported geometries are rejected. On one two-5090/4090/4080 SUPER EP4 setup,
+short exact-output fixtures improved by about 2.7% against the saved control;
+longer operational observations were essentially flat. This is not a universal
+long-answer gain. Requalify full context, output correctness, cancellation,
+vision and idle/wake behavior before enabling it elsewhere.
+
+## Worker-only Engram prefill scratch
+
+`FREETOKEN_DSV41_WORKER_ENGRAM_SCRATCH=1` is an experimental, default-off
+memory-lifetime option. Only a participating EP4 expert worker with two native
+Engram tables and a two-rank PyTorch NCCL subgroup shares the eager-prefill
+gather/all-reduce buffer. The authority still retains independent table
+outputs. Decode and CUDA-graph staging use the original path.
+
+The worker discards the reconstructed rows, so sequential prefill lookups can
+reuse one high-watermark BF16 allocation. Cross-stream reuse is fenced and
+allocator stream use recorded; pending asynchronous lookups and graph capture
+are rejected on the shared path. No gather math, collective order, table
+placement or host weights change. At 8,192 tokens, the two native eager
+buffers occupy 192 MiB; one occupies 96 MiB. A two-GPU synthetic native-format
+UVA/NCCL lab verifies that live-tensor difference and exact outputs, but this
+does not establish a full-model peak saving or qualify larger chunks. Keep the
+option off until the native-checkpoint capacity and service gates pass on the
+intended placement. It performs no idle work and is not a decode-speed claim.
 
 ## Profiling
 

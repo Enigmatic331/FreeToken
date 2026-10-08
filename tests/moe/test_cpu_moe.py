@@ -812,3 +812,76 @@ def test_dsfp4_gpu_order_mapped_changing_graph_replay(monkeypatch, bs, route_par
         if bs == 1 and n == 0:
             assert ex._ext.flag_served_count(slot) == before
         ex.raise_if_unhealthy()
+
+
+def test_dsfp4_gpu_order_compacts_only_active_first_stage_routes(monkeypatch):
+    """Sparse CPU routes keep their original output slots across graph replays."""
+    from freetoken.kernel import _cpu_moe
+    if not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_compact_active_routes"):
+        pytest.skip("Requires rebuilt active-route compaction extension")
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_MAPPED_HANDOFF", "1")
+    monkeypatch.setenv("FREETOKEN_DSV41_CPU_FUSE_PREP", "1")
+    monkeypatch.setenv("FREETOKEN_DSV41_CPU_ROUTE_PARALLEL", "0")
+    monkeypatch.setenv("FREETOKEN_DSV41_CPU_COMPACT_ACTIVE_ROUTES", "1")
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
+
+    H, I, E, top_k = 5120, 2304, 6, 6
+    cache = _make_dsfp4_cache(1, E, H, I, seed=8127)
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=1, device=torch.device("cuda"),
+        swiglu_limit=10., dsfp4_activation_block_size=32,
+        return_route_outputs=True, dsfp4_gpu_order=True,
+    )
+    assert ex.dsfp4_compact_active_routes
+    assert not ex.dsfp4_route_parallel
+    if not ex._mapped_handoff:
+        pytest.skip("mapped handoff requires CUDA stream memory operations")
+    banks = [cache.bank_sources[k][0].cuda() for k in (
+        "gate_up_packed", "gate_up_scale", "down_packed", "down_scale")]
+    x = torch.zeros(1, H, device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((1, top_k), -1, device="cuda", dtype=torch.int32)
+    w = torch.zeros(1, top_k, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ex.decode_sync(ex.decode_submit(0, x, w, ids))
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = ex.decode_sync(ex.decode_submit(0, x, w, ids))
+    torch.cuda.current_stream().wait_stream(stream)
+    slot = ex._flag_slots[(0, 1)]
+    patterns = (
+        [-1, 2, -1, -1, -1, -1],
+        [-1, -1, -1, -1, -1, -1],
+        [5, 0, 5, 1, 4, 2],
+        [-1, 2, -1, 2, -1, -1],
+        [1, -1, 0, 1, -1, -1],
+    )
+    for route_ids in patterns:
+        x.copy_(torch.randn_like(x) * .3)
+        host_ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
+        ids.copy_(host_ids)
+        weights = torch.rand_like(w) * .25
+        weights.masked_fill_(host_ids < 0, 0)
+        w.copy_(weights)
+        safe_ids = host_ids.clamp_min(0)
+        reference = routed_experts_fp4(
+            x, safe_ids, weights, *banks, 10., activation_block_size=32,
+            return_route_outputs=True,
+        )
+        before = ex._ext.flag_served_count(slot)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, reference)
+        assert torch.isfinite(output).all()
+        active = sum(route >= 0 for route in route_ids)
+        if active:
+            assert ex._ext.flag_served_count(slot) == before + 1
+            assert ex._ext.active_route_count() == active
+            assert ex._ext.first_stage_job_count() == active * (I // 32)
+        else:
+            assert ex._ext.flag_served_count(slot) == before
+        ex.raise_if_unhealthy()

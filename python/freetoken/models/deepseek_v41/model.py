@@ -25,10 +25,15 @@ from .args import DeepseekV41Args
 from .attention_layout import AttentionLayout
 from .compress import Compressor
 from .engram_layer import Engram
+from .head import native_bf16_head_enabled, project_logits
 from .indexer import (
     CandidateRuntime,
+    bitpacked_prefill_candidates_enabled,
+    compact_prefill_candidates_enabled,
+    expand_candidate_block_mask,
     indexer_prefill_chunk_rows,
     indexer_prefill_max_logits_bytes,
+    select_candidate_block_mask,
     select_candidate_blocks,
     select_index_topk,
 )
@@ -48,7 +53,7 @@ class SharedAttentionRuntime:
 
     def reset(self) -> None:
         self.topk_rows = None
-        self.candidates.mask = None
+        self.candidates.reset()
 
 
 shared_attention = SharedAttentionRuntime()
@@ -74,6 +79,10 @@ class Indexer(nn.Module):
         self.candidate_topk_blocks = args.candidate_topk_blocks
         self.candidate_block_size = args.candidate_block_size
         self.prefill_max_logits_bytes = indexer_prefill_max_logits_bytes()
+        self.compact_prefill_candidates = compact_prefill_candidates_enabled()
+        self.bitpacked_prefill_candidates = bitpacked_prefill_candidates_enabled()
+        if self.bitpacked_prefill_candidates and not self.compact_prefill_candidates:
+            raise ValueError("bit-packed prefill candidates require compact prefill mode")
         self.head_weight_scale = args.index_head_dim**-0.5 * args.index_n_heads**-0.5
         self.wq_b = Linear(args.q_lora_rank, args.index_n_heads * args.index_head_dim)
         self.weights_proj = Linear(args.dim, args.index_n_heads, kind="bf16")
@@ -322,24 +331,39 @@ class Attention(nn.Module):
                 dtype=torch.int32,
                 device=x.device,
             )
+            compact = self.indexer.compact_prefill_candidates
+            packed = getattr(self.indexer, "bitpacked_prefill_candidates", False)
+            if packed:
+                # Imported only by enabled eager prefill, never the OFF/decode path.
+                from .candidate_bits import pack_into, expand as expand_packed_candidates
+            candidate_width = (
+                (n_blocks + self.indexer.candidate_block_size - 1)
+                // self.indexer.candidate_block_size
+                if compact else n_blocks
+            )
+            publication_width = (candidate_width + 7) // 8 if packed else candidate_width
             published_candidates = (
                 torch.empty(
-                    query.shape[0], n_blocks, dtype=torch.bool, device=x.device
+                    query.shape[0], publication_width,
+                    dtype=torch.uint8 if packed else torch.bool, device=x.device
                 )
                 if self.plan.is_candidate_source
                 else None
             )
             consumed_candidates = (
-                shared_attention.candidates.mask if self.plan.uses_candidates else None
+                (shared_attention.candidates.prefill_packed_mask if packed else
+                 shared_attention.candidates.prefill_block_mask
+                 if compact else shared_attention.candidates.mask)
+                if self.plan.uses_candidates else None
             )
             if self.plan.uses_candidates:
                 if consumed_candidates is None:
                     raise RuntimeError("candidate consumer ran before the source layer")
-                expected = (query.shape[0], n_blocks)
+                expected = (query.shape[0], publication_width)
                 if consumed_candidates.shape != expected:
                     raise ValueError(
                         f"published candidate mask {consumed_candidates.shape} "
-                        f"!= logits {expected}"
+                        f"!= expected publication {expected}"
                     )
 
             for row_start in range(0, query.shape[0], rows_per_chunk):
@@ -351,14 +375,36 @@ class Attention(nn.Module):
                     weights[rows].unsqueeze(0),
                 )[0]
                 if published_candidates is not None:
-                    mask = self.indexer.select_candidate_mask(
-                        scores, live[rows].unsqueeze(-1)
+                    mask = (
+                        select_candidate_block_mask(
+                            scores, live[rows].unsqueeze(-1),
+                            self.indexer.candidate_topk_blocks,
+                            self.indexer.candidate_block_size,
+                        )
+                        if compact else self.indexer.select_candidate_mask(
+                            scores, live[rows].unsqueeze(-1)
+                        )
                     )
-                    published_candidates[rows].copy_(mask)
+                    if packed:
+                        pack_into(mask, published_candidates[rows])
+                    else:
+                        published_candidates[rows].copy_(mask)
                 elif consumed_candidates is not None:
                     mask = consumed_candidates[rows]
                 else:
                     mask = None
+                # Retain only one boolean per block across layers. Expansion
+                # stays within the fp32-logits row tile (one quarter its cap),
+                # instead of retaining the full ~4 GiB mask at 8K x 520K.
+                if packed and consumed_candidates is not None:
+                    # Expand the retained bits directly into this bounded row tile.
+                    mask = expand_packed_candidates(
+                        mask, n_blocks, self.indexer.candidate_block_size
+                    )
+                elif compact and mask is not None:
+                    mask = expand_candidate_block_mask(
+                        mask, n_blocks, self.indexer.candidate_block_size
+                    )
                 selected[rows].copy_(
                     self.indexer.select(
                         scores,
@@ -368,7 +414,12 @@ class Attention(nn.Module):
                     )
                 )
             if published_candidates is not None:
-                shared_attention.candidates.mask = published_candidates
+                if packed:
+                    shared_attention.candidates.prefill_packed_mask = published_candidates
+                elif compact:
+                    shared_attention.candidates.prefill_block_mask = published_candidates
+                else:
+                    shared_attention.candidates.mask = published_candidates
         rows = self.attn.blocks_to_global(selected, ratio, ti=table_idx).unsqueeze(0)
         shared_attention.topk_rows = rows
         return rows
@@ -1133,6 +1184,9 @@ class Transformer(nn.Module):
     ) -> None:
         super().__init__()
         self.args = args
+        native_head = native_bf16_head_enabled()
+        if native_head and args.dspark_enabled:
+            raise ValueError("native BF16 head is not qualified with MTP/DSpark")
         self.attention_layout = AttentionLayout(args)
         self.embed = nn.Embedding(args.vocab_size, args.dim, dtype=torch.bfloat16)
         self.embed.weight.requires_grad_(False)
@@ -1149,8 +1203,12 @@ class Transformer(nn.Module):
         )
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.head = nn.Parameter(
-            torch.empty(args.vocab_size, args.dim, dtype=torch.float32), requires_grad=False
+            torch.empty(args.vocab_size, args.dim,
+                        dtype=torch.bfloat16 if native_head else torch.float32),
+            requires_grad=False,
         )
+        if native_head:
+            logger.info("DSV41 native BF16 head storage enabled; rowwise FP32 logits, MTP unsupported")
         self.vision = None
         self._dspark_hidden: torch.Tensor | None = None
         if enable_vision:
@@ -1186,8 +1244,22 @@ class Transformer(nn.Module):
 
     def attach_runtime(self, device: torch.device) -> None:
         self._attach_routed_experts()
+        from .hc import warmup_direct_pre
+
+        warmup_direct_pre(device, self.args.dim, self.args.hc_mult)
         for block in self.layers:
             block.attn.bind(device)
+        packed_indexers = [
+            block.attn.indexer for block in self.layers
+            if block.attn.indexer is not None
+            and getattr(block.attn.indexer, "bitpacked_prefill_candidates", False)
+        ]
+        if packed_indexers:
+            from .candidate_bits import warmup
+
+            warmup(device, block_sizes=tuple(sorted({
+                indexer.candidate_block_size for indexer in packed_indexers
+            })))
 
     def attach_prefill_communicator(self, communicator) -> None:
         self._attach_routed_experts()
@@ -1263,7 +1335,7 @@ class Transformer(nn.Module):
             torch.cat(target_hiddens, dim=-1)[0] if target_hiddens else None
         )
         projected = hidden if full_logits else hidden[:, -1]
-        logits = F.linear(projected.float(), self.head)
+        logits = project_logits(projected, self.head)
         return logits[0] if full_logits else logits
 
     def decode(
@@ -1308,7 +1380,7 @@ class Transformer(nn.Module):
             if target_hiddens
             else None
         )
-        return F.linear(hidden[:, -1].float(), self.head)
+        return project_logits(hidden[:, -1], self.head)
 
     def verify(
         self,
@@ -1350,7 +1422,7 @@ class Transformer(nn.Module):
             if target_hiddens
             else None
         )
-        return F.linear(hidden[0].float(), self.head)
+        return project_logits(hidden[0], self.head)
 
     def restore_dspark_graph_carry(
         self, selected_row: int, window_slot: int
@@ -1448,6 +1520,7 @@ class DeepseekV41ExpertWorkerModel:
                                     num_tokens=num_tokens,
                                     hashes_per_token=self.args.engram_hashes_per_token,
                                     device=device,
+                                    is_prefill=get_global_ctx().batch.is_prefill,
                                 )
                     with profile_range("DSV41/MoE/Worker"):
                         layer.worker_forward(hidden_shape, device)
@@ -1584,7 +1657,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
     def _target_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._execution.is_expert_worker:
             raise RuntimeError("expert workers have no target head")
-        return F.linear(hidden.float(), self._model.head)
+        return project_logits(hidden, self._model.head)
 
     def dspark_target_features(self) -> DSparkTargetFeatures | None:
         return self._dspark_target_features

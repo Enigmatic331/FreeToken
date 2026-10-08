@@ -29,6 +29,126 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+# C2 (default off): optional pre-transposed CPU-only copy of an ownership-defined
+# subset of DS-FP4 experts.  "decode_only" = decode-owned and not prefill-owned;
+# "decode" = every decode-owned expert.  The native host bank is never modified:
+# GPU refill and prefill streaming keep reading it, and the CPU falls back to it
+# for every task that is not fully covered.
+LAYOUT_MODES = ("0", "decode_only", "decode")
+LAYOUT_BANKS = ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale")
+LAYOUT_LEDGER = "/dev/shm/freetoken-dsv41-cpu-layout"
+
+
+def dsv41_cpu_layout_range(mode: str, storage, decode, prefill) -> tuple[int, int] | None:
+    """Storage-local ``[start, stop)`` of the experts to pre-transpose, or ``None``.
+
+    ``storage``/``decode``/``prefill`` expose ``global_offset`` and ``local_count``
+    (``ExpertStorageRange``/``ExpertPartition``).  Raises if the requested subset
+    is not one contiguous interval inside storage.
+    """
+    if mode not in LAYOUT_MODES:
+        raise ValueError(f"FREETOKEN_DSV41_CPU_LAYOUT_BANK must be one of {LAYOUT_MODES}, got {mode!r}")
+    if mode == "0" or decode.local_count == 0:
+        return None
+    lo = decode.global_offset - storage.global_offset
+    hi = lo + decode.local_count
+    if lo < 0 or hi > storage.local_count:
+        raise ValueError(f"decode ownership [{lo},{hi}) is outside storage")
+    if mode == "decode_only" and prefill.local_count:
+        p_lo = prefill.global_offset - storage.global_offset
+        p_hi = p_lo + prefill.local_count
+        left, right = (lo, min(hi, max(lo, p_lo))), (max(lo, min(hi, p_hi)), hi)
+        parts = [part for part in (left, right) if part[1] > part[0]]
+        if not parts:
+            return None  # every decode-owned expert is also prefill-owned
+        if len(parts) != 1:
+            raise ValueError(f"decode-only experts are not one interval: {parts}")
+        lo, hi = parts[0]
+    return (lo, hi) if hi > lo else None
+
+
+def dsv41_cpu_layout_plan(mode: str, ranks: dict) -> dict[int, tuple[int, int] | None]:
+    """Deterministic whole-plan layout ranges for every CPU rank.
+
+    ``ranks`` maps a global rank to its ``(storage, decode, prefill)`` partitions;
+    every rank derives the same plan, so each knows its peers' planned copies."""
+    return {rank: dsv41_cpu_layout_range(mode, *parts) for rank, parts in sorted(ranks.items())}
+
+
+def dsfp4_layout_bytes(banks: dict, start: int, stop: int) -> int:
+    """Exact bytes of a layout copy for ``[start, stop)`` across all layers."""
+    total = 0
+    for name in LAYOUT_BANKS:
+        for layer in banks[name]:
+            total += (stop - start) * layer[0].numel() * layer.element_size()
+    return total
+
+
+def _mem_available_bytes() -> int:
+    with open("/proc/meminfo") as meminfo:
+        for line in meminfo:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("MemAvailable not found")
+
+
+def _process_start(pid: int) -> str | None:
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def layout_floor_violation(available: int, own: int, peer_planned: int, peer_built: int,
+                           floor: int) -> str | None:
+    """Copies already built by live peers are inside ``available`` already; only
+    the peers' still-unbuilt planned bytes are charged on top of our own copy."""
+    unbuilt = max(0, peer_planned - peer_built)
+    if available - own - unbuilt < floor:
+        return (f"CPU layout bank needs {own / 2**30:.2f} GiB (+{unbuilt / 2**30:.2f} GiB still planned "
+                f"by peer ranks) but MemAvailable is {available / 2**30:.2f} GiB with floor "
+                f"{floor / 2**30:.0f} GiB; unset FREETOKEN_DSV41_CPU_LAYOUT_BANK or use decode_only")
+    return None
+
+
+class _LayoutLedger:
+    """Host-wide lock plus live-process ledger of built layout copies (tmpfs, per boot)."""
+
+    def __init__(self, directory: str | None = None):
+        self.directory = directory or os.getenv("FREETOKEN_DSV41_CPU_LAYOUT_LEDGER", LAYOUT_LEDGER)
+
+    def __enter__(self):
+        import fcntl
+
+        os.makedirs(self.directory, exist_ok=True)
+        self._lock = open(os.path.join(self.directory, "lock"), "a")
+        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.close()
+
+    def peers_built(self) -> int:
+        total = 0
+        for name in os.listdir(self.directory):
+            if not name.endswith(".bytes"):
+                continue
+            pid_text, _, start = name[:-6].partition("-")
+            if not pid_text.isdigit() or int(pid_text) == os.getpid():
+                continue
+            if _process_start(int(pid_text)) != start:
+                continue  # dead or reused pid: its memory is gone
+            try:
+                total += int(open(os.path.join(self.directory, name)).read())
+            except (OSError, ValueError):
+                pass
+        return total
+
+    def record(self, nbytes: int) -> None:
+        name = f"{os.getpid()}-{_process_start(os.getpid())}.bytes"
+        with open(os.path.join(self.directory, name), "w") as out:
+            out.write(str(int(nbytes)))
+
 # Flag-based GPU<->CPU handshake for hybrid/cpu decode. The default host-func path
 # (cudaLaunchHostFunc submit+sync per layer) pays ~30-50us of callback dispatch latency
 # per call with the GPU stream idle -- 2 calls per MoE layer per decode step (~6 ms/step
@@ -181,6 +301,8 @@ class CpuMoeExecutor:
         coordinator_core: int | None = None,
         return_route_outputs: bool = False,
         dsfp4_gpu_order: bool = False,
+        layout_experts: tuple[int, int] | None = None,
+        layout_peer_experts: int = 0,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
@@ -202,6 +324,17 @@ class CpuMoeExecutor:
         )
         if self.dsfp4_fuse_prep and not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_fuse_prep"):
             raise RuntimeError("V4.1 fused CPU preparation requires a rebuilt _cpu_moe extension")
+        self.dsfp4_compact_active_routes = (
+            self.dsfp4_gpu_order and self.return_route_outputs
+            and dsfp4_activation_block_size == 32
+            and os.getenv("FREETOKEN_DSV41_CPU_COMPACT_ACTIVE_ROUTES", "0") == "1"
+        )
+        if self.dsfp4_compact_active_routes and not hasattr(
+            _cpu_moe.CpuMoeExecutor, "set_dsfp4_compact_active_routes"
+        ):
+            raise RuntimeError(
+                "V4.1 active-route compaction requires a rebuilt _cpu_moe extension"
+            )
         if self.dsfp4_gpu_order and (
             fmt != "ds_fp4" or not hasattr(_cpu_moe.CpuMoeExecutor, "set_dsfp4_gpu_order")
         ):
@@ -323,6 +456,33 @@ class CpuMoeExecutor:
             self._ext.set_dsfp4_route_parallel(True)
         if self.dsfp4_fuse_prep:
             self._ext.set_dsfp4_fuse_prep(True)
+        if self.dsfp4_compact_active_routes:
+            self._ext.set_dsfp4_compact_active_routes(True)
+        self.layout_experts = None
+        if layout_experts is not None:
+            self._install_layout(cache.bank_sources, layout_experts, layout_peer_experts, nthreads)
+        # C3 (default off): two-tile GPU-order DS-FP4 kernel, with or without the C2
+        # layout bank.  Same bytes; never silently ignored on a stale extension.
+        self.x2 = False
+        if os.getenv("FREETOKEN_DSV41_CPU_X2", "0") == "1":
+            if not (self.dsfp4_gpu_order and self.return_route_outputs
+                    and self.dsfp4_activation_block_size == 32 and self.quant_format == "ds_fp4"):
+                raise RuntimeError("FREETOKEN_DSV41_CPU_X2 requires V4.1 GPU-order DS-FP4 route outputs")
+            if not hasattr(self._ext, "set_dsfp4_x2"):
+                raise RuntimeError("FREETOKEN_DSV41_CPU_X2 requires a rebuilt _cpu_moe extension")
+            self._ext.set_dsfp4_x2(True)
+            self.x2 = True
+            logger.info(f"[cpu-x2] two-tile CPU kernel enabled (layout bank "
+                        f"{'on' if self.layout_experts is not None else 'off'})")
+        # C3 (default off): bounded MONITORX/MWAITX warm wait for the pool workers
+        # and the submitter between tasks; the condvar path resumes after the window.
+        self.warm_wait_us = int(os.getenv("FREETOKEN_DSV41_CPU_WARM_WAIT_US", "0"))
+        if self.warm_wait_us:
+            if not hasattr(self._ext, "set_warm_wait_us"):
+                raise RuntimeError("FREETOKEN_DSV41_CPU_WARM_WAIT_US requires a rebuilt _cpu_moe extension")
+            self._ext.set_warm_wait_us(self.warm_wait_us)
+            logger.info(f"[cpu-warm] warm wait {self.warm_wait_us} us "
+                        f"({self._ext.warm_wait_cycles()} TSC cycles)")
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
@@ -416,6 +576,71 @@ class CpuMoeExecutor:
         self._banks.append(table)
         self._banks.extend(layers)
         return table
+
+    def _install_layout(self, banks: dict, experts: tuple[int, int], peer_experts: int,
+                        threads: int) -> None:
+        """Build the CPU-only pre-transposed copy for storage-local ``[start, stop)``.
+
+        Bytes come from the extension's own ``dsfp4_transpose8`` (identical to the
+        per-call transpose).  Copies are ordinary pageable CPU memory, never
+        CUDA-registered, owned by ``self._banks`` for the executor's lifetime.
+        """
+        start, stop = (int(v) for v in experts)
+        if not (self.dsfp4_gpu_order and self.return_route_outputs
+                and self.dsfp4_activation_block_size == 32 and self.quant_format == "ds_fp4"):
+            raise RuntimeError("CPU layout bank requires V4.1 GPU-order DS-FP4 route outputs")
+        if not hasattr(self._ext, "set_dsfp4_layout") or not hasattr(self._cpu_moe, "dsfp4_layout_copy"):
+            raise RuntimeError("CPU layout bank requires a rebuilt _cpu_moe extension")
+        if not 0 <= start < stop <= self.num_experts:
+            raise ValueError(f"layout experts [{start},{stop}) outside [0,{self.num_experts})")
+        need = dsfp4_layout_bytes(banks, start, stop)
+        per_expert = need // (stop - start)
+        floor = int(float(os.getenv("FREETOKEN_DSV41_CPU_LAYOUT_MIN_FREE_GIB", "64")) * 2**30)
+        with _LayoutLedger() as ledger:
+            available = _mem_available_bytes()
+            built = ledger.peers_built()
+            problem = layout_floor_violation(available, need, int(peer_experts) * per_expert, built, floor)
+            if problem:
+                raise RuntimeError(problem)
+            started = time.monotonic()
+            tables = {name: torch.zeros(self.num_layers * self.num_experts, dtype=torch.int64)
+                      for name in LAYOUT_BANKS}
+            for name in LAYOUT_BANKS:
+                for layer_id, layer in enumerate(banks[name]):
+                    source = layer[start:stop]
+                    assert source.is_contiguous() and source.element_size() == 1, (name, layer_id)
+                    assert source.shape[1] % 8 == 0, (name, source.shape)
+                    rows, row_bytes = source.shape[0] * source.shape[1], source.shape[2]
+                    copy = torch.empty_like(source)
+                    self._cpu_moe.dsfp4_layout_copy(copy.data_ptr(), source.data_ptr(), rows,
+                                                    row_bytes, max(1, threads))
+                    self._banks.append(copy)
+                    stride = source.shape[1] * row_bytes
+                    base = layer_id * self.num_experts
+                    for local in range(start, stop):
+                        tables[name][base + local] = copy.data_ptr() + (local - start) * stride
+            self._banks.extend(tables.values())
+            self._ext.set_dsfp4_layout(*(tables[name].data_ptr() for name in LAYOUT_BANKS))
+            ledger.record(need)
+        self.layout_experts = (start, stop)
+        logger.info(
+            f"[cpu-layout] built experts [{start},{stop}) x {self.num_layers} layers: "
+            f"{need / 2**30:.2f} GiB in {time.monotonic() - started:.1f}s "
+            f"(MemAvailable before {available / 2**30:.1f} GiB, peers built {built / 2**30:.2f} GiB, "
+            f"peer plan {int(peer_experts) * per_expert / 2**30:.2f} GiB)"
+        )
+
+    def layout_task_counts(self) -> tuple[int, int]:
+        """(tasks served from the layout copy, tasks that fell back to native)."""
+        if not hasattr(self._ext, "layout_task_counts"):
+            return (0, 0)
+        return tuple(self._ext.layout_task_counts())
+
+    def x2_task_count(self) -> int:
+        """Tasks served by the C3 two-tile kernel (0 when it is off)."""
+        if not hasattr(self._ext, "x2_task_count"):
+            return 0
+        return int(self._ext.x2_task_count())
 
     def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.

@@ -114,6 +114,36 @@ def test_dsfp4_sparse_modules_warm_before_collectives_and_reset_cache(monkeypatc
     assert events.count("reset") == len(rows_seen) + 1
 
 
+def test_inactive_prefill_warms_full_bank_sentinel_before_barrier(monkeypatch):
+    from freetoken.engine.engine import Engine
+    from freetoken.moe import fused_ds_fp4
+    import freetoken.kernel as kernels
+
+    events = []
+    views = object()
+    cache = SimpleNamespace(quant_format="ds_fp4", reset=lambda: None,
+        bank_views=lambda: views, alphas_for_layer=lambda _: None)
+    def gemm(actual_cache, hidden, weights, ids, **kwargs):
+        assert actual_cache is cache and kwargs["views"] is views
+        assert kwargs["n"] == 112 and kwargs["is_prefill"]
+        assert torch.all(hidden == 0) and torch.all(ids == 0)
+        assert torch.all(weights[:, 0] == 1) and torch.all(weights[:, 1:] == 0)
+        events.append(hidden.shape[0])
+    layer = SimpleNamespace(top_k=6, hidden_size=4, layer_id=0, num_experts=112,
+        dsfp4_activation_block_size=32, _expert_gemm=gemm,
+        _prefill_routed=lambda hidden,*_: hidden)
+    engine = SimpleNamespace(moe_offload_cache=cache,
+        model=SimpleNamespace(_iter_offload_moe_layers=lambda: iter([layer])),
+        dtype=torch.bfloat16, device=torch.device("cpu"),
+        _execution_plan=SimpleNamespace(enabled=True), tp_cpu_group=object())
+    monkeypatch.setattr(fused_ds_fp4, "_PREFILL_SKIP_INACTIVE", True)
+    monkeypatch.setattr(kernels, "moe_sum_reduce_triton", lambda *_: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda **_: events.append("barrier"))
+    Engine._warmup_sparse_prefill_moe_kernels(engine, SimpleNamespace(moe_sparse_prefill_max_tokens=256))
+    assert events == [128, 129, 130, 132, 171, 176, "barrier"]
+
+
 @pytest.mark.parametrize("hybrid_limit", [None, 1, 3, 5, 6, 0])
 def test_dspark_warms_local_hybrid_before_collective_barrier(monkeypatch, hybrid_limit):
     from freetoken.engine.engine import Engine

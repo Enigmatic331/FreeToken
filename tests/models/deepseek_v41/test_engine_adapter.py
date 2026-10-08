@@ -795,8 +795,15 @@ def test_dspark_worker_stream_fence_is_narrowly_scoped(
     assert engine.stream.calls == expected
 
 
-def test_worker_enters_engram_collective_at_the_matching_layer_boundary():
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_worker_enters_engram_collective_at_the_matching_layer_boundary(monkeypatch, is_prefill):
     events = []
+    # The serving engine sets a Context and enters forward_batch before model
+    # execution. Supply that contract here and check the new phase argument.
+    monkeypatch.setattr(
+        "freetoken.models.deepseek_v41.model.get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=is_prefill)),
+    )
 
     class Layer:
         def __init__(self, layer_id):
@@ -812,7 +819,7 @@ def test_worker_enters_engram_collective_at_the_matching_layer_boundary():
         )
 
         def worker_lookup(self, layer_id, **kwargs):
-            events.append(("engram", layer_id, kwargs["num_tokens"], kwargs["hashes_per_token"]))
+            events.append(("engram", layer_id, kwargs["num_tokens"], kwargs["hashes_per_token"], kwargs["is_prefill"]))
 
     worker = object.__new__(DeepseekV41ExpertWorkerModel)
     worker.args = SimpleNamespace(
@@ -826,7 +833,7 @@ def test_worker_enters_engram_collective_at_the_matching_layer_boundary():
     output = worker.forward(torch.tensor([3, 4], dtype=torch.int64))
     assert events == [
         ("moe", 0, (2, 32), "cpu"),
-        ("engram", 1, 2, 24),
+        ("engram", 1, 2, 24, is_prefill),
         ("moe", 1, (2, 32), "cpu"),
         ("moe", 2, (2, 32), "cpu"),
     ]

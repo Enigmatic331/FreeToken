@@ -29,6 +29,8 @@ from freetoken.moe.fused import moe_align_block_size
 
 _TL_DTYPE = None
 _SKIP_ZERO_ROUTES = os.environ.get("FREETOKEN_DSV41_SKIP_ZERO_ROUTES", "0") == "1"
+_SM89_WIDE_GRID = os.environ.get("FREETOKEN_DSV41_SM89_WIDE_GRID", "0") == "1"
+_PREFILL_SKIP_INACTIVE = os.environ.get("FREETOKEN_DSV41_PREFILL_SKIP_INACTIVE", "0") == "1"
 
 
 @lru_cache(maxsize=None)
@@ -42,6 +44,25 @@ def _use_zero_route_skip(tokens: int, activation_block_size: int, device: torch.
         _SKIP_ZERO_ROUTES and tokens == 1 and activation_block_size == 32
         and device.type == "cuda" and _zero_route_device_supported(device)
     )
+
+
+@lru_cache(maxsize=None)
+def _decode_launch_geometry(device: torch.device) -> tuple[int, int, int]:
+    """Return ``(N tile, packed-K-byte tile, warps)`` for decode FP4 GEMVs.
+
+    The opt-in wider grid is deliberately limited to high-SM-count Ada.  A
+    real-checkpoint screen found N=8 faster on the 128-SM RTX 4090 but slower
+    on the 80-SM RTX 4080 SUPER; SM120 and smaller Ada therefore retain the
+    qualified production geometry.
+    """
+    if (
+        _SM89_WIDE_GRID
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device) == (8, 9)
+        and torch.cuda.get_device_properties(device).multi_processor_count >= 120
+    ):
+        return 8, 128, 1
+    return 16, 128, 1
 
 
 def _compute_type(dtype: torch.dtype):
@@ -81,14 +102,11 @@ def _grouped_decode(
         topk_weights = out.new_empty((1, 1), dtype=torch.float32)
     scale_u8 = scale_cache.view(torch.uint8)
 
-    # Decode is a per-route GEMV, bound by the inline FP4 dequant (LUT gather + block
-    # scale), not weight HBM bandwidth -- so it tops out ~29% of HBM peak. BN=16/
-    # BKB=128/1 warp maximizes memory-level parallelism (many single-warp CTAs, no
-    # cross-warp reduction) -> ~950 GB/s on H100 (was ~830 at BN=8/BKB=256/2). K_BYTES
-    # must be a multiple of BLOCK_SIZE_KB (gate_up 2048, down 1024 -- both /128).
-    BLOCK_SIZE_N = 16
-    BLOCK_SIZE_KB = 128
-    _NW = 1
+    # Decode is a per-route GEMV, bound by inline FP4 dequant.  The qualified
+    # default is BN=16/BKB=128/1 warp.  An opt-in 128-SM Ada path uses BN=8 to
+    # expose twice as many CTAs; the device discriminator is cached outside the
+    # kernel and leaves the 4080 SUPER and both 5090s unchanged.
+    BLOCK_SIZE_N, BLOCK_SIZE_KB, _NW = _decode_launch_geometry(a.device)
     assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
     grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))
     _decode_dsfp4_moe_kernel[grid](
@@ -177,6 +195,20 @@ def routed_experts_fp4(
 _GROUPED_MIN_ROUTES = 768
 
 
+def _align_prefill_routes(slots, block_size: int, num_rows: int, skip_inactive: bool):
+    # The optional native aligner does not preserve the extra sentinel bucket
+    # uniformly: small expert counts can emit expert_id=-1, while larger
+    # counts can omit those routes. Our zero-writing branch requires every
+    # route exactly once and the explicit positive sentinel == num_rows.
+    # Keep the accepted native OFF path; use the explicit contract only for
+    # inactive skipping or the already-qualified expanded cache geometries.
+    if skip_inactive or num_rows >= 1024:
+        from freetoken.kernel.triton.moe_align import moe_align_block_size as align
+
+        return align(slots, block_size, num_rows, include_sentinel=True)
+    return moe_align_block_size(slots, block_size, num_rows)
+
+
 def _grouped_prefill(
     a: torch.Tensor,             # [A_rows, K] compute dtype (FP8 round-tripped)
     packed_cache: torch.Tensor,  # [S, N, K//2] uint8
@@ -190,6 +222,7 @@ def _grouped_prefill(
     kernel_top_k: int,
     mul_routed_weight: bool,
     cfg: dict,
+    inactive_expert: int = -1,
 ) -> None:
     N = packed_cache.shape[1]
     K = packed_cache.shape[2] * 2
@@ -213,6 +246,7 @@ def _grouped_prefill(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
         compute_type=_compute_type(a.dtype),
+        INACTIVE_EXPERT=inactive_expert,
         num_warps=cfg.get("num_warps", 4),
         num_stages=cfg.get("num_stages", 3),
     )
@@ -255,14 +289,16 @@ def routed_experts_fp4_prefill(
         BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
         num_warps=8, num_stages=1,
     )
-    # Slot caches can have thousands of rows rather than one layer's few
-    # hundred experts. The optional native aligner leaves routes unwritten at
-    # the large cache geometries; keep its qualified full-bank path unchanged
-    # and use the generic Triton sorter for these expanded slot dimensions.
-    align = moe_align_block_size
-    if num_rows >= 1024:
-        from freetoken.kernel.triton.moe_align import moe_align_block_size as align
-    sorted_ids, expert_ids, ntpp = align(slots, cfg["BLOCK_SIZE_M"], num_rows)
+    skip_inactive = _PREFILL_SKIP_INACTIVE and activation_block_size == 32
+    if skip_inactive:
+        # The caller can retain cache-safe IDs; zero-weight routes are sorted
+        # into a separate bucket rather than mixed with useful expert rows.
+        # Keep the aligner's sentinel bin and every route output initialized.
+        slots = torch.where(topk_weights == 0, num_rows, slots).contiguous()
+    sorted_ids, expert_ids, ntpp = _align_prefill_routes(
+        slots, cfg["BLOCK_SIZE_M"], num_rows, skip_inactive
+    )
+    inactive_expert = num_rows if skip_inactive else -1
     tw = topk_weights.reshape(-1).contiguous()
 
     x = act_quant_fp8_roundtrip(
@@ -272,6 +308,7 @@ def routed_experts_fp4_prefill(
     _grouped_prefill(
         x, gate_up_packed, gate_up_scale, gate_up, tw,
         sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
+        inactive_expert=inactive_expert,
     )
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
 
@@ -294,6 +331,7 @@ def routed_experts_fp4_prefill(
     _grouped_prefill(
         act, down_packed, down_scale, down, tw,
         sorted_ids, expert_ids, ntpp, routes, 1, True, cfg,
+        inactive_expert=inactive_expert,
     )
     return down if return_route_outputs else down.sum(dim=1)
 

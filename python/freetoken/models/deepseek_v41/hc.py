@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn.functional as F
+
+_DIRECT_PRE = os.environ.get("FREETOKEN_DSV41_HC_DIRECT_PRE", "0") == "1"
 
 
 def identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
@@ -67,9 +70,12 @@ def hc_pre(x: torch.Tensor, incoming_pre: torch.Tensor) -> torch.Tensor:
     if x.is_cuda:
         from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
 
-        result = hc_pre_combine(
-            x.reshape(-1, hc_mult, dim).float(), incoming_pre.reshape(-1, hc_mult), x.dtype
-        )
+        streams = x.reshape(-1, hc_mult, dim)
+        if not (_DIRECT_PRE and x.dtype in (torch.bfloat16, torch.float16)):
+            streams = streams.float()
+        # The combine kernel promotes each stream to FP32 before the same
+        # multiply/add sequence. Avoid materializing an entire FP32 copy.
+        result = hc_pre_combine(streams, incoming_pre.reshape(-1, hc_mult), x.dtype)
         return result.view(*leading, dim)
     return (incoming_pre.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
 
@@ -98,4 +104,18 @@ def hc_post(
     return result.to(output.dtype)
 
 
-__all__ = ["hc_mixes", "hc_post", "hc_pre", "identity_pre_mix"]
+def warmup_direct_pre(device: torch.device, dim: int, hc_mult: int) -> None:
+    """Load authority-local BF16-input modules before any unmatched receive."""
+    if not _DIRECT_PRE or device.type != "cuda":
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("HC direct-pre warmup must precede graph capture")
+    # Cover Triton's scalar-one, divisible-by-16, and generic row variants.
+    for rows in (1, 2, 16):
+        x = torch.zeros((rows, hc_mult, dim), device=device, dtype=torch.bfloat16)
+        pre = torch.zeros((rows, hc_mult), device=device, dtype=torch.float32)
+        hc_pre(x, pre)
+    torch.cuda.synchronize(device)
+
+
+__all__ = ["hc_mixes", "hc_post", "hc_pre", "identity_pre_mix", "warmup_direct_pre"]

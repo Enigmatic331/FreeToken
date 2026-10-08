@@ -140,6 +140,30 @@ def _prefill_warmup_slot_start(kv_cache, dummy_slot: int, length: int) -> int:
     return 0
 
 
+def _hybrid_warmup_local_ids(
+    top_k: int, num_experts: int, layout_experts, device
+) -> torch.Tensor:
+    """Storage-local expert IDs of one synthetic hybrid decode warmup row.
+
+    Without a CPU layout bank this is unchanged: ``0..top_k-1`` (mod the local
+    count).  With one (C2), the IDs are the first ``top_k`` experts of the
+    executor's layout interval, so the warmup exercises the layout path rather
+    than a native fallback.  An interval that cannot hold them fails loudly; it is
+    never wrapped back into the local range.
+    """
+    if layout_experts is None:
+        return torch.arange(top_k, dtype=torch.int32, device=device).remainder(int(num_experts))
+    start, stop = layout_experts
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (start, stop)) or not (
+        0 <= start < stop <= int(num_experts) and stop - start >= top_k
+    ):
+        raise ValueError(
+            f"CPU layout interval {layout_experts!r} cannot cover the {top_k}-expert hybrid "
+            f"decode warmup within [0,{int(num_experts)})"
+        )
+    return torch.arange(start, start + top_k, dtype=torch.int32, device=device)
+
+
 def _required_attn_types(model_config) -> frozenset[AttnType]:
     """Backend-driving attention types of this model, from the group-spec walk
     (single source shared with the pool factory and the KV cost model). getattr
@@ -612,6 +636,18 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        self._dsv41_phase_priority = None
+        if os.getenv("FREETOKEN_DSV41_PHASE_CACHE_PRIORITY", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }:
+            from freetoken.moe.phase_priority import PhaseCachePriority
+
+            self._dsv41_phase_priority = PhaseCachePriority.from_engine(self)
+            logger.info(
+                "DSv4.1 phase-cache priority enabled: local decode range %s:%s",
+                self._dsv41_phase_priority.start,
+                self._dsv41_phase_priority.start + self._dsv41_phase_priority.count,
+            )
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -678,6 +714,30 @@ class Engine:
             torch.cuda.synchronize(self.device)
         cache.reset()
         torch.cuda.synchronize(self.device)
+        from freetoken.moe.fused_ds_fp4 import _PREFILL_SKIP_INACTIVE
+
+        if _PREFILL_SKIP_INACTIVE and getattr(layer, "dsfp4_activation_block_size", 128) == 32:
+            # Full-bank and cache-slot sentinels have different compiled
+            # constants. Load the full-bank variants locally too, before any
+            # rank can post a prefill receive. Only valid resident slot zero is
+            # read; zero activations avoid dependence on the last warmed row.
+            # The candidate now uses the explicit-sentinel Triton sorter at
+            # full-bank sizes too. Warm both its <=1024-route single-CTA and
+            # >1024-route multi-launch paths, with divisible/generic rows.
+            full_bank_rows = sorted({grouped, grouped + 1, grouped + 2, grouped + 4,
+                                     align_large, ((align_large + 15) // 16) * 16})
+            for rows in full_bank_rows:
+                hidden = torch.zeros((rows, layer.hidden_size), dtype=self.dtype,
+                                     device=self.device)
+                weights = torch.zeros((rows, top_k), dtype=torch.float32, device=self.device)
+                weights[:, 0] = 1
+                ids = torch.zeros((rows, top_k), dtype=torch.int32, device=self.device)
+                layer._expert_gemm(
+                    cache, hidden, weights, ids, views=cache.bank_views(),
+                    n=layer.num_experts, alphas=cache.alphas_for_layer(layer.layer_id),
+                    is_prefill=True,
+                )
+                torch.cuda.synchronize(self.device)
         logger.info("DS-FP4 sparse-prefill local kernel warmup complete: %s", lengths)
         if self._execution_plan.enabled:
             torch.distributed.barrier(group=self.tp_cpu_group)
@@ -801,10 +861,12 @@ class Engine:
             weights = torch.full(
                 (rows, top_k), 1.0 / top_k, dtype=torch.float32, device=self.device
             )
-            local_ids = (
-                torch.arange(top_k, dtype=torch.int32, device=self.device)
-                .remainder(int(cache.num_experts)).repeat(rows, 1)
-            )
+            local_ids = _hybrid_warmup_local_ids(
+                top_k,
+                cache.num_experts,
+                getattr(getattr(cache, "cpu_executor", None), "layout_experts", None),
+                self.device,
+            ).repeat(rows, 1)
             gpu_layer._decode_hybrid(cache, hidden, weights, local_ids)
             torch.cuda.synchronize(self.device)
         cache.reset()
@@ -1155,6 +1217,30 @@ class Engine:
             core_ids, coordinator_core = partition_rank_affinity(
                 config.tp_info.rank, ranks, config.moe_cpu_threads
             )
+        # C2 (default off): ownership-defined pre-transposed CPU layout subset.  Every
+        # CPU rank derives the same whole plan, so its memory floor can charge peers'
+        # still-unbuilt copies deterministically.
+        layout_experts, layout_peer_experts = None, 0
+        layout_mode = os.getenv("FREETOKEN_DSV41_CPU_LAYOUT_BANK", "0")
+        if layout_mode != "0":
+            from freetoken.moe.cpu_executor import dsv41_cpu_layout_plan
+            from freetoken.moe.partition import ExpertStorageRange
+
+            plan = self._dsv41_plan
+            if plan is None or not plan.phase_aware or plan.expert_storage_ranges is None:
+                raise ValueError("FREETOKEN_DSV41_CPU_LAYOUT_BANK requires phase-aware DeepSeek-V4.1 EP")
+            total = config.model_config.dsv41_args.n_routed_experts
+            cpu_ranks = tuple(config.moe_hybrid_ranks or range(config.tp_info.size))
+            layout_plan = dsv41_cpu_layout_plan(layout_mode, {
+                rank: (ExpertStorageRange(total, *plan.expert_storage_ranges[rank]),
+                       plan.partition_for_rank(total, rank),
+                       plan.partition_for_rank(total, rank, prefill=True))
+                for rank in cpu_ranks
+            })
+            layout_experts = layout_plan.get(config.tp_info.rank)
+            layout_peer_experts = sum(stop - start for rank, span in layout_plan.items()
+                                      if span is not None and rank != config.tp_info.rank
+                                      for start, stop in (span,))
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -1173,6 +1259,8 @@ class Engine:
             coordinator_core=coordinator_core,
             return_route_outputs=cache.quant_format == "ds_fp4" and cache.decode_target == "hybrid",
             dsfp4_gpu_order=getattr(config.model_config, "dsv41_args", None) is not None,
+            layout_experts=layout_experts,
+            layout_peer_experts=layout_peer_experts,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1374,6 +1462,9 @@ class Engine:
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
+        phase_priority = getattr(self, "_dsv41_phase_priority", None)
+        if phase_priority is not None:
+            phase_priority.warm(self.stream)
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -1741,6 +1832,9 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        phase_priority = getattr(self, "_dsv41_phase_priority", None)
+        if phase_priority is not None:
+            phase_priority.before(batch)
         target_features = None
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):

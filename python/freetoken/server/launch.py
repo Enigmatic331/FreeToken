@@ -183,8 +183,19 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
     with torch.inference_mode():
         try:
+            from .rank_affinity import prepare_rank_main_affinity
+
+            main_affinity = prepare_rank_main_affinity(args)
             scheduler = Scheduler(args)
             scheduler.sync_all_ranks()
+            # All eager warmup, CPU pools and normal I/O helpers already exist.
+            # Never narrow the inherited mask before worker allocation.
+            if main_affinity is not None:
+                main_affinity.apply()
+                init_logger(__name__).info(
+                    f"Rank-main affinity applied: rank={args.tp_info.rank} "
+                    f"pid={os.getpid()} CPUs={sorted(main_affinity.cpus)}"
+                )
         except BaseException as exc:  # noqa: BLE001 -- startup failure is fatal to this worker
             # A startup failure (bad config, OOM, corrupt weights) would otherwise reach the
             # parent only as a dead process -> a generic "exited during load". Push the real
