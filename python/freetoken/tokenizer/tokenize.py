@@ -29,17 +29,30 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
     (``_apply_dsv4_chat_encoder`` below) uses it to pick the prompt the model
     sees, and the frontend parse side (``server/openai_api.py``) imports it to
     decide whether the model's output begins inside a reasoning block. Keeping
-    one implementation prevents the two sides from disagreeing. Thinking is on
-    when tools are offered (dsv4 only emits well-formed tool calls in thinking
-    mode) or when the caller requests it via ``chat_template_kwargs``.
+    one implementation prevents the two sides from disagreeing. An explicit
+    caller preference is authoritative: a disabled/chat request stays in chat
+    mode even when tools are offered. Tools only select thinking mode when the
+    caller supplied no preference, because dsv4 emits well-formed tool calls in
+    thinking mode by default.
     """
     ctk = chat_template_kwargs or {}
-    mode = str(ctk.get("thinking_mode") or "chat")
-    if tools or ctk.get("enable_thinking") or ctk.get("thinking"):
-        mode = "thinking"
-    if mode not in ("chat", "thinking"):
-        mode = "chat"
-    return mode
+    mode = str(ctk.get("thinking_mode") or "").strip().lower()
+    explicitly_disabled = (
+        ctk.get("enable_thinking") is False
+        or ctk.get("thinking") is False
+        or mode in ("chat", "disabled", "off")
+    )
+    if explicitly_disabled:
+        return "chat"
+
+    explicitly_enabled = (
+        ctk.get("enable_thinking") is True
+        or ctk.get("thinking") is True
+        or mode in ("thinking", "enabled", "on", "adaptive")
+    )
+    if explicitly_enabled or tools:
+        return "thinking"
+    return "chat"
 
 
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]

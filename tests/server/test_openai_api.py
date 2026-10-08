@@ -16,6 +16,7 @@ from freetoken.server.openai_api import (
     register_openai_routes,
     stream_chat_completion_chunks,
 )
+from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 
 def run(coro):
@@ -191,6 +192,9 @@ def test_chat_reasoning_effort_none_disables_thinking():
     # vLLM-compatible semantics: an explicit effort "none" DISABLES thinking.
     spec = chat_request_to_genspec(chat_request(reasoning_effort="none"), {})
     assert spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
+    # Tools are present on chat_request; explicit off must reach the encoder as
+    # chat mode instead of being silently overridden by tool availability.
+    assert resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "chat"
 
 
 def test_chat_reasoning_effort_broadcasts_every_toggle_spelling():
