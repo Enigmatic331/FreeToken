@@ -91,6 +91,17 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # The two-phase batch below snapshots every msg's read/surr window BEFORE
+        # any offsets update, so two msgs for the SAME uid in one batch (an MTP
+        # spec accept cycle emits two tokens per drain) would both slice from the
+        # stale offsets and re-emit the first token's text. Process repeated-uid
+        # batches sequentially instead; distinct-uid batches keep the fast path.
+        uids = [m.uid for m in msgs]
+        if len(set(uids)) != len(uids):
+            out: List[str] = []
+            for m in msgs:
+                out.extend(self.detokenize([m]))
+            return out
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

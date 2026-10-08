@@ -115,6 +115,26 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
+def _tp_rank_slice(cores: list[int]) -> list[int]:
+    """This rank's contiguous slice of ``cores`` under TP>1.
+
+    Every TP rank runs its own CPU-MoE pool in its own process, and each process
+    sees the full affinity set — so without partitioning, all ranks pin workers
+    to the SAME physical-core representatives and the pools fight (EP+hybrid
+    decode collapsed to 2 t/s from exactly this). Contiguous slices keep a
+    rank's workers on adjacent cores/CCDs. tp=1 (and benchbw, which runs
+    outside the rank processes) is unaffected.
+    """
+    from freetoken.distributed import try_get_tp_info
+
+    info = try_get_tp_info()
+    if info is None or info.size == 1 or len(cores) < info.size:
+        return cores
+    base, extra = divmod(len(cores), info.size)
+    start = info.rank * base + min(info.rank, extra)
+    return cores[start : start + base + (1 if info.rank < extra else 0)]
+
+
 def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
@@ -123,16 +143,23 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spin-barrier degrades badly when oversubscribed). An explicit count is honored,
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
+    Under TP>1 each rank works inside its own disjoint core slice (see
+    ``_tp_rank_slice``); an explicit count larger than the slice doubles up
+    within the slice rather than spilling into other ranks' cores.
     """
-    reps = physical_core_cpus()
+    all_reps = physical_core_cpus()
+    reps = _tp_rank_slice(all_reps)
     if requested and requested > 0:
         n = int(requested)
         try:
             allowed = sorted(os.sched_getaffinity(0))
         except AttributeError:
             allowed = list(range(os.cpu_count() or 1))
-        # physical-core reps first, then the rest of the logical CPUs.
-        order = reps + [c for c in allowed if c not in set(reps)]
+        # This rank's physical cores first, then its slice of the SMT-sibling
+        # pool (allowed minus EVERY rank's physical reps — subtracting only this
+        # rank's slice would let a large count spill onto other ranks' cores).
+        extra = _tp_rank_slice([c for c in allowed if c not in set(all_reps)])
+        order = reps + extra
         if not order:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]

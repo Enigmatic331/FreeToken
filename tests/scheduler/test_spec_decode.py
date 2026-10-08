@@ -64,6 +64,7 @@ class FakePrefillManager:
 
 class FakeScheduler:
     def __init__(self):
+        self.config = SimpleNamespace(tp_info=SimpleNamespace(rank=0, size=1))
         self.engine = SimpleNamespace(model=FakeModel())
         self.decode_manager = DecodeManager(page_size=1)
         self.prefill_manager = FakePrefillManager()
@@ -445,3 +446,55 @@ def test_free_spec_tail_conserves_pages_across_boundary_reject():
 
     cm.cache_req(req, finished=True)
     cm.check_integrity()
+
+
+# ------------------------------------------------------------------ tp>1 lockstep
+class FakeCpuGroup:
+    """Stands in for the scheduler's gloo tp_cpu_group: rank 0's value (queued here)
+    lands in every rank's tensor."""
+
+    def __init__(self, values):
+        self.values = list(values)
+
+    def broadcast(self, t, root=0):
+        t[0] = self.values.pop(0)
+        return SimpleNamespace(wait=lambda: None)
+
+
+def _follower_mgr(shared_values):
+    sched = FakeScheduler()
+    sched.config = SimpleNamespace(tp_info=SimpleNamespace(rank=1, size=2))
+    sched.engine.tp_cpu_group = FakeCpuGroup(shared_values)
+    return SpecDecodeManager(sched, None), sched
+
+
+def test_follower_receives_draft_without_sidecar():
+    mgr, _ = _follower_mgr([123])
+    assert not mgr.is_drafter and mgr.sidecar is None
+    hc = torch.zeros(1, 1, 4)
+    assert mgr._draft_step(hc, [5]) == 123
+    assert not mgr.disabled
+
+
+def test_follower_latches_on_disable_sentinel():
+    from freetoken.scheduler.spec import _SPEC_DISABLED
+
+    mgr, _ = _follower_mgr([_SPEC_DISABLED])
+    assert mgr._draft_step(torch.zeros(1, 1, 4), [5]) is None
+    assert mgr.disabled
+
+
+def test_drafter_broadcasts_its_draft():
+    sched = FakeScheduler()
+    sched.config = SimpleNamespace(tp_info=SimpleNamespace(rank=0, size=2))
+    captured = []
+
+    class CaptureGroup:
+        def broadcast(self, t, root=0):
+            captured.append(int(t[0]))
+            return SimpleNamespace(wait=lambda: None)
+
+    sched.engine.tp_cpu_group = CaptureGroup()
+    mgr = SpecDecodeManager(sched, FakeSidecar([321]))
+    assert mgr._draft_step(torch.zeros(1, 1, 4), [5]) == 321
+    assert captured == [321]
