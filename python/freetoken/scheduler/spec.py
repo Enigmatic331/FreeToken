@@ -20,9 +20,13 @@ emitted — so its 128-slot ring never needs a rejection rewind, and a fresh dra
 available even immediately after a reject (the pair (state@p, s1) predicts p+2).
 Every cycle is therefore a 2-token verify: E[tokens/cycle] = 1 + acceptance.
 
-Engagement rules (MVP): tp == 1, FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 (the driver
+Engagement rules (MVP): FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 (the driver
 consumes the model's per-forward hc stash at drain time, which the next overlapped
-forward would clobber), and exactly one request in the system. A newly arriving
+forward would clobber), and exactly one request in the system. Under TP>1 the
+schedulers run in deterministic lockstep (identical seeds, identical post-reduce
+logits, receive_msg syncs message batches), so every rank runs this driver
+identically; the sidecar — the one nondeterministic input — lives on rank 0, which
+broadcasts each draft id (or a disable sentinel) over the CPU group (_share_int). A newly arriving
 request exits speculation at the next cycle boundary, where the request's counters
 are indistinguishable from a normal mid-decode request's, and hands it back to the
 decode manager. No re-adoption mid-generation.
@@ -56,6 +60,30 @@ logger = init_logger(__name__)
 
 _LOG_EVERY_CYCLES = 100
 
+# FREETOKEN_MTP_SPEC_DEBUG=1: log (base, fed tokens, sampled rows) for the first
+# cycles of each adoption — frame-alignment forensics, rank-local.
+import os as _os
+
+_SPEC_DEBUG = _os.getenv("FREETOKEN_MTP_SPEC_DEBUG", "") == "1"
+
+# Broadcast sentinel: the drafter hit a sidecar error; every rank latches
+# speculation off in the same exchange, keeping the lockstep schedulers aligned.
+_SPEC_DISABLED = -2
+
+
+def _share_int(tp_cpu_group, value: int | None) -> int:
+    """Share one int from rank 0 with every rank (the scheduler's CPU/gloo group,
+    same channel receive_msg synchronizes message counts on).
+
+    Rank 0 passes its value; followers pass None and receive. The schedulers run
+    in deterministic lockstep, so every rank reaches each exchange in the same
+    order — the sidecar's outputs (draft ids) are the only nondeterministic
+    inputs, and this is their sync point.
+    """
+    t = torch.tensor([value if value is not None else 0], dtype=torch.int64)
+    tp_cpu_group.broadcast(t, root=0).wait()
+    return int(t.item())
+
 
 def create_spec_manager(scheduler: Scheduler) -> "SpecDecodeManager | None":
     """Build the driver if every prerequisite holds, else warn once and return None
@@ -68,34 +96,42 @@ def create_spec_manager(scheduler: Scheduler) -> "SpecDecodeManager | None":
     if getattr(config.model_config, "dsv4_args", None) is None:
         logger.warning_rank0("FREETOKEN_MTP_SPEC: not a DSV4 model; speculation disabled")
         return None
-    if config.tp_info.size > 1:
-        logger.warning_rank0(
-            "FREETOKEN_MTP_SPEC: tp > 1 is not supported yet (the sidecar drafts on rank 0 "
-            "only); speculation disabled"
-        )
-        return None
     if not ENV.DISABLE_OVERLAP_SCHEDULING:
         logger.warning_rank0(
             "FREETOKEN_MTP_SPEC requires FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 (the driver "
             "reads each forward's hc stash at drain time); speculation disabled"
         )
         return None
-    try:
-        from freetoken.models.deepseek_v4.mtp_sidecar import MTPSidecar
+    # TP>1: rank 0 owns the sidecar and broadcasts each draft id over the gloo
+    # world group; other ranks run the identical (deterministic-lockstep) driver
+    # and receive the ids instead of drafting. All ranks must agree on whether
+    # the manager exists, so rank 0 shares its construction outcome.
+    sidecar = None
+    if config.tp_info.rank == 0:
+        try:
+            from freetoken.models.deepseek_v4.mtp_sidecar import MTPSidecar
 
-        t0 = time.monotonic()
-        sidecar = MTPSidecar(config.model_path, max_seq_len=scheduler.engine.max_seq_len)
-        logger.info_rank0(
-            f"MTP spec: draft sidecar ready on {sidecar.device} "
-            f"in {time.monotonic() - t0:.1f}s"
-        )
-        if sidecar.device == scheduler.engine.device:
-            logger.warning_rank0(
-                "MTP spec: sidecar shares the serving GPU; its resident bf16 weights cost "
-                "~14 GB there. Point FREETOKEN_MTP_DEVICE at a spare GPU if available."
+            t0 = time.monotonic()
+            sidecar = MTPSidecar(config.model_path, max_seq_len=scheduler.engine.max_seq_len)
+            logger.info_rank0(
+                f"MTP spec: draft sidecar ready on {sidecar.device} "
+                f"in {time.monotonic() - t0:.1f}s"
             )
-    except Exception:
-        logger.exception("FREETOKEN_MTP_SPEC: sidecar construction failed; speculation disabled")
+            if sidecar.device == scheduler.engine.device:
+                logger.warning_rank0(
+                    "MTP spec: sidecar shares the serving GPU; its resident bf16 weights cost "
+                    "~14 GB there. Point FREETOKEN_MTP_DEVICE at a spare GPU if available."
+                )
+        except Exception:
+            logger.exception(
+                "FREETOKEN_MTP_SPEC: sidecar construction failed; speculation disabled"
+            )
+            sidecar = None
+    if config.tp_info.size > 1:
+        ok = _share_int(scheduler.engine.tp_cpu_group, 1 if sidecar is not None else 0)
+        if not ok:
+            return None
+    elif sidecar is None:
         return None
     max_prompt = int(os.environ.get("FREETOKEN_MTP_MAX_PROMPT", "4096"))
     return SpecDecodeManager(scheduler, sidecar, max_prompt=max_prompt)
@@ -104,7 +140,12 @@ def create_spec_manager(scheduler: Scheduler) -> "SpecDecodeManager | None":
 class SpecDecodeManager:
     def __init__(self, scheduler: Scheduler, sidecar, max_prompt: int = 4096) -> None:
         self.sched = scheduler
-        self.sidecar = sidecar
+        self.sidecar = sidecar  # rank 0 only under TP>1; followers receive draft ids
+        self.tp_info = scheduler.config.tp_info
+        self.is_drafter = self.tp_info.rank == 0
+        assert self.is_drafter == (sidecar is not None), (
+            "the sidecar lives on rank 0; follower ranks receive draft ids instead"
+        )
         self.max_prompt = max_prompt  # one-shot sidecar ingest bound (see module docstring)
         # --- active speculation (at most one request) ---
         self.req: Req | None = None
@@ -137,9 +178,36 @@ class SpecDecodeManager:
         """A sidecar error must never take serving down: latch speculation off and hand any
         active request back to normal decode."""
         logger.exception("MTP spec: sidecar failure; speculation disabled for this server run")
+        self._disable()
+
+    def _disable(self) -> None:
+        """Latch speculation off (shared by the drafter's exception path and a follower
+        receiving the _SPEC_DISABLED sentinel — both ranks latch in the same exchange)."""
         self.disabled = True
         if self.req is not None:
             self._exit_to_decode()
+
+    def _draft_step(self, hc: torch.Tensor, tokens, *, reset: bool = False) -> int | None:
+        """One sidecar draft, TP-synchronized: rank 0 drafts (an exception becomes the
+        _SPEC_DISABLED sentinel), every rank agrees on the resulting id. Returns the
+        draft id, or None when speculation was just latched off."""
+        value: int | None = None
+        if self.is_drafter:
+            try:
+                if reset:
+                    self.sidecar.reset()
+                value = int(self.sidecar.extend(hc, tokens))
+            except Exception:
+                logger.exception(
+                    "MTP spec: sidecar failure; speculation disabled for this server run"
+                )
+                value = _SPEC_DISABLED
+        if self.tp_info.size > 1:
+            value = _share_int(self.sched.engine.tp_cpu_group, value)
+        if value == _SPEC_DISABLED:
+            self._disable()
+            return None
+        return value
 
     # -------------------------------------------------------------- scheduling
     def before_schedule(self) -> None:
@@ -218,16 +286,13 @@ class SpecDecodeManager:
             or self.sched.prefill_manager.runnable
         ):
             return
-        try:
-            # Pair every prompt state with the token AFTER it; the last state's pair token
-            # is the first sampled token s0. Returns the draft for the position after s0.
-            self.sidecar.reset()
-            tokens = torch.cat(
-                [req.input_ids[1:T].long(), next_tokens_cpu[0].view(1).long()]
-            )
-            d1 = self.sidecar.extend(hc, tokens)
-        except Exception:
-            self._latch_disabled()
+        # Pair every prompt state with the token AFTER it; the last state's pair token
+        # is the first sampled token s0. Returns the draft for the position after s0.
+        tokens = torch.cat(
+            [req.input_ids[1:T].long(), next_tokens_cpu[0].view(1).long()]
+        )
+        d1 = self._draft_step(hc, tokens, reset=True)
+        if d1 is None:
             return
         self.sched.decode_manager.remove_req(req)
         req.spec_active = True
@@ -250,6 +315,11 @@ class SpecDecodeManager:
             self.sched._free_req_resources(req)
             return []
         toks = [int(next_tokens_cpu[t].item()) for t in range(T)]
+        if _SPEC_DEBUG and self.cycles < 40:
+            fed = [int(x) for x in req.input_ids[base : base + T]]
+            logger.info(
+                f"MTP spec dbg: cycle {self.cycles} base={base} fed={fed} toks={toks}"
+            )
 
         reply: List[DetokenizeMsg] = []
         finished = False
@@ -289,14 +359,11 @@ class SpecDecodeManager:
             self._drop_active()
             self.sched._free_req_resources(req)
         elif committed_pairs:
-            try:
-                t0 = time.monotonic()
-                self.pending_draft = self.sidecar.extend(
-                    hc[: len(committed_pairs)], committed_pairs
-                )
-                self._t_draft += time.monotonic() - t0
-            except Exception:
-                self._latch_disabled()
+            t0 = time.monotonic()
+            d = self._draft_step(hc[: len(committed_pairs)], committed_pairs)
+            self._t_draft += time.monotonic() - t0
+            if d is not None:
+                self.pending_draft = d
         self._maybe_log()
         return reply
 
