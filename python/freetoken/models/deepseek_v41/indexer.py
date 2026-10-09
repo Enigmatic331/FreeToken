@@ -12,6 +12,7 @@ INDEXER_PREFILL_MAX_LOGITS_MB_ENV = "FREETOKEN_DSV41_INDEXER_MAX_LOGITS_MB"
 DEFAULT_INDEXER_PREFILL_MAX_LOGITS_MB = 512
 COMPACT_PREFILL_CANDIDATES_ENV = "FREETOKEN_DSV41_COMPACT_PREFILL_CANDIDATES"
 BITPACKED_PREFILL_CANDIDATES_ENV = "FREETOKEN_DSV41_BITPACKED_PREFILL_CANDIDATES"
+SPARSE_CONSUMER_LOGITS_ENV = "FREETOKEN_DSV41_SPARSE_CONSUMER_LOGITS"
 
 
 def compact_prefill_candidates_enabled() -> bool:
@@ -27,6 +28,14 @@ def bitpacked_prefill_candidates_enabled() -> bool:
     raw = os.getenv(BITPACKED_PREFILL_CANDIDATES_ENV, "0")
     if raw not in ("0", "1"):
         raise ValueError(f"{BITPACKED_PREFILL_CANDIDATES_ENV} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
+def sparse_consumer_logits_enabled() -> bool:
+    """Default-off CSA2-S consumer logits; freeze at model creation."""
+    raw = os.getenv(SPARSE_CONSUMER_LOGITS_ENV, "0")
+    if raw not in ("0", "1"):
+        raise ValueError(f"{SPARSE_CONSUMER_LOGITS_ENV} must be 0 or 1, got {raw!r}")
     return raw == "1"
 
 
@@ -87,8 +96,15 @@ def select_candidate_block_mask(
     compressed_lengths: torch.Tensor | int,
     topk_blocks: int,
     block_size: int,
+    *,
+    ids_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select level-one blocks, pinning the newest, without expanding key rows."""
+    """Select level-one blocks, pinning the newest, without expanding key rows.
+
+    ``ids_out`` (int32 ``[..., k]``, CSA2-S) additionally receives the same
+    top-k's block ids, ``-1`` wherever the mask keeps nothing, so the id set
+    equals the mask's True blocks by construction.
+    """
 
     if block_size <= 0 or topk_blocks <= 0:
         raise ValueError("candidate block size and top-k must be positive")
@@ -108,9 +124,19 @@ def select_candidate_block_mask(
     block_ids = torch.arange(num_blocks, device=logits.device)
     scores = scores.masked_fill(block_ids == newest, torch.inf)
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
-    )
+    if ids_out is None:
+        keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+            -1, top.indices, top.values > -torch.inf
+        )
+        return keep
+    if ids_out.shape != top.indices.shape or ids_out.dtype != torch.int32:
+        raise ValueError(
+            f"candidate ids {tuple(ids_out.shape)} {ids_out.dtype} != "
+            f"{tuple(top.indices.shape)} int32"
+        )
+    kept = top.values > -torch.inf
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, kept)
+    ids_out.copy_(top.indices).masked_fill_(kept.logical_not_(), -1)
     return keep
 
 
@@ -186,6 +212,47 @@ def select_index_topk(
     return torch.where(picked < live, picked + offset, -1).to(torch.int32)
 
 
+def warmup_sparse_consumer(
+    device: torch.device,
+    *,
+    heads: int,
+    dim: int,
+    block_sizes: tuple[int, ...] = (8,),
+    capacity: int = 2048,
+) -> None:
+    """Load the CSA2-S eager kernels before model collectives begin.
+
+    Covers the source's id publication and the consumers' gathered kernel and
+    selection.  The gathered kernel does not specialize on key width,
+    candidate count or row strides, and serving inputs are contiguous and
+    allocator-aligned, so one call per block size covers every request shape.
+    Repeat on runtime rebind.
+    """
+    if device.type != "cuda":
+        return
+    from freetoken.kernel.triton.dsv4.indexer import indexer_gathered_logits
+
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("sparse consumer warmup must run outside CUDA graph capture")
+        for block_size in block_sizes:
+            width = capacity * block_size + 1  # one block more than the capacity
+            scores = torch.zeros((2, width), dtype=torch.float32, device=device)
+            ids = torch.empty((2, capacity), dtype=torch.int32, device=device)
+            select_candidate_block_mask(scores, width, capacity, block_size, ids_out=ids)
+            scores.fill_(-torch.inf)
+            indexer_gathered_logits(
+                torch.zeros((2, heads, dim), dtype=torch.bfloat16, device=device),
+                torch.zeros((width, dim), dtype=torch.bfloat16, device=device),
+                torch.zeros((2, heads), dtype=torch.bfloat16, device=device),
+                ids, block_size, out=scores,
+            )
+            select_index_topk(
+                scores, torch.full((2,), width, device=device), 2, inplace=True
+            )
+        torch.cuda.current_stream(device).synchronize()
+
+
 class CandidateRuntime:
     """Per-forward candidate publication shared by layer 20 and its consumers."""
 
@@ -193,11 +260,14 @@ class CandidateRuntime:
         self.mask: torch.Tensor | None = None
         self.prefill_block_mask: torch.Tensor | None = None
         self.prefill_packed_mask: torch.Tensor | None = None
+        # CSA2-S: int32 [rows, candidate_topk_blocks], -1 padded; beside the mask.
+        self.prefill_block_ids: torch.Tensor | None = None
 
     def reset(self) -> None:
         self.mask = None
         self.prefill_block_mask = None
         self.prefill_packed_mask = None
+        self.prefill_block_ids = None
 
     def publish(
         self,
@@ -235,5 +305,8 @@ __all__ = [
     "select_candidate_block_mask",
     "select_candidate_blocks",
     "select_index_topk",
+    "SPARSE_CONSUMER_LOGITS_ENV",
+    "sparse_consumer_logits_enabled",
     "visible_compressed_lengths",
+    "warmup_sparse_consumer",
 ]

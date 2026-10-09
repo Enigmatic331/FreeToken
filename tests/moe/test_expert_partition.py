@@ -125,14 +125,17 @@ def test_ep_worker_async_send_preserves_owned_route_order(monkeypatch):
         device="cuda",
     )
 
-    stream = layer._send_packed_prefill_routes_async(routes, weights)
-    torch.cuda.current_stream().wait_stream(stream)
+    done = layer._send_packed_prefill_routes_async(routes, weights, None)
+    torch.cuda.current_stream().wait_event(done)
     torch.cuda.synchronize()
 
     owned = weights.ne(0).reshape(-1)
     expected = routes.view(-1, routes.shape[-1])[owned]
     assert len(fake.sent) == 1
     torch.testing.assert_close(fake.sent[0], expected)
+    # A tile owning no route sends nothing and keeps the in-flight event.
+    assert layer._send_packed_prefill_routes_async(routes, weights * 0, done) is done
+    assert len(fake.sent) == 1
 
 
 def test_balanced_partition_and_local_routes():

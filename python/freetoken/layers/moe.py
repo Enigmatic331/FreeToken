@@ -41,6 +41,15 @@ if _EP_PACKED_WIRE_DTYPE not in {"bf16", "fp8"}:
         "FREETOKEN_EP_PACKED_WIRE_DTYPE must be either 'bf16' or 'fp8', got "
         f"{_EP_PACKED_WIRE_DTYPE!r}"
     )
+# Post the authority's packed-prefill receives from every active peer as one
+# grouped P2P launch instead of one receive per peer. Off by default.
+_EP_PACKED_GROUPED_P2P_ENV = os.getenv("FREETOKEN_EP_PACKED_GROUPED_P2P", "0")
+if _EP_PACKED_GROUPED_P2P_ENV not in {"0", "1"}:
+    raise ValueError(
+        "FREETOKEN_EP_PACKED_GROUPED_P2P must be either '0' or '1', got "
+        f"{_EP_PACKED_GROUPED_P2P_ENV!r}"
+    )
+_EP_PACKED_GROUPED_P2P = _EP_PACKED_GROUPED_P2P_ENV == "1"
 _EP_PACKED_RECV_STREAM: torch.cuda.Stream | None = None
 _EP_PACKED_SEND_STREAM: torch.cuda.Stream | None = None
 _DECODE_REFILL_STREAMS: dict[int, torch.cuda.Stream] = {}
@@ -904,6 +913,26 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             pending.append((peer, indices, packed, scale))
 
         communicator = self._packed_prefill_communicator()
+        recv_many = (
+            getattr(communicator, "recv_many", None)
+            if _EP_PACKED_GROUPED_P2P
+            else None
+        )
+        if recv_many is not None:
+            # Same buffers, peer order and per-peer scale-then-payload order as
+            # the sequential loop below; only the launch is grouped. Combine
+            # still index-copies each peer's buffer in this entry order.
+            receives = []
+            for peer, _indices, packed, scale in pending:
+                if packed is None:
+                    continue
+                if scale is not None:
+                    receives.append((scale, peer))
+                receives.append((packed, peer))
+            with torch.cuda.stream(recv_stream):
+                recv_many(receives)
+            self._packed_prefill_pending = (tuple(pending), recv_stream)
+            return
         with torch.cuda.stream(recv_stream):
             for peer, _indices, packed, scale in pending:
                 if packed is None:
@@ -1089,7 +1118,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             else None
         )
         last = None
-        async_send_stream = None
+        async_send_done = None
         skip_inactive = self.skip_inactive_prefill_routes and root is not None
         for start in range(0, hidden_states.shape[0], tile_tokens):
             end = min(start + tile_tokens, hidden_states.shape[0])
@@ -1125,8 +1154,8 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                 is_prefill=True,
             )
             if not is_root and root is not None and _EP_PACKED_ASYNC_SEND:
-                async_send_stream = self._send_packed_prefill_routes_async(
-                    routes, tile_weights
+                async_send_done = self._send_packed_prefill_routes_async(
+                    routes, tile_weights, async_send_done
                 )
                 combined = routes
             else:
@@ -1135,14 +1164,25 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                 )
             if output is not None:
                 output[start:end].copy_(combined)
-            last = combined
+                # The authority has copied this tile into the full output.  Do
+                # not retain its route projection while allocating the next
+                # tile; at native geometry that needless overlap is about
+                # 240 MiB.  Same-stream copies are ordered, and async worker
+                # sends read only a payload already packed on this stream.
+                del combined, routes
+            elif end == hidden_states.shape[0]:
+                # Workers return only the final tile to preserve the existing
+                # layer contract.  Earlier tiles have already been sent.
+                last = combined
+            else:
+                del combined, routes
 
-        if async_send_stream is not None:
+        if async_send_done is not None:
             # Preserve communicator ordering before this rank enters the next
-            # layer's broadcasts, without serializing sends between this layer's
-            # tiles. Root has already consumed the same ordered send queue.
-            torch.cuda.current_stream(hidden_states.device).wait_stream(
-                async_send_stream
+            # layer's broadcasts. The event follows this layer's last queued
+            # send; root has already consumed the same ordered send queue.
+            torch.cuda.current_stream(hidden_states.device).wait_event(
+                async_send_done
             )
         self._packed_prefill_tiled_global_ids = None
         if cache.prefill_overlap:
@@ -1156,8 +1196,15 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
         self,
         routes: torch.Tensor,
         local_topk_weights: torch.Tensor,
-    ) -> torch.cuda.Stream:
-        """Queue one worker tile on a side stream so the next tile can compute."""
+        in_flight: torch.cuda.Event | None,
+    ) -> torch.cuda.Event | None:
+        """Pack one worker tile on this stream; queue only its sends on the side.
+
+        ``in_flight`` is the event this method returned for the layer's previous
+        send. It completes before this tile's payload is allocated, so at most one
+        tile's payload is ever in flight. Returns the event that follows the
+        newest queued send (``in_flight`` itself when this tile owns no routes).
+        """
         root = getattr(self, "packed_prefill_root", None)
         info = get_tp_info()
         if root is None or info.rank == root:
@@ -1165,26 +1212,32 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
 
         owned = local_topk_weights.ne(0).reshape(-1)
         owned_indices = torch.nonzero(owned, as_tuple=False).flatten()
+        if owned_indices.numel() == 0:
+            return in_flight
+        if in_flight is not None:
+            # A host wait, not a stream wait: the caching allocator reclaims the
+            # previous payload only once it observes that send's stream event.
+            in_flight.synchronize()
+        # The synchronous path's gather and FP8 rounding, on the same stream.
+        packed = routes.view(-1, routes.shape[-1]).index_select(
+            0, owned_indices
+        ).contiguous()
+        payload = (
+            _quantize_ep_routes(packed)
+            if _EP_PACKED_WIRE_DTYPE == "fp8"
+            else (packed,)
+        )
         send_stream = _ep_packed_send_stream(routes.device)
-        current = torch.cuda.current_stream(routes.device)
-        send_stream.wait_stream(current)
-        if owned_indices.numel() != 0:
-            with torch.cuda.stream(send_stream):
-                packed = routes.view(-1, routes.shape[-1]).index_select(
-                    0, owned_indices
-                ).contiguous()
-                communicator = self._packed_prefill_communicator()
-                if _EP_PACKED_WIRE_DTYPE == "fp8":
-                    scale, quantized = _quantize_ep_routes(packed)
-                    communicator.send(scale, root)
-                    communicator.send(quantized, root)
-                else:
-                    communicator.send(packed, root)
-            # These tensors were created on the compute stream but remain inputs
-            # to the side-stream gather until it is enqueued and completed.
-            routes.record_stream(send_stream)
-            owned_indices.record_stream(send_stream)
-        return send_stream
+        send_stream.wait_stream(torch.cuda.current_stream(routes.device))
+        for tensor in payload:
+            # Mark before sending, so even a failed send cannot let this stream
+            # recycle a buffer that an already queued send may still read.
+            tensor.record_stream(send_stream)
+        communicator = self._packed_prefill_communicator()
+        with torch.cuda.stream(send_stream):
+            for tensor in payload:
+                communicator.send(tensor, root)
+        return send_stream.record_event()
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Qwen's layers are constructed under a TP1 view so its backbone remains

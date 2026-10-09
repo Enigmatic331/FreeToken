@@ -115,6 +115,143 @@ def indexer_logits(
     return out
 
 
+@triton.jit(do_not_specialize=["T", "N_CAND", "stride_bs", "stride_os"])
+def _indexer_gathered_logits_kernel(
+    q_ptr, k_ptr, w_ptr, blk_ptr, out_ptr,
+    T, N_CAND,
+    stride_qs, stride_qh, stride_qd,
+    stride_kt, stride_kd,
+    stride_ws, stride_wh,
+    stride_bs, stride_bc,
+    stride_os, stride_ot,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """``_indexer_logits_kernel`` over gathered candidate blocks of one query row.
+
+    Each program owns ``BLOCK_T // BLOCK_SIZE`` candidate blocks, i.e. one
+    ``BLOCK_T``-key tile whose rows are gathered rather than contiguous.  Only
+    addressing differs from the dense kernel: the Q/K/W tiles, the tile shape
+    and the dot -> relu -> weight -> head-sum sequence are unchanged, and every
+    column stores to its absolute position.  Out-of-range ids (``-1`` pads)
+    store nothing, so the caller's prefill (``-inf``) survives there.
+    """
+    pid_s = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_d = tl.arange(0, D)
+    lane = tl.arange(0, BLOCK_T)
+    cand = pid_c * (BLOCK_T // BLOCK_SIZE) + lane // BLOCK_SIZE
+    blk = tl.load(
+        blk_ptr + pid_s * stride_bs + cand * stride_bc,
+        mask=cand < N_CAND, other=-1,
+    )
+    # Range-check the id before scaling it so no id can wrap into bounds.
+    blk_ok = (blk >= 0) & (blk < (T + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    offs_t = tl.where(blk_ok, blk, 0) * BLOCK_SIZE + lane % BLOCK_SIZE
+    h_mask = offs_h < H
+    t_mask = blk_ok & (offs_t < T)
+    offs_t = tl.where(t_mask, offs_t, 0)
+
+    # Q for this query row: [BLOCK_H, D]. Padded heads load 0 (-> 0 score -> 0 weight).
+    q_ptrs = (
+        q_ptr + pid_s * stride_qs
+        + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0)
+
+    # Gathered K tile: [BLOCK_T, D].
+    k_ptrs = k_ptr + offs_t[:, None] * stride_kt + offs_d[None, :] * stride_kd
+    k = tl.load(k_ptrs, mask=t_mask[:, None], other=0.0)
+
+    w = tl.load(
+        w_ptr + pid_s * stride_ws + offs_h * stride_wh,
+        mask=h_mask, other=0.0,
+    ).to(tl.float32)
+
+    # Identical to the dense kernel, column for column.
+    score = tl.dot(q, tl.trans(k))            # [BLOCK_H, BLOCK_T] fp32
+    score = tl.maximum(score, 0.0)
+    score = score * w[:, None]
+    logits = tl.sum(score, axis=0)            # [BLOCK_T]
+
+    out_ptrs = out_ptr + pid_s * stride_os + offs_t * stride_ot
+    tl.store(out_ptrs, logits, mask=t_mask)
+
+
+GATHERED_BLOCK_T = 128
+
+
+def _max_offset(t: torch.Tensor) -> int:
+    """Largest element offset any in-bounds index reaches (padded lanes are masked)."""
+    return sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()) if size)
+
+
+def indexer_gathered_logits(
+    q: torch.Tensor,        # [S, H, D] bf16  (one request's index queries)
+    k: torch.Tensor,        # [T, D]    bf16  (dense compressed-key slab)
+    weights: torch.Tensor,  # [S, H]          (per-head gate, softmax_scale folded in)
+    blocks: torch.Tensor,   # [S, C]    int32 candidate block ids, -1 pads
+    block_size: int,
+    out: torch.Tensor | None = None,  # [S, T] fp32; untouched outside candidates
+) -> torch.Tensor:
+    """``indexer_logits`` restricted to candidate blocks, scattered into ``out``.
+
+    Column ``b * block_size + j`` of row ``s`` is written for every valid block
+    id ``b`` in ``blocks[s]`` (and ``b * block_size + j < T``); every other
+    column keeps its prior value; ids outside ``[0, ceil(T / block_size))``
+    write nothing.  A new ``out`` is prefilled with ``-inf``.  Duplicate ids
+    rewrite the same value.  Bitwise equality with the dense
+    kernel is the qualification gate, not an assumption.
+    """
+    if q.ndim != 3 or k.ndim != 2 or weights.ndim != 2 or blocks.ndim != 2:
+        raise ValueError("expected q [S,H,D], k [T,D], weights [S,H], blocks [S,C]")
+    S, H, D = q.shape
+    T = k.shape[0]
+    if k.shape[1] != D or weights.shape != (S, H) or blocks.shape[0] != S:
+        raise ValueError(f"mismatched {q.shape}, {k.shape}, {weights.shape}, {blocks.shape}")
+    if blocks.dtype != torch.int32:
+        raise ValueError(f"candidate block ids must be int32, got {blocks.dtype}")
+    if D != triton.next_power_of_2(D):
+        raise ValueError(f"index_head_dim must be pow2, got {D}")
+    if block_size <= 0 or GATHERED_BLOCK_T % block_size:
+        raise ValueError(f"block size {block_size} must divide {GATHERED_BLOCK_T}")
+    devices = {t.device for t in (q, k, weights, blocks)}
+    if out is None:
+        out = torch.full((S, T), -torch.inf, dtype=torch.float32, device=q.device)
+    devices.add(out.device)
+    if len(devices) != 1:
+        raise ValueError(f"gathered indexer tensors span devices {devices}")
+    if out.shape != (S, T) or out.dtype != torch.float32:
+        raise ValueError(f"output {tuple(out.shape)} {out.dtype} != ({S}, {T}) fp32")
+    # Kernel offsets are int32 sums of index * stride products.
+    if max(_max_offset(t) for t in (q, k, weights, blocks, out)) >= 2**31:
+        raise ValueError("gathered indexer tile exceeds int32 addressing")
+    C = blocks.shape[1]
+    if S == 0 or C == 0 or T == 0:
+        return out
+
+    cands = GATHERED_BLOCK_T // block_size
+    _indexer_gathered_logits_kernel[(S, triton.cdiv(C, cands))](
+        q, k, weights, blocks, out,
+        T, C,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1),
+        weights.stride(0), weights.stride(1),
+        blocks.stride(0), blocks.stride(1),
+        out.stride(0), out.stride(1),
+        H=H, D=D,
+        BLOCK_H=triton.next_power_of_2(H), BLOCK_T=GATHERED_BLOCK_T,
+        BLOCK_SIZE=block_size,
+        num_warps=4, num_stages=2,
+    )
+    return out
+
+
 @triton.jit
 def _indexer_decode_logits_kernel(
     q_ptr, w_ptr, pool_ptr, snap_ptr, valid_ptr, out_ptr,
@@ -223,4 +360,4 @@ def indexer_decode_logits(
     return out
 
 
-__all__ = ["indexer_logits", "indexer_decode_logits"]
+__all__ = ["indexer_logits", "indexer_gathered_logits", "indexer_decode_logits"]

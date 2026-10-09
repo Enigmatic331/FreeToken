@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,7 @@ from torch import nn
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator
 from freetoken.layers import ExpertParallelOffloadMoELayer
+from freetoken.moe import prefill_trace
 
 from .args import DeepseekV41Args
 from .execution import get_execution_plan
@@ -46,6 +48,21 @@ def _background_admission_max_misses() -> int:
     if not 1 <= value <= 6:
         raise ValueError("V4.1 background CPU miss limit must be between 1 and 6")
     return value
+
+
+_PREFILL_EARLY_REFILL_ENV = "FREETOKEN_DSV41_PREFILL_EARLY_REFILL"
+
+
+def prefill_early_refill_enabled() -> bool:
+    """Strict parse at model creation: unset/``0`` is off and ``1`` is on."""
+    value = os.environ.get(_PREFILL_EARLY_REFILL_ENV)
+    if value is None or value == "0":
+        return False
+    if value == "1":
+        return True
+    raise ValueError(
+        f"{_PREFILL_EARLY_REFILL_ENV} must be '0' or '1', got {value!r}"
+    )
 
 
 def _broadcast_decode_dispatch(
@@ -270,6 +287,215 @@ class RoutedExperts(ExpertParallelOffloadMoELayer):
         with profile_range("DSV41/EP/RouteAllReduce"):
             return super()._maybe_all_reduce(routes)
 
+    # Bound by PrefillEarlyRefill when FREETOKEN_DSV41_PREFILL_EARLY_REFILL=1.
+    prefill_early_refill = None
+
+    def uses_prefill_double_buffer(self, num_tokens: int) -> bool:
+        """Whether this row count takes the real overlap double-buffer path."""
+        cache = self.offload_cache
+        if cache is None or not cache.prefill_overlap or not cache.prefill_bank_buffers:
+            return False
+        if self._prefill_route_tile_tokens(num_tokens):
+            return True
+        return not (
+            cache.sparse_prefill_max_tokens > 0
+            and num_tokens <= cache.sparse_prefill_max_tokens
+            and cache.quant_format in ("fp8_block", "ds_fp4")
+            and not cache.is_unpinned_layer(self.layer_id)
+        )
+
+    def routed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        routed = super().routed_forward(hidden_states, topk_weights, topk_ids)
+        refill = self.prefill_early_refill
+        if refill is not None:
+            refill.layer_released(self, hidden_states.shape[0])
+        return routed
+
+    # -- opt-in prefill trace (FREETOKEN_DSV41_PREFILL_TRACE); each override
+    # defers to the base class unchanged unless a traced prefill chunk is active.
+
+    def _wait_prefill_overlap(self, cache):
+        refill = self.prefill_early_refill
+        began_early = (
+            self.layer_id == 0 and refill is not None and refill.began(cache)
+        )
+        if not prefill_trace.active():
+            if began_early:
+                # Layer 0 was issued before embedding/attention. Queue layer 1
+                # only now, after attention 0, so a host-blocking invalidation
+                # cannot serialize that attention behind copy 0.
+                cache.prefetch_prefill_layer(0)
+                cache.prefetch_prefill_layer(1)
+                return cache.wait_prefill_layer(0)
+            return super()._wait_prefill_overlap(cache)
+        # Mirrors OffloadMoELayer._wait_prefill_overlap, split by trace marks.
+        prefill_trace.mark("moe.prefetch.begin")
+        if self.layer_id == 0 and not began_early:
+            cache.begin_prefill()
+        if self.layer_id == 0:
+            prefill_trace.note("bank_feat_bytes", [
+                int(buffer[0, 0].numel() * buffer.element_size())
+                for buffer in cache.prefill_bank_buffers
+            ])
+            prefill_trace.note("prefill_expert_count", int(cache.prefill_expert_count))
+        self._traced_prefetch(cache, self.layer_id)
+        self._traced_prefetch(cache, self.layer_id + 1)
+        prefill_trace.mark("moe.prefetch.end")
+        views = cache.wait_prefill_layer(self.layer_id)
+        prefill_trace.mark("moe.expert_wait.end")
+        return views
+
+    @staticmethod
+    def _traced_prefetch(cache, layer: int) -> None:
+        stream = cache.prefill_copy_stream
+        buffer_id = layer % 2
+        if (
+            stream is None
+            or layer >= cache.num_layers
+            or cache._prefill_buffer_layer[buffer_id] == layer
+        ):
+            cache.prefetch_prefill_layer(layer)  # already issued, or nothing to copy
+            return
+        if cache._prefill_buffer_has_release_event[buffer_id]:
+            # The prefetch begins with this same wait; repeating it first lets
+            # the begin mark observe when the copy can actually start.
+            stream.wait_event(cache.prefill_release_events[buffer_id])
+        prefill_trace.mark("h2d.begin", layer=layer, stream=stream, tag="copy")
+        hits = cache.prefill_hit_rows
+        cache.prefetch_prefill_layer(layer)
+        prefill_trace.mark("h2d.end", layer=layer, stream=stream, tag="copy")
+        prefill_trace.note("h2d.hit_rows", cache.prefill_hit_rows - hits, layer=layer)
+
+    def _expert_gemm(self, cache, hidden_states, *args, is_prefill, **kwargs):
+        if not (is_prefill and prefill_trace.active()):
+            return super()._expert_gemm(
+                cache, hidden_states, *args, is_prefill=is_prefill, **kwargs
+            )
+        prefill_trace.mark("moe.gemm.begin")
+        out = super()._expert_gemm(
+            cache, hidden_states, *args, is_prefill=is_prefill, **kwargs
+        )
+        prefill_trace.mark("moe.gemm.end")
+        return out
+
+    def prepare_packed_prefill_receive(self, *args, **kwargs) -> None:
+        if not prefill_trace.active():
+            return super().prepare_packed_prefill_receive(*args, **kwargs)
+        prefill_trace.mark("moe.prep.begin")
+        super().prepare_packed_prefill_receive(*args, **kwargs)
+        pending = getattr(self, "_packed_prefill_pending", None)
+        if pending is not None:
+            # Completes when every peer's packed routes for this tile arrived.
+            prefill_trace.mark("moe.recv.end", stream=pending[1], tag="recv")
+        prefill_trace.mark("moe.prep.end")
+
+    def _maybe_combine_packed_prefill_routes(self, routes, local_topk_weights):
+        if not prefill_trace.active():
+            return super()._maybe_combine_packed_prefill_routes(
+                routes, local_topk_weights
+            )
+        out = super()._maybe_combine_packed_prefill_routes(routes, local_topk_weights)
+        # Root: after peer wait, index_copy and FP32 reduction; worker: after send.
+        prefill_trace.mark("moe.combine.end")
+        return out
+
+
+class PrefillEarlyRefill:
+    """Issue expert banks as early as double-buffer ownership safely permits."""
+
+    def __init__(self) -> None:
+        self._layers: tuple[RoutedExperts, ...] = ()
+        self._cache = None
+        self._tokens = 0
+
+    def bind(self, layers) -> None:
+        self._layers = tuple(layers)
+        for layer in self._layers:
+            layer.prefill_early_refill = self
+
+    def began(self, cache) -> bool:
+        return cache is not None and cache is self._cache
+
+    def _eligible_cache(self, num_tokens: int):
+        if not self._layers or num_tokens <= 0:
+            return None
+        if not get_global_ctx().batch.is_moe_prefill:
+            return None
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return None
+        cache = self._layers[0].offload_cache
+        if (
+            cache is None
+            or cache.num_layers != len(self._layers)
+            or any(
+                layer.offload_cache is not cache or layer.layer_id != index
+                for index, layer in enumerate(self._layers)
+            )
+        ):
+            return None
+        if not all(
+            layer.uses_prefill_double_buffer(num_tokens) for layer in self._layers
+        ):
+            return None
+        return cache
+
+    def begin(self, num_tokens: int) -> bool:
+        self._cache = None
+        cache = self._eligible_cache(num_tokens)
+        if cache is None:
+            return False
+        # Publish before the first copy so an abort inside begin is fenced.
+        self._cache, self._tokens = cache, int(num_tokens)
+        with profile_range("DSV41/MoE/EarlyRefillBegin"):
+            cache.begin_prefill()
+            if prefill_trace.active():
+                self._layers[0]._traced_prefetch(cache, 0)
+            else:
+                cache.prefetch_prefill_layer(0)
+        return True
+
+    def layer_released(self, layer: RoutedExperts, num_tokens: int) -> None:
+        cache = self._cache
+        if (
+            cache is None
+            or layer.offload_cache is not cache
+            or num_tokens != self._tokens
+        ):
+            return
+        # routed_forward released buffer L % 2 after its last GEMM; the next
+        # owner of that buffer is L + 2, so this is its earliest safe issue.
+        next_layer = layer.layer_id + 2
+        if prefill_trace.active():
+            layer._traced_prefetch(cache, next_layer)
+        else:
+            cache.prefetch_prefill_layer(next_layer)
+
+    def end(self, *, aborted: bool) -> None:
+        cache, self._cache = self._cache, None
+        if aborted and cache is not None and cache.prefill_copy_stream is not None:
+            try:
+                # Copies left by an aborted chunk must precede later slot reuse.
+                torch.cuda.current_stream(cache.device).wait_stream(
+                    cache.prefill_copy_stream
+                )
+            except Exception:
+                # Preserve the original chunk error if CUDA is already sticky.
+                pass
+
+    @contextmanager
+    def chunk(self, num_tokens: int):
+        try:
+            yield self.begin(num_tokens)
+        except BaseException:
+            self.end(aborted=True)
+            raise
+        self.end(aborted=False)
+
 
 class MoE(nn.Module):
     """Authority computes router/shared expert; all ranks compute owned routes."""
@@ -441,6 +667,7 @@ class MoE(nn.Module):
                 ids = self._phase_broadcast(
                     torch.empty(route_shape, dtype=torch.int32, device=device)
                 )
+            prefill_trace.mark("moe.input_recv.end")
             fused_cache_safe = (
                 self.fused_route_prep
                 and weights.is_cuda
@@ -458,6 +685,7 @@ class MoE(nn.Module):
                 fused_cache_safe=fused_cache_safe,
                 storage=self.storage,
             )
+            prefill_trace.mark("moe.localize.end")
         with profile_range("DSV41/MoE/WorkerRoutedExpert"):
             if fused_cache_safe:
                 self.experts.routed_decode_cache_safe(
@@ -469,4 +697,4 @@ class MoE(nn.Module):
                 )
 
 
-__all__ = ["Gate", "MoE", "RoutedExperts", "SharedExpert"]
+__all__ = ["Gate", "MoE", "PrefillEarlyRefill", "RoutedExperts", "SharedExpert"]

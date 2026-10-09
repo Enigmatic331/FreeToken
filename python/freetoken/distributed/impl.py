@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Sequence
 
 import torch
 import torch.distributed as dist
@@ -28,6 +28,11 @@ class DistributedImpl(ABC):
 
     @abstractmethod
     def recv(self, x: torch.Tensor, src: int) -> torch.Tensor: ...
+
+    def recv_many(self, ops: Sequence[tuple[torch.Tensor, int]]) -> None:
+        # Ordered fallback for backends without a proven grouped P2P API.
+        for x, src in ops:
+            self.recv(x, src)
 
 
 @dataclass
@@ -68,6 +73,18 @@ class TorchDistributedImpl(DistributedImpl):
         work = dist.batch_isend_irecv([dist.P2POp(dist.irecv, x, src)])[0]
         work.wait()
         return x
+
+    def recv_many(self, ops: Sequence[tuple[torch.Tensor, int]]) -> None:
+        # One NCCL group for every receive. NCCL matches P2P operations to the
+        # same peer in issue order, so a peer's FP8 scale must precede its
+        # payload in ``ops`` exactly as the worker sends them.
+        if not ops:
+            return
+        works = dist.batch_isend_irecv(
+            [dist.P2POp(dist.irecv, x, src) for x, src in ops]
+        )
+        for work in works:
+            work.wait()
 
 
 @dataclass
@@ -123,6 +140,9 @@ class DistributedCommunicator:
 
     def recv(self, x: torch.Tensor, src: int) -> torch.Tensor:
         return self.plugins[-1].recv(x, src)
+
+    def recv_many(self, ops: Sequence[tuple[torch.Tensor, int]]) -> None:
+        self.plugins[-1].recv_many(ops)
 
 
 def enable_pynccl_distributed(

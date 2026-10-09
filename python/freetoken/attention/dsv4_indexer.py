@@ -41,6 +41,16 @@ class IndexerBackendMixin:
 
         return indexer_logits(q, keys, weights)
 
+    def indexer_prefill_gathered_logits(
+        self, q: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor,
+        blocks: torch.Tensor, block_size: int, out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dense-kernel scores for one request's candidate blocks only, written into
+        ``out [seqlen, n_blocks]``; every other column keeps the caller's value."""
+        from freetoken.kernel.triton.dsv4.indexer import indexer_gathered_logits
+
+        return indexer_gathered_logits(q, keys, weights, blocks, block_size, out=out)
+
     def indexer_decode_scores(
         self, q: torch.Tensor, weights: torch.Tensor, valid: torch.Tensor, n_stage: int,
         ratio: int, layer_id: int,

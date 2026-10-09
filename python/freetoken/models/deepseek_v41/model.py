@@ -9,6 +9,7 @@ TP2+EP2 research mode executes a sharded dense backbone on both ranks.
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -18,6 +19,7 @@ from torch import nn
 
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
+from freetoken.moe import prefill_trace
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import init_logger
 
@@ -27,6 +29,7 @@ from .compress import Compressor
 from .engram_layer import Engram
 from .head import native_bf16_head_enabled, project_logits
 from .indexer import (
+    SPARSE_CONSUMER_LOGITS_ENV,
     CandidateRuntime,
     bitpacked_prefill_candidates_enabled,
     compact_prefill_candidates_enabled,
@@ -36,9 +39,16 @@ from .indexer import (
     select_candidate_block_mask,
     select_candidate_blocks,
     select_index_topk,
+    sparse_consumer_logits_enabled,
 )
 from .layers import Linear, RMSNorm
-from .moe import Gate, MoE, SharedExpert
+from .moe import (
+    Gate,
+    MoE,
+    PrefillEarlyRefill,
+    SharedExpert,
+    prefill_early_refill_enabled,
+)
 from .profile import profile, profile_range
 
 logger = init_logger(__name__)
@@ -83,6 +93,20 @@ class Indexer(nn.Module):
         self.bitpacked_prefill_candidates = bitpacked_prefill_candidates_enabled()
         if self.bitpacked_prefill_candidates and not self.compact_prefill_candidates:
             raise ValueError("bit-packed prefill candidates require compact prefill mode")
+        # CSA2-S: the source publishes its candidate ids beside the compact bool
+        # mask; consumers score only those blocks.
+        sparse = sparse_consumer_logits_enabled()
+        self.sparse_consumer_logits = sparse and self.uses_candidates
+        self.publish_candidate_ids = sparse and self.is_candidate_source
+        if (self.sparse_consumer_logits or self.publish_candidate_ids) and (
+            not self.compact_prefill_candidates or self.bitpacked_prefill_candidates
+        ):
+            logger.warning(
+                "%s=1 needs compact unpacked prefill candidates; "
+                "layer %d keeps dense consumer logits",
+                SPARSE_CONSUMER_LOGITS_ENV, layer_id,
+            )
+            self.sparse_consumer_logits = self.publish_candidate_ids = False
         self.head_weight_scale = args.index_head_dim**-0.5 * args.index_n_heads**-0.5
         self.wq_b = Linear(args.q_lora_rank, args.index_n_heads * args.index_head_dim)
         self.weights_proj = Linear(args.dim, args.index_n_heads, kind="bf16")
@@ -292,6 +316,50 @@ class Attention(nn.Module):
             0, rows, compressed
         )
 
+    def _sparse_consumer_ids(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        weights: torch.Tensor,
+        block_mask: torch.Tensor,
+        n_blocks: int,
+        rows_per_chunk: int,
+    ) -> torch.Tensor | None:
+        """The source's candidate ids for exact CSA2-S logits; None keeps dense logits."""
+        from freetoken.kernel.triton.dsv4.indexer import GATHERED_BLOCK_T
+
+        indexer = self.indexer
+        capacity = indexer.candidate_topk_blocks
+        if query.shape[0] == 0 or block_mask.shape[-1] <= capacity:
+            return None  # every block may be a candidate: dense logits are no worse
+        ids = shared_attention.candidates.prefill_block_ids
+        tensors = (query, keys, weights)
+        reason = None
+        if not hasattr(self.attn, "indexer_prefill_gathered_logits"):
+            reason = "backend lacks gathered logits"
+        elif ids is None:
+            reason = "source published no candidate ids"
+        elif (ids.dtype != torch.int32 or ids.shape != (query.shape[0], capacity)
+              or not ids.is_contiguous()):
+            reason = "candidate ids are not contiguous int32 [rows, capacity]"
+        elif GATHERED_BLOCK_T % indexer.candidate_block_size:
+            reason = f"block size {indexer.candidate_block_size} does not tile keys"
+        elif any(t.dtype != torch.bfloat16 or not t.is_contiguous() for t in tensors):
+            reason = "indexer inputs are not contiguous bf16"
+        elif len({t.device for t in (*tensors, ids)}) != 1:
+            reason = "indexer inputs span devices"
+        elif (query.ndim != 3 or keys.shape != (n_blocks, query.shape[-1])
+              or weights.shape != query.shape[:2]):
+            reason = "indexer input shapes disagree"
+        elif rows_per_chunk * n_blocks >= 2**31:
+            reason = "row tile exceeds int32 addressing"
+        if reason is None:
+            return ids
+        logger.warning(
+            "layer %d keeps dense consumer logits: %s", self.layer_id, reason
+        )
+        return None
+
     def _index_prefill(
         self,
         x: torch.Tensor,
@@ -350,6 +418,16 @@ class Attention(nn.Module):
                 if self.plan.is_candidate_source
                 else None
             )
+            published_ids = (
+                torch.empty(
+                    query.shape[0], self.indexer.candidate_topk_blocks,
+                    dtype=torch.int32, device=x.device,
+                )
+                if published_candidates is not None and compact and not packed
+                and getattr(self.indexer, "publish_candidate_ids", False)
+                and candidate_width > self.indexer.candidate_topk_blocks
+                else None
+            )
             consumed_candidates = (
                 (shared_attention.candidates.prefill_packed_mask if packed else
                  shared_attention.candidates.prefill_block_mask
@@ -365,10 +443,36 @@ class Attention(nn.Module):
                         f"published candidate mask {consumed_candidates.shape} "
                         f"!= expected publication {expected}"
                     )
+            sparse_ids = (
+                self._sparse_consumer_ids(
+                    query, keys, weights, consumed_candidates, n_blocks,
+                    rows_per_chunk,
+                )
+                if consumed_candidates is not None
+                and getattr(self.indexer, "sparse_consumer_logits", False)
+                else None
+            )
 
             for row_start in range(0, query.shape[0], rows_per_chunk):
                 row_end = min(row_start + rows_per_chunk, query.shape[0])
                 rows = slice(row_start, row_end)
+                if sparse_ids is not None:
+                    # CSA2-S: score only the published candidate blocks.  Every
+                    # other column stays -inf, exactly what the candidate mask
+                    # leaves today, so the unchanged selector sees the same
+                    # tensor provided the gathered logits are bitwise equal.
+                    scores = torch.full(
+                        (row_end - row_start, n_blocks), -torch.inf,
+                        dtype=torch.float32, device=x.device,
+                    )
+                    self.attn.indexer_prefill_gathered_logits(
+                        query[rows], keys, weights[rows], sparse_ids[rows],
+                        self.indexer.candidate_block_size, scores,
+                    )
+                    selected[rows].copy_(
+                        self.indexer.select(scores, live[rows], inplace=True)
+                    )
+                    continue
                 scores = self.attn.indexer_prefill_logits(
                     query[rows].unsqueeze(0),
                     keys.unsqueeze(0),
@@ -380,6 +484,7 @@ class Attention(nn.Module):
                             scores, live[rows].unsqueeze(-1),
                             self.indexer.candidate_topk_blocks,
                             self.indexer.candidate_block_size,
+                            ids_out=None if published_ids is None else published_ids[rows],
                         )
                         if compact else self.indexer.select_candidate_mask(
                             scores, live[rows].unsqueeze(-1)
@@ -418,6 +523,8 @@ class Attention(nn.Module):
                     shared_attention.candidates.prefill_packed_mask = published_candidates
                 elif compact:
                     shared_attention.candidates.prefill_block_mask = published_candidates
+                    if getattr(self.indexer, "publish_candidate_ids", False):
+                        shared_attention.candidates.prefill_block_ids = published_ids
                 else:
                     shared_attention.candidates.mask = published_candidates
         rows = self.attn.blocks_to_global(selected, ratio, ti=table_idx).unsqueeze(0)
@@ -458,15 +565,18 @@ class Attention(nn.Module):
             )
             local = torch.where(candidates <= query_pos, candidates - lo, -1).unsqueeze(0)
             window_rows = self.attn.win_cols_to_global(local, pool_slots)
+        prefill_trace.mark("attn.qkv.end")
 
         ratio = self.plan.compress_ratio
         if self.plan.owns_kv:
             self._publish_source_prefill(x, start_pos, table_idx, slots)
+        prefill_trace.mark("attn.compress.end")
         if ratio:
             compressed_rows = self._index_prefill(x, q_lora, start_pos, table_idx)
             topk = torch.cat([window_rows, compressed_rows], -1).int()
         else:
             topk = window_rows.int()
+        prefill_trace.mark("attn.index.end")
         output = self.attn.attend(
             q,
             self.layer_id,
@@ -477,6 +587,7 @@ class Attention(nn.Module):
             has_compression=bool(ratio),
         )
         apply_rotary_emb(output[..., -self.rope_head_dim :], freqs, inverse=True)
+        prefill_trace.mark("attn.core.end")
         return self._project_output(output)
 
     def _publish_source_decode(
@@ -882,6 +993,7 @@ class MoEState(nn.Module):
         if self.execution.uses_authority_transport and not fused_dispatch:
             with profile_range("DSV41/EP/HiddenBroadcast"):
                 hidden = self._phase_broadcast(hidden.contiguous())
+        prefill_trace.mark("moe.hidden_bcast.end")
         if (
             self.execution.attention_tp2_ep2
             and self.execution.rank != self.execution.backbone_rank
@@ -897,6 +1009,7 @@ class MoEState(nn.Module):
                     if image_mask is None
                     else self.gate(hidden, image_mask)
                 )
+        prefill_trace.mark("moe.router.end")
         if fused_dispatch:
             from .moe import _broadcast_decode_dispatch
 
@@ -913,6 +1026,7 @@ class MoEState(nn.Module):
             with profile_range("DSV41/EP/RouteBroadcast"):
                 weights = self._phase_broadcast(weights.float().contiguous())
                 ids = self._phase_broadcast(ids.to(torch.int32).contiguous())
+        prefill_trace.mark("moe.route_bcast.end")
         fused_cache_safe = (
             getattr(self, "fused_route_prep", False)
             and self.execution.enabled
@@ -935,6 +1049,7 @@ class MoEState(nn.Module):
                 fused_cache_safe=fused_cache_safe,
                 storage=getattr(self, "storage", None),
             )
+        prefill_trace.mark("moe.localize.end")
         packed_peers = getattr(self.experts, "packed_prefill_peer_ranks", ())
         if not self.execution.tp2_ep2:
             with profile_range("DSV41/MoE/PrepareRouted"):
@@ -946,6 +1061,7 @@ class MoEState(nn.Module):
                     self.experts.prepare_packed_prefill_receive(
                         weights, hidden.dtype
                     )
+        prefill_trace.mark("moe.prep_recv.end")
         routed_weights = weights.float().contiguous()
         routed_ids = ids.to(torch.int32).contiguous()
         refill_plan = None
@@ -970,6 +1086,7 @@ class MoEState(nn.Module):
             with profile_range("DSV41/MoE/SharedExpert"):
                 assert self.shared_experts is not None
                 shared = self.shared_experts(hidden)
+            prefill_trace.mark("moe.shared.end")
         else:
             shared = None
         if self.execution.tp2_ep2:
@@ -1095,22 +1212,31 @@ class Block(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .hc import hc_post, hc_pre
 
+        prefill_trace.set_layer(self.layer_id)
+        prefill_trace.mark("layer.begin")
         hidden = self._engram(hidden, engram_rows, token_mask)
+        prefill_trace.mark("engram.end")
         residual = hidden
         attn_pre, attn_post, attn_comb = self._mixes(hidden, "attn")
         block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
+        prefill_trace.mark("attn.begin")
         with profile_range("DSV41/Attention/Prefill"):
             block_output = self.attn.prefill_single(
                 block_input, start_pos, table_idx
             )
+        prefill_trace.mark("attn.end")
         hidden = hc_post(block_output, residual, attn_post, attn_comb)
 
         residual = hidden
         ffn_pre, ffn_post, ffn_comb = self._mixes(hidden, "ffn")
         block_input = self.ffn_norm(hc_pre(hidden, attn_pre))
+        prefill_trace.mark("ffn.begin")
         with profile_range("DSV41/MoE/Authority"):
             block_output = self.ffn(block_input, image_mask)
-        return hc_post(block_output, residual, ffn_post, ffn_comb), ffn_pre
+        prefill_trace.mark("ffn.end")
+        hidden = hc_post(block_output, residual, ffn_post, ffn_comb)
+        prefill_trace.mark("layer.end")
+        return hidden, ffn_pre
 
     @profile("DSV41/Layer_{}/Decode", layer_id_field="layer_id")
     def decode_step(
@@ -1184,6 +1310,9 @@ class Transformer(nn.Module):
     ) -> None:
         super().__init__()
         self.args = args
+        self.prefill_early_refill = (
+            PrefillEarlyRefill() if prefill_early_refill_enabled() else None
+        )
         native_head = native_bf16_head_enabled()
         if native_head and args.dspark_enabled:
             raise ValueError("native BF16 head is not qualified with MTP/DSpark")
@@ -1241,6 +1370,8 @@ class Transformer(nn.Module):
         for layer_id, block in enumerate(self.layers):
             if block.ffn.experts is None:
                 block.ffn.attach_routed_experts(layer_id, self.args)
+        if self.prefill_early_refill is not None:
+            self.prefill_early_refill.bind(block.ffn.experts for block in self.layers)
 
     def attach_runtime(self, device: torch.device) -> None:
         self._attach_routed_experts()
@@ -1260,6 +1391,25 @@ class Transformer(nn.Module):
             warmup(device, block_sizes=tuple(sorted({
                 indexer.candidate_block_size for indexer in packed_indexers
             })))
+        sparse_layers = [
+            layer_id for layer_id, block in enumerate(self.layers)
+            if block.attn.indexer is not None
+            and getattr(block.attn.indexer, "sparse_consumer_logits", False)
+        ]
+        if sparse_layers:
+            from .indexer import warmup_sparse_consumer
+
+            warmup_sparse_consumer(
+                device,
+                heads=self.args.index_n_heads,
+                dim=self.args.index_head_dim,
+                block_sizes=tuple(sorted({
+                    self.layers[layer_id].attn.indexer.candidate_block_size
+                    for layer_id in sparse_layers
+                })),
+                capacity=self.args.candidate_topk_blocks,
+            )
+            logger.info("CSA2-S sparse consumer logits on layers %s", sparse_layers)
 
     def attach_prefill_communicator(self, communicator) -> None:
         self._attach_routed_experts()
@@ -1489,6 +1639,10 @@ class DeepseekV41ExpertWorkerModel:
         self.args = args
         self.layers = [MoE(layer_id, args) for layer_id in range(args.n_layers)]
         self.engram_coordinator = None
+        self.prefill_early_refill = None
+        if prefill_early_refill_enabled():
+            self.prefill_early_refill = PrefillEarlyRefill()
+            self.prefill_early_refill.bind(layer.experts for layer in self.layers)
 
     def attach_engram_coordinator(self, coordinator) -> None:
         self.engram_coordinator = coordinator
@@ -1509,8 +1663,30 @@ class DeepseekV41ExpertWorkerModel:
         ):
             return torch.zeros((1, 1), dtype=torch.float32, device=device)
         hidden_shape = (num_tokens, self.args.dim)
+        batch = get_global_ctx().batch if prefill_trace.enabled() else None
+        trace = (
+            # The scheduler is replicated on every rank, so workers see the
+            # same request offsets as the authority without a device sync.
+            prefill_trace.chunk(
+                rank=self.engram_coordinator.execution.rank,
+                tokens=num_tokens,
+                device=device,
+                start_pos=batch.reqs[0].cached_len,
+                prompt_len=batch.reqs[0].input_ids.numel(),
+            )
+            if batch is not None and batch.is_moe_prefill
+            else nullcontext()
+        )
+        refill = getattr(self, "prefill_early_refill", None)
+        with trace, (refill.chunk(num_tokens) if refill is not None else nullcontext()):
+            self._forward_layers(num_tokens, hidden_shape, device)
+        return torch.zeros((1, 1), dtype=torch.float32, device=device)
+
+    def _forward_layers(self, num_tokens, hidden_shape, device) -> None:
         try:
             for layer_id, layer in enumerate(self.layers):
+                prefill_trace.set_layer(layer_id)
+                prefill_trace.mark("layer.begin")
                 with profile_range(f"DSV41/Layer_{layer_id}/ExpertWorker"):
                     if layer_id in self.args.engram_layer_ids:
                         if self.engram_coordinator.execution.participates_in_engram:
@@ -1522,8 +1698,10 @@ class DeepseekV41ExpertWorkerModel:
                                     device=device,
                                     is_prefill=get_global_ctx().batch.is_prefill,
                                 )
+                    prefill_trace.mark("engram.end")
                     with profile_range("DSV41/MoE/Worker"):
                         layer.worker_forward(hidden_shape, device)
+                prefill_trace.mark("layer.end")
         finally:
             # Rejoin every side stream before capture ends or the forward returns.
             # This also seals cancellation/error boundaries. Shared-cache repeats
@@ -1533,7 +1711,6 @@ class DeepseekV41ExpertWorkerModel:
                 state = getattr(cache, "_dsv41_background_admission", None)
                 if state is not None:
                     state.join()
-        return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
 
 class DeepseekV41ForCausalLM(BaseLLMModel):
@@ -1998,7 +2175,21 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             return phase_barrier(result)
         if batch.is_prefill:
             req = batch.reqs[0]
-            with profile_range("DSV41/Batch/Prefill"):
+            trace = (
+                prefill_trace.chunk(
+                    rank=self._execution.rank,
+                    tokens=input_ids.numel(),
+                    device=input_ids.device,
+                    start_pos=req.cached_len,
+                    prompt_len=req.input_ids.numel(),
+                )
+                if prefill_trace.enabled() and batch.is_moe_prefill
+                else nullcontext()
+            )
+            refill = getattr(self._model, "prefill_early_refill", None)
+            with profile_range("DSV41/Batch/Prefill"), trace, (
+                refill.chunk(input_ids.numel()) if refill is not None else nullcontext()
+            ):
                 result = self._model.prefill_single(
                     input_ids.view(1, -1),
                     start_pos=req.cached_len,
