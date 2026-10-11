@@ -108,7 +108,10 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager = DecodeManager(config.page_size)
         self._speculative = _speculative_config(config)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            max_batch_size=getattr(config.model_config, "prefill_batch_size_limit", None),
         )
         self.multimodal_cache_keys = MultimodalCacheKeyRegistry()
         self.vision_feature_cache = VisionFeatureCache()
@@ -165,7 +168,14 @@ class Scheduler(SchedulerIOMixin):
                 "DSV4.1 layer-major tail pairing enabled: %s", self._tail_pairing
             )
         # Default-off DSV4.1 dependency-cone prefill; None (the default) adds no work anywhere.
-        self._dependency_cone = dependency_cone_geometry(config)
+        if config.max_running_req == 1:
+            self._dependency_cone = dependency_cone_geometry(config)
+        else:
+            self._dependency_cone = None
+            if os.environ.get("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") != "0":
+                logger.warning_rank0(
+                    "DSV4.1 dependency-cone prefill is bypassed for concurrent serving"
+                )
         validate_dependency_cone_cache_window(
             self._dependency_cone, self.cache_manager.sliding_window_size
         )
@@ -1363,7 +1373,10 @@ def _tail_pairing_limits(config) -> TailPairLimits | None:
     if getattr(config.model_config, "dsv41_args", None) is None:
         raise ValueError(f"{TAIL_PAIRING_ENV}=1 is only supported for DeepSeek-V4.1")
     if config.max_running_req != 1:
-        raise ValueError(f"{TAIL_PAIRING_ENV}=1 requires --max-running-requests 1")
+        logger.warning_rank0(
+            "DSV4.1 layer-major tail pairing is bypassed for concurrent serving"
+        )
+        return None
     try:
         return tail_pair_limits(config)
     except ValueError as exc:

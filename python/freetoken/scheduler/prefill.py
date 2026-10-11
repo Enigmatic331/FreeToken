@@ -249,6 +249,11 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    max_batch_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_batch_size is not None and self.max_batch_size < 1:
+            raise ValueError("prefill max_batch_size must be positive or None")
 
     def add_one_req(self, req: UserMsg, cache_ids: torch.Tensor | None = None) -> None:
         self.pending_list.append(
@@ -301,6 +306,8 @@ class PrefillManager:
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
+                if self.max_batch_size is not None and len(reqs) >= self.max_batch_size:
+                    break
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:

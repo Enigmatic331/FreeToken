@@ -323,6 +323,9 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # Some models can batch one-token decode rows but still require each prefill forward to
+    # contain one logical request. ``None`` keeps the generic token-budget batching policy.
+    prefill_batch_size_limit: int | None = None
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()

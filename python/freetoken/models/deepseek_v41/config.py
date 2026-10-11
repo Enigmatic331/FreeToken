@@ -72,6 +72,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         dsv4_args=args,
         dsv41_args=args,
         single_stream_only=True,
+        # The first concurrency gate batches decode only.  V4.1 paged compression and vision
+        # prefill retain their qualified single-request forward until a separate ragged-prefill
+        # implementation is proved.
+        prefill_batch_size_limit=1,
         attention_groups=(
             DSV4AttentionGroupConfig(
                 name="dsv41",

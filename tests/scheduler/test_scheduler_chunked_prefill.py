@@ -15,6 +15,7 @@ prompt is inserted once when the final (non-chunked) chunk is processed.
 from __future__ import annotations
 
 import torch
+import pytest
 
 CHUNK = 8
 WIDTH = 64
@@ -190,6 +191,52 @@ def test_multimodal_prompt_can_continue_across_prefill_chunks():
     assert not isinstance(final.reqs[0], ChunkedReq)
     assert not pm.runnable
     assert tm.available_size == MAX_RUNNING - 1
+
+
+def test_prefill_batch_limit_serializes_text_and_multimodal_requests():
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, tm, dm, _pm = _build_managers(num_pages=64)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=dm.page_size), max_batch_size=1)
+    image_features = torch.arange(8, dtype=torch.float32).view(2, 4)
+    pm.pending_list = [
+        PendingReq(
+            10,
+            torch.tensor([1, 2, 3], dtype=torch.int32),
+            SamplingParams(max_tokens=2),
+        ),
+        PendingReq(
+            11,
+            torch.tensor([4, 99, 99, 5], dtype=torch.int32),
+            SamplingParams(max_tokens=2),
+            mm_embeds=image_features,
+            is_multimodal=True,
+        ),
+    ]
+
+    first = pm.schedule_next_batch(32)
+    assert first is not None
+    assert [req.uid for req in first.reqs] == [10]
+    assert len(pm.pending_list) == 1
+
+    second = pm.schedule_next_batch(32)
+    assert second is not None
+    assert [req.uid for req in second.reqs] == [11]
+    assert second.reqs[0].mm_embeds is image_features
+    assert second.reqs[0].is_multimodal
+    assert not pm.pending_list
+
+
+def test_prefill_batch_limit_must_be_positive():
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+
+    cm, tm, dm, _pm = _build_managers(num_pages=64)
+    with pytest.raises(ValueError, match="positive"):
+        PrefillManager(cm, tm, DecodeManager(page_size=dm.page_size), max_batch_size=0)
 
 
 def test_multimodal_gather_slices_features_for_each_chunk():

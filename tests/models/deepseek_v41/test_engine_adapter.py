@@ -569,6 +569,44 @@ def test_engine_config_accepts_phase_aware_ep4_with_two_decode_only_ranks():
         distributed_info._TP_INFO = None
 
 
+def test_experimental_c2_preserves_two_decode_rows_and_graph_shapes(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config()
+    object.__setattr__(config, "max_running_req", 2)
+    monkeypatch.setenv("FREETOKEN_DSV41_CONCURRENCY", "1")
+    monkeypatch.setenv("FREETOKEN_DSV41_CUDA_GRAPH", "1")
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(config.dsv41_backbone_rank)
+        _adjust_config(config)
+        assert config.max_running_req == 2
+        assert config.cuda_graph_bs == [1, 2]
+        assert config.cuda_graph_max_bs == 2
+        assert config.model_config.dsv41_args.max_batch_size == 3  # two live + dummy
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
+def test_experimental_c2_rejects_more_than_two_requests(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _engine_config()
+    object.__setattr__(config, "max_running_req", 3)
+    monkeypatch.setenv("FREETOKEN_DSV41_CONCURRENCY", "1")
+    try:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = config.tp_info
+        configure_execution(config.dsv41_backbone_rank)
+        with pytest.raises(ValueError, match="max-running-requests 1 or 2"):
+            _adjust_config(config)
+    finally:
+        _reset_execution_for_tests()
+        distributed_info._TP_INFO = None
+
+
 def test_engram_history_comes_from_tokens_immediately_before_the_forward():
     class CapturingHasher:
         def row_ids(self, input_ids, positions, cu, history):
@@ -620,6 +658,67 @@ def test_engram_history_uses_address_stable_graph_inputs_when_present():
     _, _, cu, history = model._engram_hasher.args
     assert cu.tolist() == [0, 1]
     assert history.tolist() == [[6, 7, 8]]
+
+
+def test_engram_history_is_isolated_for_two_decode_rows_and_slot_order():
+    class CapturingHasher:
+        def row_ids(self, input_ids, positions, cu, history):
+            self.args = (input_ids.clone(), positions.clone(), cu.clone(), history.clone())
+            return torch.zeros(input_ids.numel(), 2, 24, dtype=torch.int64)
+
+    model = object.__new__(DeepseekV41ForCausalLM)
+    model._args = SimpleNamespace(
+        engram_max_ngram_size=4,
+        engram_pad_id=2,
+        engram_layer_ids=(1, 14),
+    )
+    model._engram_hasher = CapturingHasher()
+    model._config = SimpleNamespace(image_token_id=None)
+    a = SimpleNamespace(
+        input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.int32), cached_len=3
+    )
+    b = SimpleNamespace(
+        input_ids=torch.tensor([7, 8, 9, 10, 11], dtype=torch.int32), cached_len=4
+    )
+
+    for reqs, ids, positions, expected in (
+        ([a, b], [4, 11], [3, 4], [[1, 2, 3], [8, 9, 10]]),
+        ([b, a], [11, 4], [4, 3], [[8, 9, 10], [1, 2, 3]]),
+    ):
+        batch = SimpleNamespace(
+            padded_reqs=reqs,
+            positions=torch.tensor(positions, dtype=torch.int32),
+            is_decode=True,
+        )
+        rows = model._engram_rows(batch, torch.tensor(ids, dtype=torch.int64))
+        got_ids, got_pos, cu, history = model._engram_hasher.args
+        assert got_ids.tolist() == ids
+        assert got_pos.tolist() == positions
+        assert cu.tolist() == [0, 1, 2]
+        assert history.tolist() == expected
+        assert rows[1].shape == (2, 24)
+
+
+def test_engram_rejects_a_concurrent_ragged_prefill():
+    model = object.__new__(DeepseekV41ForCausalLM)
+    model._args = SimpleNamespace(
+        engram_max_ngram_size=4,
+        engram_pad_id=2,
+        engram_layer_ids=(1, 14),
+    )
+    model._engram_hasher = SimpleNamespace()
+    model._config = SimpleNamespace(image_token_id=None)
+    reqs = [
+        SimpleNamespace(input_ids=torch.tensor([1, 2]), cached_len=0),
+        SimpleNamespace(input_ids=torch.tensor([3, 4]), cached_len=0),
+    ]
+    batch = SimpleNamespace(
+        padded_reqs=reqs,
+        positions=torch.arange(4, dtype=torch.int32),
+        is_decode=False,
+    )
+    with pytest.raises(RuntimeError, match="prefill remains single-request"):
+        model._engram_rows(batch, torch.tensor([1, 2, 3, 4], dtype=torch.int64))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

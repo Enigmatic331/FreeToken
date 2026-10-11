@@ -2403,24 +2403,33 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         if self._engram_hasher is None:
             raise RuntimeError("V4.1 Engram hasher was not initialized")
         reqs = batch.padded_reqs
-        if len(reqs) != 1:
-            raise RuntimeError("V4.1 ordinary-generation baseline supports one stream")
         history = getattr(batch, "engram_history", None)
         cu = getattr(batch, "engram_cu_seqlens", None)
         if history is None or cu is None:
             ctx = self._args.engram_max_ngram_size - 1
             pin = {"pin_memory": torch.cuda.is_available()}
             history = torch.full(
-                (1, ctx), self._args.engram_pad_id, dtype=torch.int64, **pin
+                (len(reqs), ctx), self._args.engram_pad_id, dtype=torch.int64, **pin
             )
-            req = reqs[0]
-            prefix = req.input_ids[max(0, req.cached_len - ctx) : req.cached_len].long()
-            if prefix.numel():
-                history[0, -prefix.numel() :] = prefix
+            for row, req in enumerate(reqs):
+                prefix = req.input_ids[
+                    max(0, req.cached_len - ctx) : req.cached_len
+                ].long()
+                if prefix.numel():
+                    history[row, -prefix.numel() :] = prefix
             history = history.to(input_ids.device, non_blocking=True)
-            cu = torch.tensor(
-                [0, input_ids.numel()], dtype=torch.int32, **pin
-            ).to(input_ids.device, non_blocking=True)
+            if len(reqs) == 1:
+                lengths = [input_ids.numel()]
+            elif batch.is_decode and input_ids.numel() == len(reqs):
+                lengths = [1] * len(reqs)
+            else:
+                raise RuntimeError(
+                    "V4.1 concurrent Engram metadata supports one-token decode rows; "
+                    "prefill remains single-request"
+                )
+            cu_host = torch.zeros(len(lengths) + 1, dtype=torch.int32, **pin)
+            cu_host[1:] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
+            cu = cu_host.to(input_ids.device, non_blocking=True)
         flat_ids = input_ids.view(-1)
         image_token_id = getattr(getattr(self, "_config", None), "image_token_id", None)
         if image_token_id is None:
@@ -2443,6 +2452,13 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
+        if batch.is_prefill and len(batch.reqs) != 1:
+            # Paged compression, Engram history and vision embeddings are prefilled one request
+            # per forward (prefill_batch_size_limit=1); C2 batches one-token decode rows only.
+            # Checked before the expert-worker split so every rank refuses the same batch.
+            raise RuntimeError(
+                f"V4.1 prefill forward requires exactly one request, got {len(batch.reqs)}"
+            )
         if os.getenv("FREETOKEN_DSV41_TRACE_COLLECTIVES", "0") == "1":
             logger.info(
                 "DSV41 model enter rank=%d phase=%s moe_prefill=%s "

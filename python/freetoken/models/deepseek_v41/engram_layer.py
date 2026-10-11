@@ -59,7 +59,12 @@ class Engram(nn.Module):
         rows = self.table.lookup(row_ids)
         kv = self.wkv(rows.flatten(-2))
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
-        key = key.float().unflatten(-1, (self.hc_mult, self.dim))
+        # Row ids, and so key/value/token_mask, are token-flat ([T, ...]) while x
+        # carries its own token dims ([T], [1, T] prefill, [B, 1] decode).  Align
+        # them to x's token dims so batched decode never cross-broadcasts rows.
+        tokens = x.shape[:-2]
+        key = key.float().reshape(*tokens, self.hc_mult, self.dim)
+        value = value.reshape(*tokens, self.dim)
         hidden = x.float()
         weight = self.q_weight.float() * self.k_weight.float()
         rstd = torch.rsqrt(hidden.square().mean(-1) + self.eps)
@@ -67,7 +72,7 @@ class Engram(nn.Module):
         dot = (hidden * weight * key).sum(-1) * rstd * self.dim**-0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot))
         if token_mask is not None:
-            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
+            gate = gate.masked_fill(~token_mask.reshape(tokens).unsqueeze(-1), 0)
         return (hidden + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 

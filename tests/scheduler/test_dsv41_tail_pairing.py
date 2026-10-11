@@ -749,9 +749,9 @@ def test_scheduler_resolves_limits_only_for_dsv41_single_stream(monkeypatch):
     assert scheduler_mod._tail_pairing_limits(config) is None
     monkeypatch.setenv(TAIL_PAIRING_ENV, "1")
     assert scheduler_mod._tail_pairing_limits(config) == _limits()
-    with pytest.raises(ValueError, match="max-running-requests"):
-        scheduler_mod._tail_pairing_limits(
-            SimpleNamespace(**{**vars(config), "max_running_req": 2}))
+    assert scheduler_mod._tail_pairing_limits(
+        SimpleNamespace(**{**vars(config), "max_running_req": 2})
+    ) is None
     with pytest.raises(ValueError, match="DeepSeek-V4.1"):
         scheduler_mod._tail_pairing_limits(
             SimpleNamespace(**{**vars(config), "model_config": SimpleNamespace(dsv41_args=None)}))

@@ -428,30 +428,38 @@ class Engine:
         # keep what was requested so tail pairing can refuse a request it would not serve.
         requested_max_running_req = config.max_running_req
         _adjust_config(config)
-        if os.environ.get("FREETOKEN_DSV41_TAIL_PAIRING", "0") != "0":
-            from freetoken.scheduler.tail_pairing import tail_pairing_enabled
+        if config.max_running_req == 1:
+            if os.environ.get("FREETOKEN_DSV41_TAIL_PAIRING", "0") != "0":
+                from freetoken.scheduler.tail_pairing import tail_pairing_enabled
 
-            if tail_pairing_enabled():  # refuse before the long weight load, not after it
-                _validate_tail_pairing(
-                    config, self._dsv41_plan, requested_max_running_req=requested_max_running_req
+                if tail_pairing_enabled():  # refuse before the long weight load, not after it
+                    _validate_tail_pairing(
+                        config,
+                        self._dsv41_plan,
+                        requested_max_running_req=requested_max_running_req,
+                    )
+            if os.environ.get("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") != "0":
+                from freetoken.scheduler.dependency_cone import (
+                    DEPENDENCY_CONE_ENV,
+                    dependency_cone_enabled,
+                    dependency_cone_problems,
                 )
-        if os.environ.get("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") != "0":
-            from freetoken.scheduler.dependency_cone import (
-                DEPENDENCY_CONE_ENV,
-                dependency_cone_enabled,
-                dependency_cone_problems,
-            )
 
-            if dependency_cone_enabled():  # refuse before the long weight load, not after it
-                problems = dependency_cone_problems(
-                    config, self._dsv41_plan, requested_max_running_req=requested_max_running_req
-                )
-                if problems:
-                    raise ValueError(f"{DEPENDENCY_CONE_ENV}=1 requires: " + "; ".join(problems))
-                logger.info(
-                    "DSV4.1 dependency-cone execution checks passed on rank %d",
-                    config.tp_info.rank,
-                )
+                if dependency_cone_enabled():  # refuse before weight load, not after it
+                    problems = dependency_cone_problems(
+                        config,
+                        self._dsv41_plan,
+                        requested_max_running_req=requested_max_running_req,
+                    )
+                    if problems:
+                        raise ValueError(
+                            f"{DEPENDENCY_CONE_ENV}=1 requires: " + "; ".join(problems)
+                        )
+                    logger.info(
+                        "DSV4.1 dependency-cone execution checks passed on rank %d",
+                        config.tp_info.rank,
+                    )
+        _refuse_clamped_dsv41_c2(config, requested_max_running_req)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -664,9 +672,12 @@ class Engine:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
         self._dsv41_phase_priority = None
-        if os.getenv("FREETOKEN_DSV41_PHASE_CACHE_PRIORITY", "").strip().lower() in {
+        phase_priority_requested = os.getenv(
+            "FREETOKEN_DSV41_PHASE_CACHE_PRIORITY", ""
+        ).strip().lower() in {
             "1", "true", "yes", "on"
-        }:
+        }
+        if phase_priority_requested and config.max_running_req == 1:
             from freetoken.moe.phase_priority import PhaseCachePriority
 
             self._dsv41_phase_priority = PhaseCachePriority.from_engine(self)
@@ -674,6 +685,10 @@ class Engine:
                 "DSv4.1 phase-cache priority enabled: local decode range %s:%s",
                 self._dsv41_phase_priority.start,
                 self._dsv41_phase_priority.start + self._dsv41_phase_priority.count,
+            )
+        elif phase_priority_requested:
+            logger.warning_rank0(
+                "DSv4.1 phase-cache priority is bypassed for concurrent serving"
             )
         self.graph_runner = GraphRunner(
             stream=self.stream,
@@ -2278,6 +2293,54 @@ _DENSE_MOE_SETTINGS = {
 }
 
 
+_DSV41_CONCURRENCY_ENV = "FREETOKEN_DSV41_CONCURRENCY"
+
+
+def _dsv41_concurrency_enabled() -> bool:
+    """Strict experimental gate for the first decode-only C2 serving path."""
+
+    value = os.environ.get(_DSV41_CONCURRENCY_ENV)
+    if value is None or value == "0":
+        return False
+    if value == "1":
+        return True
+    raise ValueError(f"{_DSV41_CONCURRENCY_ENV} must be '0' or '1', got {value!r}")
+
+
+def _refuse_clamped_dsv41_c2(config: EngineConfig, requested_max_running_req: int) -> None:
+    """Refuse, before any CUDA or weight work, a V4.1 request for two running requests that
+    _adjust_config resolved to one. It runs after the tail-pairing/dependency-cone checks so
+    their established refusals (and the live gate that judges them) keep precedence."""
+
+    if getattr(config.model_config, "dsv41_args", None) is None:
+        return
+    if requested_max_running_req == 2 and config.max_running_req != 2:
+        raise ValueError(
+            "DeepSeek-V4.1 --max-running-requests 2 requires the experimental "
+            f"{_DSV41_CONCURRENCY_ENV}=1 gate; use --max-running-requests 1 for the "
+            "qualified single-stream path"
+        )
+
+
+def _check_dsv41_c2_graph_buckets(config: EngineConfig) -> None:
+    """C2 decode graphs must include bs=1 so a lone decode row replays the qualified bs=1
+    graph instead of being padded beside a dummy row; bs=2 needs explicit qualification."""
+
+    max_bs = config.cuda_graph_max_bs or 0
+    buckets = config.cuda_graph_bs
+    if buckets is None:  # GraphRunner derives [1, 2, 4, ...] up to max_bs
+        buckets = [bs for bs in (1, 2) if bs <= max_bs]
+    if buckets and 1 not in buckets:
+        raise ValueError(
+            "DeepSeek-V4.1 C2 CUDA graphs must include batch size 1 "
+            f"(got --cuda-graph-bs {sorted(buckets)})"
+        )
+    logger.info_rank0(
+        f"DeepSeek-V4.1 C2 decode CUDA graph buckets: {sorted(buckets) or 'none'}; "
+        "other decode batch sizes run eagerly"
+    )
+
+
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
@@ -2286,6 +2349,7 @@ def _adjust_config(config: EngineConfig):
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     dsv41_args = getattr(model_config, "dsv41_args", None)
+    dsv41_concurrency = dsv41_args is not None and _dsv41_concurrency_enabled()
     qwen4_args = getattr(model_config, "qwen4_args", None)
     qwen_backbone_rank = getattr(config, "qwen4_exp_backbone_rank", None)
     qwen_expert_shards = getattr(config, "qwen4_exp_expert_shards", None)
@@ -2611,31 +2675,54 @@ def _adjust_config(config: EngineConfig):
                 f"experts); ignoring MoE settings: {', '.join(dropped)}"
             )
 
+    if dsv41_concurrency:
+        if not 1 <= config.max_running_req <= 2:
+            raise ValueError(
+                f"{_DSV41_CONCURRENCY_ENV}=1 currently requires "
+                "--max-running-requests 1 or 2"
+            )
+        # At 1 the gate is inert: the qualified single-stream resolution below runs unchanged.
+        if config.max_running_req == 2:
+            single_stream_only = False
+            logger.info_rank0(
+                "DeepSeek-V4.1 experimental C2 enabled: prefills remain serialized; "
+                "one-token decode rows may batch"
+            )
+
     if single_stream_only:
         # The model runs one sequence at a time: it collapses the batch to one row and the
         # decode CUDA graph is captured at bs=1. Force the runtime knobs so the KV pool, page
-        # table and graph capture all stay bs=1.
+        # table and graph capture all stay bs=1. Engine.__init__ refuses a clamped request for
+        # exactly two (see _refuse_clamped_dsv41_c2); other values keep the historical clamp.
         if config.max_running_req != 1:
+            logger.warning_rank0(
+                f"{getattr(model_config, 'model_type', 'model')} runs one request at a time; "
+                f"clamping max_running_req {config.max_running_req} to 1"
+            )
             override("max_running_req", 1)
-        dsv41_graph_opt_in = os.getenv(
-            "FREETOKEN_DSV41_CUDA_GRAPH", "0"
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if dsv41_args is not None and not dsv41_graph_opt_in:
-            # Engram history itself is graph-safe, but the heterogeneous EP graph
-            # currently deadlocks its PyNCCL collective sequence on first replay.
-            # Keep the implementation available for qualification without making
-            # an unproven distributed graph the serving default.
-            override("cuda_graph_bs", [])
-            override("cuda_graph_max_bs", 0)
-        elif config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
+
+    dsv41_graph_opt_in = os.getenv(
+        "FREETOKEN_DSV41_CUDA_GRAPH", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if dsv41_args is not None and not dsv41_graph_opt_in:
+        # Engram history itself is graph-safe, but the heterogeneous EP graph
+        # currently deadlocks its PyNCCL collective sequence on first replay.
+        # Keep the implementation available for qualification without making
+        # an unproven distributed graph the serving default.  This applies to C2 too.
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
 
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+
+    if dsv41_args is not None and config.max_running_req == 2:
+        _check_dsv41_c2_graph_buckets(config)
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
