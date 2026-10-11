@@ -122,6 +122,7 @@ class PrefillAdder:
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
+        dsv41_cone: object | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -197,6 +198,7 @@ class PrefillAdder:
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        req.dsv41_cone = dsv41_cone  # the prompt's dependency-cone state (None unless enabled)
         return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -214,6 +216,7 @@ class PrefillAdder:
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
+                dsv41_cone=getattr(chunked_req, "dsv41_cone", None),
             )
 
         if resource := self._try_allocate_one(pending_req):
@@ -342,6 +345,7 @@ class PrefillManager:
             next_track_idx=head.mamba_next_track_idx,
             restore_src=None,
             swa_evicted_seqlen=head.swa_evicted_seqlen,
+            dsv41_cone=getattr(head, "dsv41_cone", None),
         )
         if (tail is None or isinstance(tail, ChunkedReq)
                 or (tail.cached_len, tail.device_len) != (plan.tail_start, plan.prompt_end)):

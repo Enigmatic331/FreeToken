@@ -30,6 +30,13 @@ from freetoken.utils import (
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .dependency_cone import (
+    DECODER,
+    agree_cone_segment,
+    dependency_cone_geometry,
+    plan_prefill_cone,
+    validate_dependency_cone_cache_window,
+)
 from .io import SchedulerIOMixin
 from .multimodal_cache import MultimodalCacheKeyRegistry, VisionFeatureCache
 from .prefill import ChunkedReq, PrefillManager
@@ -156,6 +163,15 @@ class Scheduler(SchedulerIOMixin):
         if self._tail_pairing is not None:
             logger.info_rank0(
                 "DSV4.1 layer-major tail pairing enabled: %s", self._tail_pairing
+            )
+        # Default-off DSV4.1 dependency-cone prefill; None (the default) adds no work anywhere.
+        self._dependency_cone = dependency_cone_geometry(config)
+        validate_dependency_cone_cache_window(
+            self._dependency_cone, self.cache_manager.sliding_window_size
+        )
+        if self._dependency_cone is not None:
+            logger.info_rank0(
+                "DSV4.1 dependency-cone prefill enabled: %s", self._dependency_cone
             )
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
@@ -1134,9 +1150,15 @@ class Scheduler(SchedulerIOMixin):
         if batch is None:
             return None
         self._maybe_make_speculative(batch)
+        if getattr(self, "_dependency_cone", None) is not None and batch.is_prefill:
+            self._plan_dependency_cone(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
-        if getattr(self, "_tail_pairing", None) is not None and batch.is_prefill:
+        if (
+            getattr(self, "_tail_pairing", None) is not None
+            and batch.is_prefill
+            and getattr(batch, "dsv41_cone", None) is None
+        ):
             forward_input = self._maybe_pair_tail(forward_input)
         return forward_input
 
@@ -1188,6 +1210,35 @@ class Scheduler(SchedulerIOMixin):
             plan.uid, plan.head_start, plan.tail_start, plan.tail_start, plan.prompt_end,
         )
         return tail_input
+
+    def _plan_dependency_cone(self, batch: Batch) -> None:
+        """Give a prefill batch its agreed dependency-cone segment (scheduler/dependency_cone.py).
+
+        Every rank evaluates the same pure plan on its replicated state and proves agreement
+        before the batch is prepared. A divergent rank therefore fails closed on all ranks,
+        rather than hanging in a layer collective that its peers skip.
+        """
+        segment = plan_prefill_cone(batch, self._dependency_cone)
+        tp = self.config.tp_info
+        segment = agree_cone_segment(
+            segment,
+            rank=tp.rank,
+            world_size=tp.size,
+            broadcast=lambda wire: self._cpu_broadcast(wire, "dependency_cone"),
+            all_reduce_sum=lambda flag: self._cpu_all_reduce_sum(
+                flag, "dependency_cone_mismatch"
+            ),
+        )
+        batch.dsv41_cone = segment
+        decoder = segment is not None and segment.kind == DECODER
+        if decoder and segment.start == segment.decoder_start:  # the prompt's first decoder chunk
+            state = batch.reqs[0].dsv41_cone
+            logger.info_rank0(
+                "DSV4.1 dependency cone uid=%d: decoder from %d of a %d-token prompt "
+                "(%d rows encoder-only)",
+                segment.uid, segment.decoder_start, state.prompt_len,
+                segment.decoder_start - state.admitted_len,
+            )
 
     def _release_paired_head_window(self, batch: Batch) -> None:
         """At a paired forward's drain, return the head's out-of-window SWA slots: the same

@@ -330,6 +330,33 @@ class RoutedExperts(ExpertParallelOffloadMoELayer):
             # Paired tail chunk: the head chunk streamed this layer moments ago in the same
             # forward and the slot stays resident until the head's next layer issues L+2.
             return cache.reuse_prefill_layer(self.layer_id)
+        # Keep the default-OFF path identical: in particular, do not even require an active
+        # global batch when the feature is disabled (standalone kernel tools call this method).
+        cone = None
+        if os.getenv("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") == "1":
+            cone = getattr(get_global_ctx().batch, "dsv41_cone", None)
+        if cone is not None:
+            # Encoder-only cone chunks stop before the source layer.  The generic overlap
+            # choreography always queues L+1, which would stream the unused source-layer expert
+            # bank after layer source-1.  Bound both traced and ordinary prefetch to the layers
+            # this rank will actually execute; decoder chunks retain the normal full-depth path.
+            limit = int(cone.executed_layers)
+            if not 0 <= self.layer_id < limit:
+                raise RuntimeError(
+                    f"dependency-cone prefill reached MoE layer {self.layer_id} "
+                    f"outside its {limit}-layer segment"
+                )
+            if self.layer_id == 0:
+                cache.begin_prefill()
+            if prefill_trace.active():
+                self._traced_prefetch(cache, self.layer_id)
+                if self.layer_id + 1 < limit:
+                    self._traced_prefetch(cache, self.layer_id + 1)
+            else:
+                cache.prefetch_prefill_layer(self.layer_id)
+                if self.layer_id + 1 < limit:
+                    cache.prefetch_prefill_layer(self.layer_id + 1)
+            return cache.wait_prefill_layer(self.layer_id)
         refill = self.prefill_early_refill
         began_early = (
             self.layer_id == 0 and refill is not None and refill.began(cache)

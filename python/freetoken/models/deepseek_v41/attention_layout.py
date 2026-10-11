@@ -104,4 +104,36 @@ class AttentionLayout:
         return AttentionCacheBytes(window, compressed, index, state)
 
 
-__all__ = ["AttentionCacheBytes", "AttentionLayout", "LayerAttentionPlan"]
+def decoder_source_layer(args: DeepseekV41Args) -> int:
+    """First decoder layer of V4.1's causal encoder-decoder split.
+
+    This is the last compressed-KV source.  Its compressed KV and index keys are per-row
+    functions of its own input, which is the encoder output, and every later layer reads them.
+    A later index source computes queries only.  So a row of a later layer depends on other
+    rows only through that layer's own sliding window.  Raises ValueError when the checkpoint's
+    layer plan does not have this shape.
+    """
+
+    if not args.kv_source_layers:
+        raise ValueError("V4.1 encoder-decoder split needs a compressed-KV source")
+    layout = AttentionLayout(args)
+    source = max(int(layer) for layer in args.kv_source_layers)
+    if not 0 < source < args.n_layers:
+        raise ValueError(f"last KV source {source} leaves no encoder or no decoder layer")
+    for plan in layout.layers[source:]:
+        if not plan.compress_ratio or plan.kv_source != source:
+            raise ValueError(
+                f"layer {plan.layer_id} does not read the last KV source {source}"
+            )
+    late_engram = [int(layer) for layer in args.engram_layer_ids if int(layer) >= source]
+    if late_engram:
+        raise ValueError(f"Engram layers {late_engram} are not encoder layers (< {source})")
+    return source
+
+
+__all__ = [
+    "AttentionCacheBytes",
+    "AttentionLayout",
+    "LayerAttentionPlan",
+    "decoder_source_layer",
+]

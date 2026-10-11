@@ -435,6 +435,23 @@ class Engine:
                 _validate_tail_pairing(
                     config, self._dsv41_plan, requested_max_running_req=requested_max_running_req
                 )
+        if os.environ.get("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") != "0":
+            from freetoken.scheduler.dependency_cone import (
+                DEPENDENCY_CONE_ENV,
+                dependency_cone_enabled,
+                dependency_cone_problems,
+            )
+
+            if dependency_cone_enabled():  # refuse before the long weight load, not after it
+                problems = dependency_cone_problems(
+                    config, self._dsv41_plan, requested_max_running_req=requested_max_running_req
+                )
+                if problems:
+                    raise ValueError(f"{DEPENDENCY_CONE_ENV}=1 requires: " + "; ".join(problems))
+                logger.info(
+                    "DSV4.1 dependency-cone execution checks passed on rank %d",
+                    config.tp_info.rank,
+                )
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)

@@ -500,6 +500,9 @@ class CacheManager:
             return
 
         insert_len = align_down(req.cached_len, self.page_size)
+        if getattr(req, "dsv41_cone", None) is not None:
+            if not self._honor_dependency_cone(req, old_handle, insert_len, finished=finished):
+                return
         freed = page_indices[:0]
         if insert_len > 0:
             # insert reconciles tombstones (revives the in-window ones by ADOPTING the request's
@@ -562,6 +565,38 @@ class CacheManager:
                 self.page_table[req.table_idx, : m.cached_len].copy_(m.kv_indices)
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
+
+    def _honor_dependency_cone(self, req: Req, old_handle, insert_len: int, *,
+                               finished: bool) -> bool:
+        """Keep a DSV4.1 dependency-cone prompt's inexact window KV out of the SWA tree.
+
+        Below the cone's frontier, decoder window KV was never written or is inexact
+        (scheduler/dependency_cone.py). Free the request's own live swa there and raise its
+        extend-free watermark, so that the insert below tombstones those positions. Returns
+        False when nothing new may be published yet. A finished request then returns its own
+        span to both pools. A running one keeps its pages and handle until its next commit.
+        """
+        frontier = req.dsv41_cone.swa_commit_frontier(insert_len)
+        if frontier is None:
+            if not finished:
+                raise RuntimeError(
+                    "dependency-cone prefill reached a final cache commit before its exact "
+                    "window frontier"
+                )
+            if finished:
+                self.unlock(old_handle)
+                tail = self._padded_tail(req, old_handle.cached_len)
+                self._free_swa(tail)
+                self._free(tail)
+            return False
+        start = max(req.swa_evicted_seqlen, old_handle.cached_len)
+        if frontier > start:
+            # Overlap-safe: the frontier never passes the prompt's finish-time retention start.
+            # An in-flight decode step reads only the window ending at the prompt end or later,
+            # so it reads none of these slots.
+            self._free_swa(self.page_table[req.table_idx, start:frontier])
+            req.swa_evicted_seqlen = frontier
+        return True
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish

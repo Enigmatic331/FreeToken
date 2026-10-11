@@ -72,6 +72,9 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Default-off DeepSeek-V4.1 dependency-cone prefill (scheduler/dependency_cone.py): the
+    # prompt's ConeRequestState, shared by all of its chunk Reqs. None everywhere else.
+    dsv41_cone: object | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -215,6 +218,9 @@ class Batch:
     tail_pair_role: str | None = field(default=None, init=False)
     tail_pair_plan: object | None = field(default=None, init=False)
     paired_head: object | None = field(default=None, init=False)
+    # Default-off DeepSeek-V4.1 dependency-cone prefill: this prefill chunk's agreed ConeSegment
+    # (scheduler/dependency_cone.py). None means the plain forward.
+    dsv41_cone: object | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

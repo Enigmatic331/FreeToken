@@ -559,15 +559,27 @@ class Attention(nn.Module):
         return rows
 
     def prefill_single(
-        self, x: torch.Tensor, start_pos: int, table_idx: int
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        table_idx: int,
+        window_floor: int | None = None,
     ) -> torch.Tensor:
-        """Correctness-first single-request paged prefill/extend."""
+        """Correctness-first single-request paged prefill/extend.
+
+        ``window_floor`` (DSV4.1 dependency-cone decoder chunks only) clamps every query's
+        sliding window at that position: rows below it never ran this layer.
+        """
 
         from freetoken.models.deepseek_v4.ops import apply_rotary_emb
 
         assert self.freqs_cis is not None
         n = x.shape[1]
         end = start_pos + n
+        if window_floor is not None and not 0 <= window_floor <= start_pos:
+            raise ValueError(
+                f"window floor {window_floor} outside [0, {start_pos}] at layer {self.layer_id}"
+            )
         freqs = self.freqs_cis[start_pos:end]
         q_lora, q = self._project_q(x, freqs)
         kv = self._project_window_kv(x, freqs)
@@ -584,6 +596,8 @@ class Attention(nn.Module):
             window_rows = self.attn.win_cols_to_global(local, slots)
         else:
             lo = max(0, start_pos - self.window_size + 1)
+            if window_floor is not None:
+                lo = max(lo, window_floor)
             pool_slots = self.attn.window_slots_of(table_idx, lo, end)
             query_pos = start_pos + torch.arange(n, device=x.device).unsqueeze(1)
             candidates = (
@@ -616,6 +630,27 @@ class Attention(nn.Module):
         apply_rotary_emb(output[..., -self.rope_head_dim :], freqs, inverse=True)
         prefill_trace.mark("attn.core.end")
         return self._project_output(output)
+
+    def publish_prefill_source(
+        self, x: torch.Tensor, start_pos: int, table_idx: int
+    ) -> None:
+        """A DSV4.1 dependency-cone encoder chunk's work at the decoder source layer.
+
+        Stores this layer's window KV and publishes its compressed KV and index keys exactly as
+        ``prefill_single`` does over the same rows. It neither attends nor projects output.
+        """
+
+        assert self.freqs_cis is not None
+        if not self.plan.owns_kv:
+            raise RuntimeError(f"layer {self.layer_id} publishes no compressed KV")
+        end = start_pos + x.shape[1]
+        freqs = self.freqs_cis[start_pos:end]
+        kv = self._project_window_kv(x, freqs)
+        slots = self.attn.window_slots_of(table_idx, start_pos, end)
+        self.attn.store_window(kv[0], self.layer_id, slots)
+        prefill_trace.mark("attn.qkv.end")
+        self._publish_source_prefill(x, start_pos, table_idx, slots)
+        prefill_trace.mark("attn.compress.end")
 
     def _publish_source_decode(
         self,
@@ -1236,6 +1271,7 @@ class Block(nn.Module):
         engram_rows: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        window_floor: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .hc import hc_post, hc_pre
 
@@ -1248,9 +1284,14 @@ class Block(nn.Module):
         block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
         prefill_trace.mark("attn.begin")
         with profile_range("DSV41/Attention/Prefill"):
-            block_output = self.attn.prefill_single(
-                block_input, start_pos, table_idx
-            )
+            if window_floor is None:
+                block_output = self.attn.prefill_single(
+                    block_input, start_pos, table_idx
+                )
+            else:
+                block_output = self.attn.prefill_single(
+                    block_input, start_pos, table_idx, window_floor=window_floor
+                )
         prefill_trace.mark("attn.end")
         hidden = hc_post(block_output, residual, attn_post, attn_comb)
 
@@ -1264,6 +1305,32 @@ class Block(nn.Module):
         hidden = hc_post(block_output, residual, ffn_post, ffn_comb)
         prefill_trace.mark("layer.end")
         return hidden, ffn_pre
+
+    @profile("DSV41/Layer_{}/PublishSource", layer_id_field="layer_id")
+    def publish_prefill_source(
+        self,
+        hidden: torch.Tensor,
+        incoming_pre: torch.Tensor,
+        *,
+        start_pos: int,
+        table_idx: int,
+    ) -> None:
+        """The decoder source layer's share of a DSV4.1 dependency-cone encoder chunk.
+
+        Builds the attention input exactly as ``prefill_single`` does, then publishes only what
+        later rows read: this layer's window KV, compressed KV and index keys. It enters no
+        collective. ``decoder_source_layer`` guarantees that this layer has no Engram.
+        """
+        from .hc import hc_pre
+
+        prefill_trace.set_layer(self.layer_id)
+        prefill_trace.mark("layer.begin")
+        if self.engram is not None:
+            raise RuntimeError(f"cone source layer {self.layer_id} has an Engram module")
+        block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
+        with profile_range("DSV41/Attention/PublishSource"):
+            self.attn.publish_prefill_source(block_input, start_pos, table_idx)
+        prefill_trace.mark("layer.end")
 
     @profile("DSV41/Layer_{}/Decode", layer_id_field="layer_id")
     def decode_step(
@@ -1469,6 +1536,7 @@ class Transformer(nn.Module):
         mm_embeds: torch.Tensor | None = None,
         full_logits: bool = False,
         capture_dspark: bool = False,
+        cone=None,
     ) -> torch.Tensor:
         from .hc import hc_pre
 
@@ -1476,12 +1544,28 @@ class Transformer(nn.Module):
         hidden, incoming, image_mask, token_mask = self._prefill_inputs(
             input_ids, mm_embeds, token_mask
         )
+        if cone is not None:
+            # DSV4.1 dependency-cone chunk (scheduler/dependency_cone.py).
+            if full_logits or capture_dspark:
+                raise RuntimeError("dependency-cone prefill has no full logits or DSpark taps")
+            if cone.is_encoder:
+                return self._prefill_encoder_chunk(
+                    hidden,
+                    incoming,
+                    cone,
+                    start_pos=start_pos,
+                    table_idx=table_idx,
+                    engram_rows=engram_rows,
+                    token_mask=token_mask,
+                    image_mask=image_mask,
+                )
         target_hiddens = []
         for layer_id, block in enumerate(self.layers):
             # The official V4.1 DSpark reference taps the attention INPUT of
             # layers 37/38/39, with the HC copies averaged away.
             if capture_dspark and layer_id in self.args.dspark_target_layer_ids:
                 target_hiddens.append(hidden.mean(dim=2))
+            floor = None if cone is None else cone.window_floor(layer_id)
             hidden, incoming = block.prefill_single(
                 hidden,
                 incoming,
@@ -1490,6 +1574,7 @@ class Transformer(nn.Module):
                 engram_rows=(engram_rows or {}).get(layer_id),
                 token_mask=token_mask,
                 image_mask=image_mask,
+                **({} if floor is None else {"window_floor": floor}),
             )
         hidden = self.norm(hc_pre(hidden, incoming))
         self._dspark_hidden = (
@@ -1498,6 +1583,40 @@ class Transformer(nn.Module):
         projected = hidden if full_logits else hidden[:, -1]
         logits = project_logits(projected, self.head)
         return logits[0] if full_logits else logits
+
+    def _prefill_encoder_chunk(
+        self,
+        hidden: torch.Tensor,
+        incoming: torch.Tensor,
+        cone,
+        *,
+        start_pos: int,
+        table_idx: int,
+        engram_rows: dict[int, torch.Tensor] | None,
+        token_mask: torch.Tensor | None,
+        image_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """A dependency-cone encoder chunk: the encoder layers unchanged, then the decoder source
+        layer's window-KV and compressed-KV/index-key publication. Nothing samples its logits
+        (it is never a final chunk), so zeros keep the forward's return shape."""
+        source = cone.source_layer
+        for layer_id in range(source):
+            hidden, incoming = self.layers[layer_id].prefill_single(
+                hidden,
+                incoming,
+                start_pos=start_pos,
+                table_idx=table_idx,
+                engram_rows=(engram_rows or {}).get(layer_id),
+                token_mask=token_mask,
+                image_mask=image_mask,
+            )
+        self.layers[source].publish_prefill_source(
+            hidden, incoming, start_pos=start_pos, table_idx=table_idx
+        )
+        self._dspark_hidden = None
+        return torch.zeros(
+            (1, self.head.shape[0]), dtype=torch.float32, device=hidden.device
+        )
 
     def _prefill_inputs(
         self,
@@ -1739,7 +1858,7 @@ class DeepseekV41ExpertWorkerModel:
         for layer in self.layers:
             layer.attach_prefill_communicator(communicator)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, cone=None) -> torch.Tensor:
         if self.engram_coordinator is None:
             raise RuntimeError("V4.1 worker has no Engram tables")
         num_tokens = input_ids.numel()
@@ -1767,12 +1886,21 @@ class DeepseekV41ExpertWorkerModel:
         )
         refill = getattr(self, "prefill_early_refill", None)
         with trace, (refill.chunk(num_tokens) if refill is not None else nullcontext()):
-            self._forward_layers(num_tokens, hidden_shape, device)
+            if cone is None:
+                self._forward_layers(num_tokens, hidden_shape, device)
+            else:
+                # A DSV4.1 dependency-cone encoder chunk enters only the encoder layers'
+                # collectives, as the authority does (scheduler/dependency_cone.py).
+                self._forward_layers(
+                    num_tokens, hidden_shape, device, layers=cone.executed_layers
+                )
         return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
-    def _forward_layers(self, num_tokens, hidden_shape, device) -> None:
+    def _forward_layers(self, num_tokens, hidden_shape, device, layers: int | None = None) -> None:
         try:
-            for layer_id, layer in enumerate(self.layers):
+            for layer_id, layer in enumerate(
+                self.layers if layers is None else self.layers[:layers]
+            ):
                 prefill_trace.set_layer(layer_id)
                 prefill_trace.mark("layer.begin")
                 with profile_range(f"DSV41/Layer_{layer_id}/ExpertWorker"):
@@ -2209,6 +2337,23 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                 )
         return sum(table.nbytes for table in tables.values())
 
+    def _check_dependency_cone(self, batch, cone) -> None:
+        """Refuse, on every rank, a dependency-cone segment this forward cannot honor exactly."""
+        from freetoken.scheduler.dependency_cone import validate_cone_segment
+
+        from .attention_layout import decoder_source_layer
+
+        if not batch.is_moe_prefill or len(batch.reqs) != 1:
+            raise RuntimeError("dependency-cone segment on a batch that is not one bulk prefill")
+        if self._args.dspark_enabled:
+            raise RuntimeError("dependency-cone prefill requires MTP/DSpark off")
+        source = getattr(self, "_cone_source_layer", None)
+        if source is None:
+            source = self._cone_source_layer = decoder_source_layer(self._args)
+        validate_cone_segment(
+            cone, batch.reqs[0], n_layers=self._args.n_layers, source_layer=source
+        )
+
     def _prefill_phase_barrier(self, batch, result: torch.Tensor) -> torch.Tensor:
         if batch.is_moe_prefill and self._execution.uses_prefill_subgroup:
             if self._phase_barrier_group is None:
@@ -2313,9 +2458,14 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         def phase_barrier(result: torch.Tensor) -> torch.Tensor:
             return self._prefill_phase_barrier(batch, result)
 
+        cone = getattr(batch, "dsv41_cone", None)
+        if cone is not None:
+            self._check_dependency_cone(batch, cone)
         if self._execution.is_expert_worker:
             with profile_range("DSV41/Batch/ExpertWorker"):
-                return phase_barrier(self._model.forward(batch.input_ids))
+                if cone is None:
+                    return phase_barrier(self._model.forward(batch.input_ids))
+                return phase_barrier(self._model.forward(batch.input_ids, cone=cone))
         self.prepare_for_runtime()
         capture_dspark = self._args.dspark_enabled and not any(
             req.is_multimodal for req in batch.reqs
@@ -2370,6 +2520,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                     mm_embeds=batch.mm_embeds,
                     full_logits=batch.speculative,
                     capture_dspark=capture_dspark,
+                    **({} if cone is None else {"cone": cone}),
                 )
                 if capture_dspark:
                     hidden = self._model._dspark_hidden
