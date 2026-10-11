@@ -51,6 +51,9 @@ def _background_admission_max_misses() -> int:
 
 
 _PREFILL_EARLY_REFILL_ENV = "FREETOKEN_DSV41_PREFILL_EARLY_REFILL"
+# freetoken.scheduler.tail_pairing.TAIL_PAIRING_ENV; strictly parsed and validated at startup by
+# the scheduler and engine. Frozen here so the default-off path never inspects the batch.
+_TAIL_PAIRING_ENABLED = os.getenv("FREETOKEN_DSV41_TAIL_PAIRING", "0") == "1"
 
 
 def prefill_early_refill_enabled() -> bool:
@@ -320,6 +323,13 @@ class RoutedExperts(ExpertParallelOffloadMoELayer):
     # defers to the base class unchanged unless a traced prefill chunk is active.
 
     def _wait_prefill_overlap(self, cache):
+        if (
+            _TAIL_PAIRING_ENABLED
+            and getattr(get_global_ctx().batch, "tail_pair_role", None) == "tail"
+        ):
+            # Paired tail chunk: the head chunk streamed this layer moments ago in the same
+            # forward and the slot stays resident until the head's next layer issues L+2.
+            return cache.reuse_prefill_layer(self.layer_id)
         refill = self.prefill_early_refill
         began_early = (
             self.layer_id == 0 and refill is not None and refill.began(cache)

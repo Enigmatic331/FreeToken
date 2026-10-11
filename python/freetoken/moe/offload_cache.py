@@ -930,6 +930,28 @@ class OffloadMoeCache:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
+    def reuse_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """Views of ``layer_id``'s already-streamed double buffer, for a second logical chunk in
+        the same layer-major forward (DSV4.1 tail pairing). Issues no copy and does not restart
+        the prefill session. The first chunk's layer-L+1 prefetch targets the other buffer and
+        layer L+2 is issued only after this chunk's layer L, whose ``release_prefill_layer``
+        re-records the release event that copy waits on. Until then the buffer counts as
+        unreleased, so a premature L+2 prefetch trips the reused-before-release assertion.
+        Raises unless the layer is resident.
+        """
+        if not self.prefill_overlap or not self.prefill_bank_buffers:
+            raise RuntimeError("prefill buffer reuse requires prefill overlap buffers")
+        buffer_id = layer_id % 2
+        if not 0 <= layer_id < self.num_layers or self._prefill_buffer_layer[buffer_id] != layer_id:
+            raise RuntimeError(
+                f"prefill layer {layer_id} is not resident for reuse "
+                f"(buffers hold {self._prefill_buffer_layer})"
+            )
+        self._prefill_buffer_released[buffer_id] = False
+        if self.prefill_ready_events:
+            torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
+        return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
+
     def release_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap:
             return

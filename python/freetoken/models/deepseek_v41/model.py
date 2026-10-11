@@ -9,7 +9,7 @@ TP2+EP2 research mode executes a sharded dense backbone on both ranks.
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -67,6 +67,33 @@ class SharedAttentionRuntime:
 
 
 shared_attention = SharedAttentionRuntime()
+
+
+@dataclass(frozen=True)
+class _PrefillSegment:
+    """One logical chunk of a layer-major paired prefill (DSV4.1 tail pairing)."""
+
+    batch: object
+    input_ids: torch.Tensor  # [1, T]
+    start_pos: int
+    table_idx: int
+    engram_rows: dict[int, torch.Tensor]
+    mm_embeds: torch.Tensor | None
+    runtime: SharedAttentionRuntime
+
+
+@contextmanager
+def _active_segment(segment: _PrefillSegment):
+    """Run code as ``segment``'s own forward would see it: its batch on the context and its
+    private shared-attention publications in the module global the layers read."""
+    global shared_attention
+    outer = shared_attention
+    shared_attention = segment.runtime
+    try:
+        with get_global_ctx().substitute_batch(segment.batch):
+            yield
+    finally:
+        shared_attention = outer
 
 
 @dataclass(frozen=True)
@@ -1443,28 +1470,12 @@ class Transformer(nn.Module):
         full_logits: bool = False,
         capture_dspark: bool = False,
     ) -> torch.Tensor:
-        from .hc import hc_pre, identity_pre_mix
+        from .hc import hc_pre
 
         shared_attention.reset()
-        embedded = self.embed(input_ids)
-        image_mask = None
-        if mm_embeds is not None:
-            image_mask = input_ids == self.args.image_token_id
-            count = int(image_mask.sum().item())
-            if mm_embeds.shape != (count, self.args.dim):
-                raise ValueError(
-                    f"DeepSeek image embeddings {tuple(mm_embeds.shape)} do not "
-                    f"match {count} placeholder tokens"
-                )
-            embedded = embedded.clone()
-            embedded[image_mask] = mm_embeds.to(
-                device=embedded.device, dtype=embedded.dtype
-            )
-            token_mask = ~image_mask
-        hidden = embedded.unsqueeze(2).repeat(
-            1, 1, self.args.hc_mult, 1
+        hidden, incoming, image_mask, token_mask = self._prefill_inputs(
+            input_ids, mm_embeds, token_mask
         )
-        incoming = identity_pre_mix(hidden, self.args.hc_mult)
         target_hiddens = []
         for layer_id, block in enumerate(self.layers):
             # The official V4.1 DSpark reference taps the attention INPUT of
@@ -1487,6 +1498,83 @@ class Transformer(nn.Module):
         projected = hidden if full_logits else hidden[:, -1]
         logits = project_logits(projected, self.head)
         return logits[0] if full_logits else logits
+
+    def _prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        mm_embeds: torch.Tensor | None,
+        token_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Embed one prefill chunk: (HC hidden, incoming pre-mix, image mask, token mask)."""
+        from .hc import identity_pre_mix
+
+        embedded = self.embed(input_ids)
+        image_mask = None
+        if mm_embeds is not None:
+            image_mask = input_ids == self.args.image_token_id
+            count = int(image_mask.sum().item())
+            if mm_embeds.shape != (count, self.args.dim):
+                raise ValueError(
+                    f"DeepSeek image embeddings {tuple(mm_embeds.shape)} do not "
+                    f"match {count} placeholder tokens"
+                )
+            embedded = embedded.clone()
+            embedded[image_mask] = mm_embeds.to(
+                device=embedded.device, dtype=embedded.dtype
+            )
+            token_mask = ~image_mask
+        hidden = embedded.unsqueeze(2).repeat(
+            1, 1, self.args.hc_mult, 1
+        )
+        incoming = identity_pre_mix(hidden, self.args.hc_mult)
+        return hidden, incoming, image_mask, token_mask
+
+    def prefill_tail_pair(
+        self, head: "_PrefillSegment", tail: "_PrefillSegment"
+    ) -> torch.Tensor:
+        """Layer-major forward of two consecutive chunks of one request (DSV4.1 tail pairing).
+
+        Each chunk runs the unchanged ``Block.prefill_single`` with its own position, Engram
+        rows, masks and shared-attention publications. At every layer the head chunk runs
+        first, so the tail reads exactly the KV state its own later forward would read, and
+        both use the layer's streamed expert bank. Returns the tail's last-token logits; the
+        head chunk's logits are never consumed, so they are not computed.
+        """
+        # As in prefill_single: free the previous forward's publications before anything else.
+        # _active_segment restores this outer runtime after every block, so it would otherwise
+        # hold them for the whole paired forward.
+        shared_attention.reset()
+        from .hc import hc_pre
+
+        segments = (head, tail)
+        states: list[list | None] = []
+        for segment in segments:
+            with _active_segment(segment):
+                states.append(list(
+                    self._prefill_inputs(segment.input_ids, segment.mm_embeds, None)
+                ))
+        last = len(self.layers) - 1
+        for layer_id, block in enumerate(self.layers):
+            for index, segment in enumerate(segments):
+                state = states[index]
+                with _active_segment(segment):
+                    state[0], state[1] = block.prefill_single(
+                        state[0],
+                        state[1],
+                        start_pos=segment.start_pos,
+                        table_idx=segment.table_idx,
+                        engram_rows=segment.engram_rows.get(layer_id),
+                        token_mask=state[3],
+                        image_mask=state[2],
+                    )
+                if index == 0 and layer_id == last:
+                    # Release the head's cross-layer state before the tail's final layer.
+                    states[0] = None
+                    head.runtime.reset()
+        hidden, incoming = states[1][0], states[1][1]
+        hidden = self.norm(hc_pre(hidden, incoming))
+        self._dspark_hidden = None
+        return project_logits(hidden[:, -1], self.head)
 
     def decode(
         self,
@@ -1703,14 +1791,58 @@ class DeepseekV41ExpertWorkerModel:
                         layer.worker_forward(hidden_shape, device)
                 prefill_trace.mark("layer.end")
         finally:
-            # Rejoin every side stream before capture ends or the forward returns.
-            # This also seals cancellation/error boundaries. Shared-cache repeats
-            # are cheap no-ops after the first join; no idle CUDA work is added.
-            for layer in self.layers:
-                cache = getattr(getattr(layer, "experts", None), "offload_cache", None)
-                state = getattr(cache, "_dsv41_background_admission", None)
-                if state is not None:
-                    state.join()
+            self._join_background_admission()
+
+    def _join_background_admission(self) -> None:
+        # Rejoin every side stream before capture ends or the forward returns.
+        # This also seals cancellation/error boundaries. Shared-cache repeats
+        # are cheap no-ops after the first join; no idle CUDA work is added.
+        for layer in self.layers:
+            cache = getattr(getattr(layer, "experts", None), "offload_cache", None)
+            state = getattr(cache, "_dsv41_background_admission", None)
+            if state is not None:
+                state.join()
+
+    def forward_tail_pair(self, head_batch, tail_batch) -> torch.Tensor:
+        """Expert-worker side of a paired prefill (DSV4.1 tail pairing).
+
+        Enters, per layer, the head chunk's Engram and MoE collectives and then the tail
+        chunk's -- the authority's order -- each under its own batch so the routed experts
+        see that chunk's geometry and the tail reuses the layer's streamed bank.
+        """
+        if self.engram_coordinator is None:
+            raise RuntimeError("V4.1 worker has no Engram tables")
+        device = tail_batch.input_ids.device
+        execution = self.engram_coordinator.execution
+        if execution.phase_aware and not execution.participates_in_prefill:
+            return torch.zeros((1, 1), dtype=torch.float32, device=device)
+        ctx = get_global_ctx()
+        segments = tuple(
+            (batch, batch.input_ids.numel()) for batch in (head_batch, tail_batch)
+        )
+        try:
+            for layer_id, layer in enumerate(self.layers):
+                for batch, num_tokens in segments:
+                    with ctx.substitute_batch(batch), profile_range(
+                        f"DSV41/Layer_{layer_id}/ExpertWorker"
+                    ):
+                        if (
+                            layer_id in self.args.engram_layer_ids
+                            and execution.participates_in_engram
+                        ):
+                            with profile_range("DSV41/Engram/Worker"):
+                                self.engram_coordinator.worker_lookup(
+                                    layer_id,
+                                    num_tokens=num_tokens,
+                                    hashes_per_token=self.args.engram_hashes_per_token,
+                                    device=device,
+                                    is_prefill=batch.is_prefill,
+                                )
+                        with profile_range("DSV41/MoE/Worker"):
+                            layer.worker_forward((num_tokens, self.args.dim), device)
+        finally:
+            self._join_background_admission()
+        return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
 
 class DeepseekV41ForCausalLM(BaseLLMModel):
@@ -2077,6 +2209,50 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                 )
         return sum(table.nbytes for table in tables.values())
 
+    def _prefill_phase_barrier(self, batch, result: torch.Tensor) -> torch.Tensor:
+        if batch.is_moe_prefill and self._execution.uses_prefill_subgroup:
+            if self._phase_barrier_group is None:
+                raise RuntimeError("phase-aware prefill barrier was not initialized")
+            torch.distributed.barrier(group=self._phase_barrier_group)
+        return result
+
+    def forward_tail_pair(self, head_batch) -> torch.Tensor:
+        """One layer-major prefill forward over ``head_batch`` and the active (tail) batch.
+
+        DSV4.1 tail pairing: both logical chunks keep their own shapes, KV writes and
+        publications, but every layer's routed-expert bank is streamed once for the two.
+        Returns the tail's logits on the authority and the usual placeholder on workers.
+        """
+        from freetoken.scheduler.tail_pairing import validate_paired_batches
+
+        tail_batch = get_global_ctx().batch
+        validate_paired_batches(head_batch, tail_batch)
+        if self._execution.is_expert_worker:
+            with profile_range("DSV41/Batch/ExpertWorkerTailPair"):
+                result = self._model.forward_tail_pair(head_batch, tail_batch)
+            return self._prefill_phase_barrier(tail_batch, result)
+        self.prepare_for_runtime()
+        segments = tuple(
+            self._prefill_segment(batch) for batch in (head_batch, tail_batch)
+        )
+        with profile_range("DSV41/Batch/PrefillTailPair"):
+            result = self._model.prefill_tail_pair(*segments)
+        self._dspark_target_features = None
+        return self._prefill_phase_barrier(tail_batch, result)
+
+    def _prefill_segment(self, batch) -> _PrefillSegment:
+        input_ids = batch.input_ids.long()
+        req = batch.reqs[0]
+        return _PrefillSegment(
+            batch=batch,
+            input_ids=input_ids.view(1, -1),
+            start_pos=req.cached_len,
+            table_idx=req.table_idx,
+            engram_rows=self._engram_rows(batch, input_ids),
+            mm_embeds=batch.mm_embeds,
+            runtime=SharedAttentionRuntime(),
+        )
+
     @profile("DSV41/Engram/Hash")
     def _engram_rows(self, batch, input_ids: torch.Tensor) -> dict[int, torch.Tensor]:
         if self._engram_hasher is None:
@@ -2135,11 +2311,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             )
 
         def phase_barrier(result: torch.Tensor) -> torch.Tensor:
-            if batch.is_moe_prefill and self._execution.uses_prefill_subgroup:
-                if self._phase_barrier_group is None:
-                    raise RuntimeError("phase-aware prefill barrier was not initialized")
-                torch.distributed.barrier(group=self._phase_barrier_group)
-            return result
+            return self._prefill_phase_barrier(batch, result)
 
         if self._execution.is_expert_worker:
             with profile_range("DSV41/Batch/ExpertWorker"):

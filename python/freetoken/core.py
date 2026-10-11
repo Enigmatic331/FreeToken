@@ -208,6 +208,13 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # Default-off DeepSeek-V4.1 layer-major tail pairing (scheduler/tail_pairing.py). A paired
+    # prefill forward is this batch -- the prompt's final short chunk, role "tail" -- plus the
+    # preceding full chunk's prepared ForwardInput in ``paired_head`` (whose batch has role
+    # "head"). ``tail_pair_plan`` is the agreed TailPairPlan on both. None everywhere else.
+    tail_pair_role: str | None = field(default=None, init=False)
+    tail_pair_plan: object | None = field(default=None, init=False)
+    paired_head: object | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -264,6 +271,18 @@ class Context:
             yield
         finally:
             self._batch = None
+
+    @contextmanager
+    def substitute_batch(self, batch: Batch):
+        """Expose one logical sub-batch of the active forward (DSV4.1 tail pairing), restoring
+        the outer batch afterwards."""
+        assert self._batch is not None, "substitute_batch requires an active forward_batch"
+        outer = self._batch
+        try:
+            self._batch = batch
+            yield
+        finally:
+            self._batch = outer
 
 
 _GLOBAL_CTX: Context | None = None

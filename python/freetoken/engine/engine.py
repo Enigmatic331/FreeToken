@@ -424,7 +424,17 @@ class Engine:
         else:
             self._dsv41_plan = None
             self._execution_plan = self._qwen4_plan
+        # _adjust_config forces single-stream models (DeepSeek-V4.1) to one running request;
+        # keep what was requested so tail pairing can refuse a request it would not serve.
+        requested_max_running_req = config.max_running_req
         _adjust_config(config)
+        if os.environ.get("FREETOKEN_DSV41_TAIL_PAIRING", "0") != "0":
+            from freetoken.scheduler.tail_pairing import tail_pairing_enabled
+
+            if tail_pairing_enabled():  # refuse before the long weight load, not after it
+                _validate_tail_pairing(
+                    config, self._dsv41_plan, requested_max_running_req=requested_max_running_req
+                )
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -1836,8 +1846,13 @@ class Engine:
         if phase_priority is not None:
             phase_priority.before(batch)
         target_features = None
+        paired = getattr(batch, "paired_head", None)
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if paired is not None:
+                # DSV4.1 tail pairing: one layer-major forward over the head chunk and this,
+                # the tail chunk; only the tail produces logits.
+                logits = self.model.forward_tail_pair(paired.batch)
+            elif self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -1856,6 +1871,9 @@ class Engine:
             return self._finish_speculative(batch, logits, target_features)
 
         self._commit_dspark_target_features(target_features)
+        if paired is not None:
+            for req in paired.batch.reqs:  # logical order: the head chunk completes first
+                req.complete_one()
         for req in batch.reqs:
             req.complete_one()
 
@@ -1874,6 +1892,25 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def tail_pair_unready(self, plan) -> str | None:
+        """Why this rank could not execute ``plan``'s paired forward (DSV4.1 tail pairing), or
+        None. A prefill-active rank streams both chunks through its MoE prefill double buffer;
+        a sparse-path tail would instead take LRU slots that can hold the head's next layer.
+        The scheduler folds this into the all-rank agreement, so a rank-local gap fails
+        closed on every rank before the forward rather than mid-forward on one."""
+        execution = self._dsv41_plan
+        if execution is None:
+            return "not a DeepSeek-V4.1 execution"
+        if not execution.participates_in_prefill:
+            return None  # a decode-only rank runs no prefill MoE work for either chunk
+        cache = self.moe_offload_cache
+        if cache is None or not cache.prefill_overlap or not cache.prefill_bank_buffers:
+            return "no MoE prefill double buffer on this rank"
+        sparse_max = cache.sparse_prefill_max_tokens
+        if sparse_max > 0 and plan.tail_len <= sparse_max:
+            return f"its {plan.tail_len}-token tail would take the sparse path (<= {sparse_max})"
+        return None
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1936,6 +1973,52 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _validate_tail_pairing(config, plan, *, requested_max_running_req: int) -> None:
+    """Refuse FREETOKEN_DSV41_TAIL_PAIRING=1 outside the execution geometry it was designed for.
+
+    A paired forward reuses each layer's prefill double buffer for the tail chunk, so nothing may
+    issue layer L+2 into that buffer before the tail's layer L (early refill), restart a prefill
+    session mid-forward (trace instrumentation), or skip the double buffer (no offload prefill
+    overlap). ``OffloadMoeCache.reuse_prefill_layer`` re-checks the buffers at run time. The
+    chunk geometry must be the qualified one: an 8,192-token head, and a sparse threshold below
+    the longest tail (``tail_pair_limits``).
+
+    ``config`` has been through ``_adjust_config``, which has already forced DeepSeek-V4.1's
+    ``max_running_req`` to 1; ``requested_max_running_req`` is the value before that, so a
+    request for any other concurrency is refused rather than silently served at one.
+    """
+    from freetoken.models.deepseek_v41 import moe as dsv41_moe
+    from freetoken.moe import prefill_trace
+    from freetoken.scheduler.tail_pairing import TAIL_PAIRING_ENV, tail_pair_limits
+
+    problems = []
+    if not dsv41_moe._TAIL_PAIRING_ENABLED:
+        problems.append("the DSV4.1 MoE layers to see the same flag at import")
+    if plan is None or not plan.uses_authority_transport:
+        problems.append("DeepSeek-V4.1 authority-EP execution (--dsv41-backbone-rank)")
+    if requested_max_running_req != 1:
+        problems.append(f"--max-running-requests 1 (got {requested_max_running_req})")
+    elif config.max_running_req != 1:
+        problems.append(f"--max-running-requests 1 (effective {config.max_running_req})")
+    try:
+        tail_pair_limits(config)
+    except ValueError as exc:
+        problems.append(str(exc))
+    if getattr(config, "speculative_dspark", False):
+        problems.append("MTP/DSpark off")
+    if dsv41_moe.prefill_early_refill_enabled():
+        problems.append("FREETOKEN_DSV41_PREFILL_EARLY_REFILL off")
+    if prefill_trace.enabled():
+        problems.append("FREETOKEN_DSV41_PREFILL_TRACE off")
+    if plan is not None and plan.participates_in_prefill and not (
+        is_offload_moe_backend(config.moe_backend) and config.moe_prefill_overlap
+    ):
+        problems.append("an offload MoE backend with prefill overlap on every prefill-active rank")
+    if problems:
+        raise ValueError(f"{TAIL_PAIRING_ENV}=1 requires: " + "; ".join(problems))
+    logger.info("DSV4.1 tail pairing execution checks passed on rank %d", config.tp_info.rank)
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:

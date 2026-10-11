@@ -242,14 +242,22 @@ class CacheManager:
         sized > one window (see the swa-pool floor), so a chunk can always make forward progress."""
         if not self.swa_paged:
             return
-        window = self.sliding_window_size
         for req in reqs:
-            floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
-            new_evicted = align_down(req.cached_len - window - self.page_size, self.page_size)
-            start = max(req.swa_evicted_seqlen, floor)
-            if new_evicted > start:
-                self._free_swa(self.page_table[req.table_idx, start:new_evicted])
-                req.swa_evicted_seqlen = new_evicted
+            self.free_swa_out_of_window_before(req, req.cached_len)
+
+    def free_swa_out_of_window_before(self, req: Req, cached_len: int) -> None:
+        """One request's extend-free for a chunk starting at ``cached_len``. A DSV4.1 paired tail
+        applies it at its drain with its schedule-time start: before the forward, those slots are
+        still read by the head chunk's own attention."""
+        if not self.swa_paged:
+            return
+        floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
+        new_evicted = align_down(
+            cached_len - self.sliding_window_size - self.page_size, self.page_size)
+        start = max(req.swa_evicted_seqlen, floor)
+        if new_evicted > start:
+            self._free_swa(self.page_table[req.table_idx, start:new_evicted])
+            req.swa_evicted_seqlen = new_evicted
 
     def lock(self, handle: BaseCacheHandle) -> None:
         if self.is_swa:

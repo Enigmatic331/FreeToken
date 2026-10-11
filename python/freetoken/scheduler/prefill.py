@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .cache import CacheManager
     from .decode import DecodeManager
     from .table import TableManager
+    from .tail_pairing import TailPairPlan
 
 logger = init_logger(__name__)
 
@@ -306,6 +307,50 @@ class PrefillManager:
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
         batch.prompt_admissions = prompt_admissions
+        return batch
+
+    def schedule_pair_tail(
+        self, head: ChunkedReq, plan: TailPairPlan, prefill_budget: int
+    ) -> Batch:
+        """Schedule the final chunk of ``head``'s prompt now, for a layer-major paired forward.
+
+        Builds exactly the continuation ``try_add_one`` would build after the head's forward
+        (``cached_len = head.device_len``, the head's handle/row/SWA watermark), and retires the
+        pending entry as a final chunk does. ``plan`` (scheduler/tail_pairing.py) already proved
+        the tail is final and fits; anything else is an invariant violation and raises.
+        """
+        if not self.pending_list or self.pending_list[0].chunked_req is not head:
+            raise RuntimeError("paired tail: the head is not the pending queue's continuation")
+        pending_req = self.pending_list[0]
+        if (pending_req.uid, head.table_idx, head.cached_len, head.device_len,
+                pending_req.input_len) != (plan.uid, plan.table_idx, plan.head_start,
+                                           plan.tail_start, plan.prompt_end):
+            raise RuntimeError(f"paired tail: head {head!r} does not match {plan}")
+        adder = PrefillAdder(
+            token_budget=prefill_budget,
+            reserved_size=self.decode_manager.inflight_tokens,
+            cache_manager=self.cache_manager,
+            table_manager=self.table_manager,
+        )
+        tail = adder._add_one_req(
+            pending_req=pending_req,
+            cache_handle=head.cache_handle,
+            table_idx=head.table_idx,
+            cached_len=head.device_len,
+            linear_slot_idx=head.linear_slot_idx,
+            ping_pong=head.mamba_ping_pong,
+            next_track_idx=head.mamba_next_track_idx,
+            restore_src=None,
+            swa_evicted_seqlen=head.swa_evicted_seqlen,
+        )
+        if (tail is None or isinstance(tail, ChunkedReq)
+                or (tail.cached_len, tail.device_len) != (plan.tail_start, plan.prompt_end)):
+            raise RuntimeError(f"paired tail: scheduled {tail!r}, planned {plan}")
+        pending_req.chunked_req = None
+        self.pending_list.pop(0)
+        batch = Batch(reqs=[tail], phase="prefill")
+        batch.log_new_tokens = tail.extend_len
+        batch.log_cached_tokens = 0  # a continuation: the first chunk logged the prefix hit
         return batch
 
     def abort_req(self, uid: int) -> Req | None:

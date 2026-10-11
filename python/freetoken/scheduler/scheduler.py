@@ -35,6 +35,14 @@ from .multimodal_cache import MultimodalCacheKeyRegistry, VisionFeatureCache
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
+from .tail_pairing import (
+    TAIL_PAIRING_ENV,
+    TailPairLimits,
+    agree_tail_pair,
+    plan_tail_pair,
+    tail_pair_limits,
+    tail_pairing_enabled,
+)
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
@@ -143,6 +151,12 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        # Default-off DSV4.1 layer-major tail pairing; None (the default) adds no work anywhere.
+        self._tail_pairing = _tail_pairing_limits(config)
+        if self._tail_pairing is not None:
+            logger.info_rank0(
+                "DSV4.1 layer-major tail pairing enabled: %s", self._tail_pairing
+            )
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -389,6 +403,8 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        if getattr(batch, "paired_head", None) is not None:
+            self._release_paired_head_window(batch)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -1013,7 +1029,7 @@ class Scheduler(SchedulerIOMixin):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")
 
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+    def _prepare_batch(self, batch: Batch, *, defer_extend_free: bool = False) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
         if batch.is_decode:
@@ -1024,10 +1040,12 @@ class Scheduler(SchedulerIOMixin):
                 batch.reqs, forward_iter=self._forward_iter)
             for req in batch.reqs:
                 req.decode_batch_idx += 1
-        else:
+        elif not defer_extend_free:
             # Prefill sibling of the decode driver: free out-of-window swa BEFORE allocating
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
+            # A paired tail defers this to its drain (_release_paired_head_window): until the
+            # paired forward has run, those slots still back the head chunk's own attention.
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
@@ -1118,7 +1136,66 @@ class Scheduler(SchedulerIOMixin):
         self._maybe_make_speculative(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
+        if getattr(self, "_tail_pairing", None) is not None and batch.is_prefill:
+            forward_input = self._maybe_pair_tail(forward_input)
         return forward_input
+
+    def _maybe_pair_tail(self, head_input: ForwardInput) -> ForwardInput:
+        """Fold the prompt's final short chunk into the just-prepared head chunk's forward.
+
+        Every rank evaluates the same pure decision on its replicated state and proves agreement
+        before anything is scheduled (scheduler/tail_pairing.py). The tail is then scheduled and
+        prepared exactly as its own later batch would be, minus the out-of-window SWA free,
+        which waits for the drain. The returned input is the tail's; it carries the head.
+        """
+        head_batch = head_input.batch
+        pending = self.prefill_manager.pending_list
+        head = head_batch.reqs[0] if len(head_batch.reqs) == 1 else None
+        matches = head is not None and bool(pending) and pending[0].chunked_req is head
+        cm = self.cache_manager
+        plan = plan_tail_pair(
+            head_batch,
+            limits=self._tail_pairing,
+            prompt_len=pending[0].input_len if matches else -1,
+            prefill_budget=self.prefill_budget,
+            decode_running=self.decode_manager.runnable,
+            pending_matches=matches,
+            swa_free_tokens=cm.swa_pool.swa_available_size() if cm.swa_paged else None,
+        )
+        tp = self.config.tp_info
+        plan = agree_tail_pair(
+            plan,
+            rank=tp.rank,
+            world_size=tp.size,
+            broadcast=lambda wire: self._cpu_broadcast(wire, "tail_pair_plan"),
+            all_reduce_sum=lambda flag: self._cpu_all_reduce_sum(flag, "tail_pair_mismatch"),
+            unready=None if plan is None else self.engine.tail_pair_unready(plan),
+        )
+        if plan is None:
+            return head_input
+        tail_batch = self.prefill_manager.schedule_pair_tail(head, plan, self.prefill_budget)
+        tail_input = self._prepare_batch(tail_batch, defer_extend_free=True)
+        head_batch.tail_pair_role = "head"
+        head_batch.tail_pair_plan = plan
+        tail_batch.tail_pair_role = "tail"
+        tail_batch.tail_pair_plan = plan
+        tail_batch.paired_head = head_input
+        # One "Prefill batch" line for the fused forward, so its throughput is meaningful.
+        tail_batch.log_new_tokens += head_batch.log_new_tokens
+        tail_batch.log_cached_tokens = head_batch.log_cached_tokens
+        logger.info_rank0(
+            "DSV4.1 tail pairing uid=%d: head [%d, %d) + tail [%d, %d) in one forward",
+            plan.uid, plan.head_start, plan.tail_start, plan.tail_start, plan.prompt_end,
+        )
+        return tail_input
+
+    def _release_paired_head_window(self, batch: Batch) -> None:
+        """At a paired forward's drain, return the head's out-of-window SWA slots: the same
+        frontier the tail's own _prepare_batch would have freed, now that nothing reads them."""
+        plan = batch.tail_pair_plan
+        for req in batch.reqs:
+            if req.table_idx != -1:
+                self.cache_manager.free_swa_out_of_window_before(req, plan.tail_start)
 
     def _maybe_make_speculative(self, batch: Batch) -> None:
         """Replace an eligible one-token decode with anchor + gamma verification."""
@@ -1202,6 +1279,9 @@ class Scheduler(SchedulerIOMixin):
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
+        paired = getattr(batch, "paired_head", None)
+        if paired is not None:
+            paired.batch.input_ids = self.token_pool[paired.input_tuple]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         if getattr(batch, "speculative", False):
@@ -1223,6 +1303,20 @@ class Scheduler(SchedulerIOMixin):
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _tail_pairing_limits(config) -> TailPairLimits | None:
+    """The default-off DSV4.1 tail-pairing limits; the engine validates its execution side."""
+    if not tail_pairing_enabled():
+        return None
+    if getattr(config.model_config, "dsv41_args", None) is None:
+        raise ValueError(f"{TAIL_PAIRING_ENV}=1 is only supported for DeepSeek-V4.1")
+    if config.max_running_req != 1:
+        raise ValueError(f"{TAIL_PAIRING_ENV}=1 requires --max-running-requests 1")
+    try:
+        return tail_pair_limits(config)
+    except ValueError as exc:
+        raise ValueError(f"{TAIL_PAIRING_ENV}=1 requires {exc}") from exc
 
 
 class _SpeculativeConfig(NamedTuple):
