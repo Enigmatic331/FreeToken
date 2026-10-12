@@ -43,6 +43,12 @@ from .dependency_cone import (
 from .io import SchedulerIOMixin
 from .multimodal_cache import MultimodalCacheKeyRegistry, VisionFeatureCache
 from .prefill import ChunkedReq, PrefillManager
+from .prefill_interleave import (
+    PREFILL_INTERLEAVE_ENV,
+    agree_interleave,
+    plan_interleave,
+    prefill_interleave_steps,
+)
 from .status import SchedulerStatusReporter
 from .table import TableManager
 from .tail_pairing import (
@@ -178,6 +184,14 @@ class Scheduler(SchedulerIOMixin):
         if self._dependency_cone is not None:
             logger.info_rank0(
                 "DSV4.1 dependency-cone prefill enabled: %s", self._dependency_cone
+            )
+        # Default-off C2 resident-decode interleaving between prefill chunks; 0 adds no work.
+        self._prefill_interleave = _prefill_interleave_steps(config)
+        self._interleave_budget = 0
+        if self._prefill_interleave:
+            logger.info_rank0(
+                "DSV4.1 C2 prefill interleave enabled: %d resident decode step(s) per chunk "
+                "boundary", self._prefill_interleave,
             )
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
@@ -1170,8 +1184,11 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        interleave = getattr(self, "_prefill_interleave", 0)
+        batch = self._interleaved_decode_batch() if interleave else None
         batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            batch
+            or self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
         if batch is None:
@@ -1187,7 +1204,46 @@ class Scheduler(SchedulerIOMixin):
             and getattr(batch, "dsv41_cone", None) is None
         ):
             forward_input = self._maybe_pair_tail(forward_input)
+        if interleave and forward_input.batch.is_prefill:
+            # Every prefill forward grants the resident rows a fresh budget; only that prompt's
+            # continuation can spend it (a final chunk leaves none, and the next prompt's first
+            # chunk resets it), so a paired head+tail forward is never split.
+            self._interleave_budget = interleave
         return forward_input
+
+    def _interleaved_decode_batch(self) -> Batch | None:
+        """The resident rows' decode batch when a chunk boundary still owes them a step.
+
+        Every rank evaluates the same pure decision on its replicated state and proves agreement
+        before anything is scheduled (scheduler/prefill_interleave.py). Returns None to keep the
+        prefill-first order, which then schedules the prompt's continuation as before.
+        """
+        pending = self.prefill_manager.pending_list
+        decision = plan_interleave(
+            budget=self._interleave_budget,
+            pending_head=pending[0] if pending else None,
+            decode_rows=len(self.decode_manager.running_reqs),
+        )
+        if decision is None:
+            return None
+        tp = self.config.tp_info
+        decision = agree_interleave(
+            decision,
+            rank=tp.rank,
+            world_size=tp.size,
+            broadcast=lambda wire: self._cpu_broadcast(wire, "prefill_interleave"),
+            all_reduce_sum=lambda flag: self._cpu_all_reduce_sum(
+                flag, "prefill_interleave_mismatch"
+            ),
+        )
+        if not decision.decode:
+            return None
+        self._interleave_budget = decision.budget - 1
+        logger.info_rank0(
+            "DSV4.1 C2 prefill interleave uid=%d: resident decode before chunk at %d (%d left)",
+            decision.uid, decision.resume_at, self._interleave_budget,
+        )
+        return self.decode_manager.schedule_next_batch()
 
     def _maybe_pair_tail(self, head_input: ForwardInput) -> ForwardInput:
         """Fold the prompt's final short chunk into the just-prepared head chunk's forward.
@@ -1400,6 +1456,15 @@ def _tail_pairing_limits(config) -> TailPairLimits | None:
         raise ValueError(f"{TAIL_PAIRING_ENV}=1 requires {exc}") from exc
     # Under C2 the other request may stay resident, its decode paused, while a prompt pairs.
     return replace(limits, resident_decode_rows=config.max_running_req - 1)
+
+
+def _prefill_interleave_steps(config) -> int:
+    """The default-off C2 prefill interleave; the engine refuses it outside gated C2 before the
+    weight load, and this fails closed again if a scheduler is built without that check."""
+    steps = prefill_interleave_steps()
+    if steps and _dsv41_feature_concurrency(config) != 2:
+        raise ValueError(f"{PREFILL_INTERLEAVE_ENV} requires DeepSeek-V4.1 gated C2")
+    return steps
 
 
 def _dependency_cone_geometry(config) -> ConeGeometry | None:

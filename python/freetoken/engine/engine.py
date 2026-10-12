@@ -465,6 +465,24 @@ class Engine:
                         config.tp_info.rank,
                     )
         _refuse_clamped_dsv41_c2(config, requested_max_running_req)
+        if os.environ.get("FREETOKEN_DSV41_C2_PREFILL_INTERLEAVE", "0") != "0":
+            from freetoken.scheduler.prefill_interleave import (
+                PREFILL_INTERLEAVE_ENV,
+                prefill_interleave_problems,
+                prefill_interleave_steps,
+            )
+
+            if prefill_interleave_steps():  # refuse before the weight load, not after it
+                problems = prefill_interleave_problems(
+                    config, requested_max_running_req=requested_max_running_req
+                )
+                if problems:
+                    raise ValueError(
+                        f"{PREFILL_INTERLEAVE_ENV} requires: " + "; ".join(problems)
+                    )
+                logger.info(
+                    "DSV4.1 C2 prefill interleave checks passed on rank %d", config.tp_info.rank
+                )
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
