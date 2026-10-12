@@ -222,3 +222,37 @@ def test_post_terminal_overlap_step_is_dropped():
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
+
+
+def test_overlap_length_uses_published_frontier_not_future_forward_state():
+    """A future overlapped forward may exhaust ``req.can_decode`` before the prior
+    token drains.  The prior token must remain non-terminal; only the token whose
+    published host frontier reaches max_device_len receives ``finish_reason=length``.
+    """
+    from freetoken.message import DetokenizeMsg
+
+    pool, cm, tm, _dm, _pm, sent, stub = _setup()
+    prompt = torch.arange(1, 13, dtype=torch.int32)
+    req = _launch_req(pool, cm, tm, prompt)  # prefill forward: device frontier +1
+
+    # Drain each result only after the next decode forward has advanced the shared
+    # device frontier, matching overlap_loop's launch-before-drain ordering.
+    req.complete_one()
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    req.complete_one()
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    req.complete_one()  # future forward has exhausted can_decode before prior drain
+    assert not req.can_decode
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+
+    replies = [m for m in sent if isinstance(m, DetokenizeMsg)]
+    assert len(replies) == 3
+    assert all(not m.finished and m.finish_reason is None for m in replies)
+    assert req not in stub.finished_reqs
+
+    # Draining the actual final forward publishes the fourth token and terminates.
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    replies = [m for m in sent if isinstance(m, DetokenizeMsg)]
+    assert len(replies) == 4
+    assert replies[-1].finished and replies[-1].finish_reason == "length"
+    assert req in stub.finished_reqs

@@ -332,7 +332,18 @@ class Scheduler(SchedulerIOMixin):
 
         # A speculative step advances by a target-decided 1..gamma+1 tokens.
         # The next batch cannot be scheduled until that frontier is committed.
-        if self._speculative is not None and last_data is not None:
+        # A pending prefill drains first too: its forward blocks the host for the whole
+        # prefill (DSV4.1 sparse-prefill expert copies, ~1.7 s at 4K), so draining after the
+        # launch held another request's already-computed token behind it. This is
+        # normal_loop's order. An intermediate-chunk-only batch has no reply to publish, so
+        # chunk-to-chunk prefill keeps its overlap.
+        if last_data is not None and (
+            self._speculative is not None
+            or (
+                self.prefill_manager.runnable
+                and not all(isinstance(req, ChunkedReq) for req in last_data[0].batch.reqs)
+            )
+        ):
             self.stream.wait_stream(self.engine.stream)
             self._process_last_data(last_data)
             self._flush_abort_acks()
@@ -483,7 +494,17 @@ class Scheduler(SchedulerIOMixin):
                 matched_stop = None
                 for pos, token in enumerate(block):
                     visible_len = block_start + pos + 1
-                    hit_length = not req.can_decode and pos == len(block) - 1
+                    # Under overlap scheduling the next forward has already called
+                    # ``complete_one`` on this shared Req before the previous result is
+                    # drained here.  Reading ``req.can_decode`` therefore observes the
+                    # *future* batch and used to terminate one token early (max_tokens=N
+                    # returned N-1 for N > 1).  ``visible_len`` is the committed host
+                    # frontier for the token being published, so it is the batch-local
+                    # source of truth for the output budget.
+                    hit_length = (
+                        visible_len >= req.max_device_len
+                        and pos == len(block) - 1
+                    )
                     hit_eos = (
                         not req.sampling_params.ignore_eos
                         and token in self.eos_token_ids

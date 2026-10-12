@@ -52,6 +52,19 @@ def test_tensor_local_device_and_single_row_leading_dims(monkeypatch):
     assert queried == ["cuda:7"]
 
 
+@pytest.mark.parametrize("shape", [(2, 5120), (1, 2, 5120)])
+def test_two_row_decode_routes_to_tuned_kernel(monkeypatch, shape):
+    monkeypatch.setattr(tuned, "ENABLED", True)
+    monkeypatch.setattr(tuned, "FORCE_EMU", False)
+    queried = []
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability",
+        lambda device: queried.append(device) or (12, 0),
+    )
+    assert tuned.use_tuned_decode(tensor(shape), tensor((512, 5120)))
+    assert queried == ["cuda:7"]
+
+
 @pytest.mark.parametrize("selected", [False,True])
 def test_wrapper_preserves_original_fallback_and_bias(monkeypatch,selected):
     x,w,s,b = object(),object(),object(),object()

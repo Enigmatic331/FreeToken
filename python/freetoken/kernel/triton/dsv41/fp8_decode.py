@@ -2,7 +2,8 @@
 
 The native FP8 bytes, E8M0 scales, activation quantizer and split-K boundaries
 are unchanged. Only launch geometry and loop unrolling differ. Unsupported
-devices/shapes and multi-row prefill retain the established implementation.
+devices/shapes and batches larger than two rows retain the established
+implementation; the two-row path evaluates each row independently.
 """
 from __future__ import annotations
 
@@ -40,10 +41,11 @@ SM120_CONFIGS = {
 
 def use_tuned_decode(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Host-only routing; inspect the tensor's device, never a foreign rank."""
+    rows = x.numel() // x.shape[-1] if x.ndim >= 1 and x.shape[-1] else 0
     return (
         ENABLED and not FORCE_EMU and x.is_cuda
         and weight.ndim == 2 and x.ndim >= 1
-        and x.numel() == x.shape[-1]
+        and rows in (1, 2)
         and tuple(weight.shape) in SM120_CONFIGS
         and torch.cuda.get_device_capability(x.device) == (12, 0)
     )
@@ -82,12 +84,28 @@ def tuned_fp8_linear_32(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """One-row SM120 path; caller must check ``use_tuned_decode`` first."""
+    """One/two-row SM120 path; caller must check ``use_tuned_decode`` first.
+
+    Two-row decode deliberately reuses the qualified one-row kernel independently
+    for each row.  Besides avoiding the tiny generic M=2 GEMM, this preserves the
+    exact C1 split-K boundaries and reduction order for both concurrent requests.
+    """
     assert weight.dtype == torch.float8_e4m3fn
     *lead, k = x.shape
     n, weight_k = weight.shape
-    assert weight_k == k and x.numel() == k
+    rows = x.numel() // k
+    assert weight_k == k and rows in (1, 2)
     assert scale.shape == (n // 32, k // 32)
+    if rows == 2:
+        flat = x.reshape(2, k)
+        out = torch.cat(
+            [
+                tuned_fp8_linear_32(flat[i : i + 1], weight, scale, bias)
+                for i in range(2)
+            ],
+            dim=0,
+        )
+        return out.reshape(*lead, n)
     bn, sk, nw, unroll = SM120_CONFIGS[(n, k)]
     compute_dtype = x.dtype if x.dtype in _TL_DTYPE else torch.bfloat16
     sb = scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
