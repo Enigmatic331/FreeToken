@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
+from freetoken.engine.engine import _dsv41_feature_concurrency
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -32,6 +34,7 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .dependency_cone import (
     DECODER,
+    ConeGeometry,
     agree_cone_segment,
     dependency_cone_geometry,
     plan_prefill_cone,
@@ -168,14 +171,7 @@ class Scheduler(SchedulerIOMixin):
                 "DSV4.1 layer-major tail pairing enabled: %s", self._tail_pairing
             )
         # Default-off DSV4.1 dependency-cone prefill; None (the default) adds no work anywhere.
-        if config.max_running_req == 1:
-            self._dependency_cone = dependency_cone_geometry(config)
-        else:
-            self._dependency_cone = None
-            if os.environ.get("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") != "0":
-                logger.warning_rank0(
-                    "DSV4.1 dependency-cone prefill is bypassed for concurrent serving"
-                )
+        self._dependency_cone = _dependency_cone_geometry(config)
         validate_dependency_cone_cache_window(
             self._dependency_cone, self.cache_manager.sliding_window_size
         )
@@ -1211,7 +1207,7 @@ class Scheduler(SchedulerIOMixin):
             limits=self._tail_pairing,
             prompt_len=pending[0].input_len if matches else -1,
             prefill_budget=self.prefill_budget,
-            decode_running=self.decode_manager.runnable,
+            decode_running=len(self.decode_manager.running_reqs),
             pending_matches=matches,
             swa_free_tokens=cm.swa_pool.swa_available_size() if cm.swa_paged else None,
         )
@@ -1393,15 +1389,28 @@ def _tail_pairing_limits(config) -> TailPairLimits | None:
         return None
     if getattr(config.model_config, "dsv41_args", None) is None:
         raise ValueError(f"{TAIL_PAIRING_ENV}=1 is only supported for DeepSeek-V4.1")
-    if config.max_running_req != 1:
+    if config.max_running_req != _dsv41_feature_concurrency(config):
         logger.warning_rank0(
             "DSV4.1 layer-major tail pairing is bypassed for concurrent serving"
         )
         return None
     try:
-        return tail_pair_limits(config)
+        limits = tail_pair_limits(config)
     except ValueError as exc:
         raise ValueError(f"{TAIL_PAIRING_ENV}=1 requires {exc}") from exc
+    # Under C2 the other request may stay resident, its decode paused, while a prompt pairs.
+    return replace(limits, resident_decode_rows=config.max_running_req - 1)
+
+
+def _dependency_cone_geometry(config) -> ConeGeometry | None:
+    """The default-off DSV4.1 dependency-cone geometry; the engine validates its execution side."""
+    if config.max_running_req == _dsv41_feature_concurrency(config):
+        return dependency_cone_geometry(config)
+    if os.environ.get("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") != "0":
+        logger.warning_rank0(
+            "DSV4.1 dependency-cone prefill is bypassed for concurrent serving"
+        )
+    return None
 
 
 class _SpeculativeConfig(NamedTuple):

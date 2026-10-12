@@ -38,27 +38,35 @@ def demote(owners, usage, *, experts, start, count):
 
 
 class PhaseCachePriority:
-    def __init__(self, cache, *, start, count):
+    def __init__(self, cache, *, start, count, max_decode_rows=1):
         if (cache.quant_format != "ds_fp4" or cache.decode_target not in ("gpu", "hybrid")
                 or type(start) is not int or type(count) is not int
                 or min(start, count) < 0 or start + count > cache.num_experts):
             raise ValueError("invalid native DS-FP4 decode ownership")
+        if type(max_decode_rows) is not int or max_decode_rows not in (1, 2):
+            raise ValueError("decode batches of one (C1) or two (C2) rows required")
         self.cache, self.start, self.count = cache, start, count
+        # Decode ownership is per rank, not per request, so a C2 decode batch demotes alike.
+        self.max_decode_rows = max_decode_rows
         self.pending = False
 
     @classmethod
     def from_engine(cls, engine):
         config, plan, cache = engine.config, engine._dsv41_plan, engine.moe_offload_cache
-        if (plan is None or not plan.phase_aware or config.max_running_req != 1
-                or config.speculative_dspark or config.cuda_graph_max_bs != 1
+        rows = config.max_running_req
+        # C1, or the gated C2: one-request prefills, decode graphs up to two rows.
+        c2 = rows == 2 and getattr(config.model_config, "prefill_batch_size_limit", None) == 1
+        if (plan is None or not plan.phase_aware or not (rows == 1 or c2)
+                or config.speculative_dspark or config.cuda_graph_max_bs != rows
                 or config.tp_info.size != 4 or cache is None or cache.num_layers != 40):
-            raise ValueError("phase-cache priority currently requires target-only, single-request V4.1 EP4")
+            raise ValueError("phase-cache priority currently requires target-only V4.1 EP4 at "
+                             "one request, or C2 with one-request prefills")
         total = config.model_config.dsv41_args.n_routed_experts
         storage, decode = plan.storage_partition(total), plan.partition(total, prefill=False)
         if storage.local_count != cache.num_experts:
             raise ValueError("cache/storage expert geometry mismatch")
         obj = cls(cache, start=decode.global_offset - storage.global_offset,
-                  count=decode.local_count)
+                  count=decode.local_count, max_decode_rows=rows)
         obj.warm(engine.stream)
         return obj
 
@@ -76,7 +84,8 @@ class PhaseCachePriority:
 
     def before(self, batch):
         """Call from Engine.forward_batch, outside the captured model forward."""
-        if batch.speculative or len(batch.reqs) != 1:
+        rows = len(batch.reqs)
+        if batch.speculative or not 1 <= rows <= (1 if batch.is_prefill else self.max_decode_rows):
             raise ValueError("phase-cache priority does not support speculative/concurrent batches")
         if batch.is_prefill:
             self.pending = True

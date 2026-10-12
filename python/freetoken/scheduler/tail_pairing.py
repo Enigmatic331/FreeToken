@@ -14,7 +14,7 @@ replicated state; ``agree_tail_pair`` fails closed, on every rank at once, if th
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Callable
 
 import torch
@@ -61,6 +61,10 @@ class TailPairLimits:
     page_size: int
     max_tail_tokens: int = MAX_TAIL_TOKENS
     max_prompt_end: int = MAX_PROMPT_END
+    # Other requests' decode rows that may stay resident, paused, while a prompt pairs: 0 for
+    # one running request, 1 under DeepSeek-V4.1's gated C2, whose prefills run one at a time.
+    # Out of the repr, so the one-request startup log line stays as qualified.
+    resident_decode_rows: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
         for item in fields(self):
@@ -71,6 +75,8 @@ class TailPairLimits:
             raise ValueError("need 0 <= sparse_max_tokens < max_tail_tokens <= head_tokens")
         if self.max_prompt_end < self.head_tokens + self.max_tail_tokens:
             raise ValueError("max_prompt_end cannot hold one head and one tail")
+        if not 0 <= self.resident_decode_rows <= 1:
+            raise ValueError("resident_decode_rows must be 0 (C1) or 1 (C2)")
 
 
 def tail_pair_limits(config) -> TailPairLimits:
@@ -160,22 +166,25 @@ def plan_tail_pair(
     limits: TailPairLimits,
     prompt_len: int,
     prefill_budget: int,
-    decode_running: bool,
+    decode_running: int,
     pending_matches: bool,
     swa_free_tokens: int | None,
 ) -> TailPairPlan | None:
     """The pairing decision for a just-prepared prefill ``batch``; ``None`` keeps it unpaired.
 
     ``prompt_len`` is the complete prompt of the pending request whose continuation the batch's
-    request is (``pending_matches``). ``swa_free_tokens`` is the window pool's free list alone,
-    excluding the evictable tree, so a pair never forces an eviction the unpaired schedule would
-    not; ``None`` means the model has no paged window pool.
+    request is (``pending_matches``). ``decode_running`` counts other requests' resident decode
+    rows (a bool counts as one or none). A pending prefill pauses them, so none shares the paired
+    forward, but each may be scheduled for one decode step before the pair drains; more than
+    ``limits.resident_decode_rows`` declines. ``swa_free_tokens`` is the window pool's free list
+    alone, excluding the evictable tree, so a pair never forces an eviction the unpaired schedule
+    would not; ``None`` means the model has no paged window pool.
     """
     from .prefill import ChunkedReq
 
     if not batch.is_prefill or getattr(batch, "speculative", False) or len(batch.reqs) != 1:
         return None
-    if decode_running or not pending_matches:
+    if decode_running > limits.resident_decode_rows or not pending_matches:
         return None
     head = batch.reqs[0]
     if not isinstance(head, ChunkedReq):  # a final or single chunk has no tail to pair
@@ -191,9 +200,9 @@ def plan_tail_pair(
     if head.device_len % page:
         return None
     if swa_free_tokens is not None:
-        # The tail's pages plus one page for the first decode step, all before the head's
-        # out-of-window pages return at the drain.
-        needed = (div_ceil(prompt_len, page) - head.device_len // page + 1) * page
+        # The tail's pages plus one page for the first decode step of this request and of each
+        # resident one, all before the head's out-of-window pages return at the drain.
+        needed = (div_ceil(prompt_len, page) - head.device_len // page + 1 + decode_running) * page
         if swa_free_tokens < needed:
             return None
     if head.uid < 0 or head.table_idx < 0:

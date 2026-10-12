@@ -451,14 +451,19 @@ def validate_dependency_cone_cache_window(
         )
 
 
-def dependency_cone_problems(config, plan, *, requested_max_running_req: int) -> list[str]:
+def dependency_cone_problems(
+    config, plan, *, requested_max_running_req: int, concurrency: int = 1
+) -> list[str]:
     """Why the current execution cannot run the cone, as unmet requirements; [] when it can.
 
     The engine checks this before the weight load. The scope is the qualified geometry: one
-    request at a time on authority EP, with MTP/DSpark and early refill off. Tail pairing may be
-    enabled alongside the cone: the scheduler applies it only to batches for which the cone did
-    not engage.
+    request at a time on authority EP, with MTP/DSpark and early refill off. ``concurrency`` 2
+    is DeepSeek-V4.1's gated C2, whose prefill forwards stay one request each, so a cone chunk
+    still runs alone while the other request's decode waits. Tail pairing may be enabled
+    alongside the cone: the scheduler applies it only to batches for which the cone did not
+    engage.
     """
+    from freetoken.engine.engine import _feature_concurrency_problems
     from freetoken.models.deepseek_v41.moe import prefill_early_refill_enabled
 
     problems = []
@@ -471,10 +476,9 @@ def dependency_cone_problems(config, plan, *, requested_max_running_req: int) ->
         problems.append(f"the V4.1 encoder-decoder layer plan ({exc})")
     if plan is None or not plan.uses_authority_transport:
         problems.append("DeepSeek-V4.1 authority-EP execution (--dsv41-backbone-rank)")
-    if requested_max_running_req != 1:
-        problems.append(f"--max-running-requests 1 (got {requested_max_running_req})")
-    elif config.max_running_req != 1:
-        problems.append(f"--max-running-requests 1 (effective {config.max_running_req})")
+    problems.extend(
+        _feature_concurrency_problems(config, requested_max_running_req, concurrency)
+    )
     if getattr(config, "speculative_dspark", False) or getattr(args, "dspark_enabled", False):
         problems.append("MTP/DSpark off")
     try:

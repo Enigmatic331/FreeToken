@@ -126,3 +126,81 @@ def test_factory_rejects_unqualified_runtime(damage):
         e.moe_offload_cache.num_experts = 144
     with pytest.raises(ValueError):
         boundary.PhaseCachePriority.from_engine(e)
+
+
+# ---- DeepSeek-V4.1 gated C2: one-request prefills, decode batches of one or two rows.
+
+
+def c2_engine():
+    e = engine()
+    e.config.max_running_req = e.config.cuda_graph_max_bs = 2
+    e.config.model_config.prefill_batch_size_limit = 1
+    return e
+
+
+def test_factory_accepts_the_gated_c2_geometry():
+    obj = boundary.PhaseCachePriority.from_engine(c2_engine())
+    assert (obj.start, obj.count, obj.max_decode_rows) == (32, 144, 2)
+    assert boundary.PhaseCachePriority.from_engine(engine()).max_decode_rows == 1
+
+
+@pytest.mark.parametrize("damage", ["graph1", "graph0", "ragged_prefill", "three"])
+def test_factory_rejects_unqualified_c2(damage):
+    e = c2_engine()
+    if damage == "graph1":
+        e.config.cuda_graph_max_bs = 1
+    elif damage == "graph0":
+        e.config.cuda_graph_max_bs = 0
+    elif damage == "ragged_prefill":
+        e.config.model_config.prefill_batch_size_limit = None
+    else:
+        e.config.max_running_req = e.config.cuda_graph_max_bs = 3
+    with pytest.raises(ValueError):
+        boundary.PhaseCachePriority.from_engine(e)
+
+
+def test_c2_demotes_once_at_the_first_decode_of_one_or_two_rows(monkeypatch):
+    cache, order = make()
+    primitive = boundary.demote
+
+    def checked(*args, **kwargs):
+        assert order[-1] == "fence"
+        order.append("demote")
+        return primitive(*args, **kwargs)
+
+    monkeypatch.setattr(boundary, "demote", checked)
+    phase = boundary.PhaseCachePriority(cache, start=32, count=144, max_decode_rows=2)
+    phase.before(batch(True))  # one-request prefill (the other request waits)
+    phase.before(batch(size=2))  # the first decode after it holds both rows
+    assert order == ["fence", "demote"] and cache.usage.tolist() == [0, 11, 12, 0, 14]
+    for size in (2, 1, 2):
+        phase.before(batch(size=size))
+    assert order == ["fence", "demote"]  # no CUDA work on later decode steps
+    phase.before(batch(True))
+    phase.before(batch(size=1))
+    assert order == ["fence", "demote", "fence", "demote"]
+
+
+@pytest.mark.parametrize("prefill,size", [(True, 2), (False, 3), (False, 0)])
+def test_c2_still_rejects_two_request_prefills_and_wider_decodes(prefill, size):
+    cache, order = make()
+    phase = boundary.PhaseCachePriority(cache, start=32, count=144, max_decode_rows=2)
+    with pytest.raises(ValueError):
+        phase.before(batch(prefill, size=size))
+    assert not phase.pending and order == []
+
+
+def test_one_request_priority_still_rejects_two_row_decodes():
+    cache, order = make()
+    phase = boundary.PhaseCachePriority(cache, start=32, count=144)
+    phase.before(batch(True))
+    with pytest.raises(ValueError):
+        phase.before(batch(size=2))
+    assert phase.pending and order == []
+
+
+@pytest.mark.parametrize("rows", [0, 3, True])
+def test_decode_row_limit_is_one_or_two(rows):
+    cache, _ = make()
+    with pytest.raises(ValueError):
+        boundary.PhaseCachePriority(cache, start=32, count=144, max_decode_rows=rows)

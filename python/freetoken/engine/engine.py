@@ -428,7 +428,10 @@ class Engine:
         # keep what was requested so tail pairing can refuse a request it would not serve.
         requested_max_running_req = config.max_running_req
         _adjust_config(config)
-        if config.max_running_req == 1:
+        feature_concurrency = _dsv41_feature_concurrency(config)
+        # Pass C2's concurrency only when it applies, so the C1 calls stay exactly as qualified.
+        c2_kwargs = {} if feature_concurrency == 1 else {"concurrency": feature_concurrency}
+        if config.max_running_req == feature_concurrency:
             if os.environ.get("FREETOKEN_DSV41_TAIL_PAIRING", "0") != "0":
                 from freetoken.scheduler.tail_pairing import tail_pairing_enabled
 
@@ -437,6 +440,7 @@ class Engine:
                         config,
                         self._dsv41_plan,
                         requested_max_running_req=requested_max_running_req,
+                        **c2_kwargs,
                     )
             if os.environ.get("FREETOKEN_DSV41_DEPENDENCY_CONE", "0") != "0":
                 from freetoken.scheduler.dependency_cone import (
@@ -450,6 +454,7 @@ class Engine:
                         config,
                         self._dsv41_plan,
                         requested_max_running_req=requested_max_running_req,
+                        **c2_kwargs,
                     )
                     if problems:
                         raise ValueError(
@@ -677,7 +682,9 @@ class Engine:
         ).strip().lower() in {
             "1", "true", "yes", "on"
         }
-        if phase_priority_requested and config.max_running_req == 1:
+        if phase_priority_requested and (
+            config.max_running_req == _dsv41_feature_concurrency(config)
+        ):
             from freetoken.moe.phase_priority import PhaseCachePriority
 
             self._dsv41_phase_priority = PhaseCachePriority.from_engine(self)
@@ -2007,7 +2014,9 @@ class Engine:
         destroy_distributed()
 
 
-def _validate_tail_pairing(config, plan, *, requested_max_running_req: int) -> None:
+def _validate_tail_pairing(
+    config, plan, *, requested_max_running_req: int, concurrency: int = 1
+) -> None:
     """Refuse FREETOKEN_DSV41_TAIL_PAIRING=1 outside the execution geometry it was designed for.
 
     A paired forward reuses each layer's prefill double buffer for the tail chunk, so nothing may
@@ -2018,8 +2027,10 @@ def _validate_tail_pairing(config, plan, *, requested_max_running_req: int) -> N
     the longest tail (``tail_pair_limits``).
 
     ``config`` has been through ``_adjust_config``, which has already forced DeepSeek-V4.1's
-    ``max_running_req`` to 1; ``requested_max_running_req`` is the value before that, so a
-    request for any other concurrency is refused rather than silently served at one.
+    ``max_running_req`` to 1 unless the C2 gate kept 2; ``requested_max_running_req`` is the
+    value before that, so a request for any other concurrency is refused rather than silently
+    served at one. ``concurrency`` is 2 only for that gated C2 (``_dsv41_feature_concurrency``),
+    which must also keep every prefill forward to one request.
     """
     from freetoken.models.deepseek_v41 import moe as dsv41_moe
     from freetoken.moe import prefill_trace
@@ -2030,10 +2041,9 @@ def _validate_tail_pairing(config, plan, *, requested_max_running_req: int) -> N
         problems.append("the DSV4.1 MoE layers to see the same flag at import")
     if plan is None or not plan.uses_authority_transport:
         problems.append("DeepSeek-V4.1 authority-EP execution (--dsv41-backbone-rank)")
-    if requested_max_running_req != 1:
-        problems.append(f"--max-running-requests 1 (got {requested_max_running_req})")
-    elif config.max_running_req != 1:
-        problems.append(f"--max-running-requests 1 (effective {config.max_running_req})")
+    problems.extend(
+        _feature_concurrency_problems(config, requested_max_running_req, concurrency)
+    )
     try:
         tail_pair_limits(config)
     except ValueError as exc:
@@ -2320,6 +2330,36 @@ def _refuse_clamped_dsv41_c2(config: EngineConfig, requested_max_running_req: in
             f"{_DSV41_CONCURRENCY_ENV}=1 gate; use --max-running-requests 1 for the "
             "qualified single-stream path"
         )
+
+
+def _dsv41_feature_concurrency(config) -> int:
+    """The concurrency at which the C1 prefill optimisations (tail pairing, dependency cone) and
+    phase-cache priority may run: 2 under DeepSeek-V4.1's gated C2 after ``_adjust_config``, else
+    1. C2 keeps every prefill forward to one request and a pending prefill pauses the other
+    request's decode, so their forwards see the C1 shapes; each feature's checks verify the rest.
+    """
+    model_config = getattr(config, "model_config", None)
+    if (
+        getattr(model_config, "dsv41_args", None) is not None
+        and config.max_running_req == 2
+        and _dsv41_concurrency_enabled()
+    ):
+        return 2
+    return 1
+
+
+def _feature_concurrency_problems(
+    config, requested_max_running_req: int, concurrency: int
+) -> list[str]:
+    """Unmet concurrency requirements of a C1 prefill optimisation at ``concurrency``
+    (``_dsv41_feature_concurrency``); C2 also needs one request per prefill forward."""
+    if requested_max_running_req != concurrency:
+        return [f"--max-running-requests {concurrency} (got {requested_max_running_req})"]
+    if config.max_running_req != concurrency:
+        return [f"--max-running-requests {concurrency} (effective {config.max_running_req})"]
+    if concurrency != 1 and getattr(config.model_config, "prefill_batch_size_limit", None) != 1:
+        return ["one request per prefill forward under C2 (prefill_batch_size_limit 1)"]
+    return []
 
 
 def _check_dsv41_c2_graph_buckets(config: EngineConfig) -> None:
