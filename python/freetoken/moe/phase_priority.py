@@ -98,4 +98,7 @@ class PhaseCachePriority:
             torch.cuda.current_stream(cache.device).wait_stream(cache.prefill_copy_stream)
         demote(cache.id_of_slot, cache.usage, experts=cache.num_experts,
                start=self.start, count=self.count)
+        trace = getattr(cache, "_admission_trace", None)
+        if trace is not None:
+            trace.note_demote(self.start, self.count)
         self.pending = False

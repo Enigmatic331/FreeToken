@@ -14,6 +14,7 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.utils import ZmqPullQueue, ZmqPushQueue, init_logger
+from freetoken.utils.request_timeline import timeline_now
 
 if TYPE_CHECKING:
     from .config import SchedulerConfig
@@ -106,6 +107,25 @@ class SchedulerIOMixin:
     def sync_all_ranks(self) -> None:
         self._cpu_barrier("scheduler_sync")
 
+    # -- default-off request timeline (freetoken.utils.request_timeline); rank 0 only ----------
+
+    def _timeline_rx(self, msg: BaseBackendMsg, t_rx: int) -> None:
+        """Open each received request's timeline (only called when the timeline is enabled)."""
+        timeline = self._request_timeline
+        idle = getattr(self, "_timeline_idle_work", None)
+        for item in (msg.data if isinstance(msg, BatchBackendMsg) else [msg]):
+            if isinstance(item, UserMsg):
+                timeline.begin(item.uid, "sched_rx", t=t_rx)
+                timeline.count(item.uid, "prompt_tokens", int(len(item.input_ids)))
+                if idle is not None:
+                    timeline.stamp(item.uid, "idle_work_start", t=idle[0])
+                    timeline.stamp(item.uid, "idle_work_end", t=idle[1])
+
+    def _timeline_stamp_msg(self, msg: BaseBackendMsg, stage: str) -> None:
+        for item in (msg.data if isinstance(msg, BatchBackendMsg) else [msg]):
+            if isinstance(item, UserMsg):
+                self._request_timeline.stamp(item.uid, stage)
+
     def _cpu_broadcast(self, tensor: torch.Tensor, label: str) -> torch.Tensor:
         sequence = getattr(self, "_rank_wire_sequence", 0)
         if _TRACE_COLLECTIVES:
@@ -178,6 +198,10 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
+        t_rx = timeline_now(self)
+        if t_rx:
+            for msg in pending_msgs:
+                self._timeline_rx(msg, t_rx)
         return pending_msgs
 
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> List[BaseBackendMsg]:
@@ -186,8 +210,13 @@ class SchedulerIOMixin:
             self.run_when_idle()
             if self._recv_from_tokenizer.wait(_RANK_IDLE_HEARTBEAT_MS):
                 raw = self._recv_from_tokenizer.get_raw()
+                t_rx = timeline_now(self)
                 msg = self._recv_from_tokenizer.decode(raw)
+                if t_rx:
+                    self._timeline_rx(msg, t_rx)
                 self._broadcast_rank_message(self._worker_message_bytes(msg, raw))
+                if t_rx:
+                    self._timeline_stamp_msg(msg, "sched_bcast_done")
                 pending_msgs.append(msg)
             else:
                 # Worker ranks are already waiting in the matching broadcast.
@@ -200,6 +229,7 @@ class SchedulerIOMixin:
         pending_raw_msgs: List[bytes] = []
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
+        t_rx = timeline_now(self)
 
         # broadcast the number of raw messages to all ranks
         src_tensor = torch.tensor(len(pending_raw_msgs))
@@ -207,7 +237,11 @@ class SchedulerIOMixin:
 
         for raw in pending_raw_msgs:
             msg = self._recv_from_tokenizer.decode(raw)
+            if t_rx:
+                self._timeline_rx(msg, t_rx)
             self._broadcast_rank_message(self._worker_message_bytes(msg, raw))
+            if t_rx:
+                self._timeline_stamp_msg(msg, "sched_bcast_done")
             pending_msgs.append(msg)
         return pending_msgs
 

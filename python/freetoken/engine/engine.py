@@ -1217,6 +1217,19 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        # Opt-in bounded admission trace; must exist before warmups and graph capture so the
+        # captured decode graphs contain its (armed-at-idle) recorder kernels.
+        from freetoken.moe.admission_trace import AdmissionTrace
+
+        cache._admission_trace = AdmissionTrace.from_env(
+            cache, rank=config.tp_info.rank, top_k=int(layers[0].top_k),
+            max_rows=max(int(config.max_running_req), int(config.cuda_graph_max_bs or 1)),
+        )
+        if cache._admission_trace is not None:
+            trace = cache._admission_trace
+            logger.info("MoE admission trace enabled (warmed, armed at first idle): rank=%d dir=%s "
+                        "records=%d max_files=%d", trace.rank, trace.directory, trace.capacity,
+                        trace.max_files)
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -1899,6 +1912,9 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        trace = getattr(getattr(self, "moe_offload_cache", None), "_admission_trace", None)
+        if trace is not None:
+            trace.begin_forward(batch)
         phase_priority = getattr(self, "_dsv41_phase_priority", None)
         if phase_priority is not None:
             phase_priority.before(batch)

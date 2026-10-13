@@ -31,6 +31,7 @@ from freetoken.utils import (
     load_eos_token_ids,
     load_tokenizer,
 )
+from freetoken.utils.request_timeline import RequestTimeline
 
 
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
@@ -91,16 +92,20 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
+    timeline: Any = None,
 ) -> tuple[List[TokenizeMsg], List[Any], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
+    ``timeline`` (optional, default-off) stamps each message's render+encode span.
     """
     ok_msgs: List[TokenizeMsg] = []
     ok_inputs: List[Any] = []
     errors: List[UserReply] = []
     for msg in messages:
+        if timeline is not None:
+            timeline.stamp(msg.uid, "tok_start")
         try:
             if hasattr(tokenize_manager, "tokenize_inputs"):
                 encoded = tokenize_manager.tokenize_inputs([msg])[0]
@@ -118,6 +123,9 @@ def _tokenize_requests(
                 )
             )
             continue
+        if timeline is not None:
+            timeline.stamp(msg.uid, "tok_done")
+            timeline.count(msg.uid, "prompt_tokens", int(tokens.numel()))
         # A zero-token prompt would trip the scheduler's input_len > 0 invariant and
         # crash the worker; reject it here as a terminal error instead.
         if tokens.numel() == 0:
@@ -163,6 +171,8 @@ def tokenize_worker(
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
+    # Default-off, content-free request boundary stamps (see freetoken.utils.request_timeline).
+    timeline = RequestTimeline(f"tokenizer_{tokenizer_id}", logger.info)
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
@@ -170,6 +180,7 @@ def tokenize_worker(
     try:
         while True:
             pending_msg = _unwrap_msg(recv_listener.get())
+            t_rx = timeline.now() if timeline.enabled else 0
             while len(pending_msg) < local_bs and not recv_listener.empty():
                 pending_msg.extend(_unwrap_msg(recv_listener.get()))
 
@@ -217,6 +228,13 @@ def tokenize_worker(
                 len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + n_control
                 == len(pending_msg)
             )
+            if t_rx:
+                for m in tokenize_msg:
+                    timeline.begin(m.uid, "tok_rx", t=t_rx)
+                for m in detokenize_msg:
+                    timeline.stamp(m.uid, "detok_first_rx", t=t_rx)
+                for m in prompt_admitted_msg:
+                    timeline.stamp(m.uid, "admitted_rx", t=t_rx)
             sampled_replies: List[UserReply] = []
             if len(detokenize_msg) > 0:
                 replies = detokenize_manager.detokenize(detokenize_msg)
@@ -254,18 +272,34 @@ def tokenize_worker(
                 sampled_replies,
                 [_error_reply(msg) for msg in error_reply_msg],
             )
+            if t_rx:
+                t_tx = timeline.now()
+                for m in prompt_admitted_msg:
+                    timeline.stamp(m.uid, "admitted_tx", t=t_tx)
+                for m, reply in zip(detokenize_msg, sampled_replies, strict=True):
+                    timeline.stamp(m.uid, "detok_first_tx", t=t_tx)
+                    timeline.add(m.uid, "detok_msgs")
+                    if reply.incremental_output:
+                        timeline.stamp(m.uid, "detok_first_text_tx", t=t_tx)
+                    if m.finished:
+                        timeline.finish(m.uid, "detok_final_tx")
+                for m in (*error_reply_msg, *abort_msg):
+                    timeline.finish(m.uid, "terminal")
 
             if len(tokenize_msg) > 0:
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
                 ok_msgs, ok_inputs, errors = _tokenize_requests(
-                    tokenize_manager, tokenize_msg, logger
+                    tokenize_manager, tokenize_msg, logger,
+                    timeline if timeline.enabled else None,
                 )
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
+                    for reply in errors:
+                        timeline.finish(reply.uid, "terminal")
                 if ok_msgs:
                     backend = []
                     for msg, encoded in zip(ok_msgs, ok_inputs, strict=True):
@@ -294,6 +328,10 @@ def tokenize_worker(
                                 )
                             )
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
+                    if timeline.enabled:
+                        t_sent = timeline.now()
+                        for msg in ok_msgs:
+                            timeline.stamp(msg.uid, "tok_tx", t=t_sent)
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
                     data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]

@@ -22,12 +22,18 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
+from freetoken.moe.cache_fingerprint import (
+    cache_fingerprint,
+    fingerprint_enabled,
+    format_fingerprint,
+)
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
     load_tokenizer,
     load_toolcall_anchor_id,
 )
+from freetoken.utils.request_timeline import RequestTimeline, timeline_enabled, timeline_now
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -200,6 +206,15 @@ class Scheduler(SchedulerIOMixin):
 
         if config.moe_collect_stats and self.engine.moe_offload_cache is not None:
             self.engine.moe_offload_cache.reset_stats()
+        # Default-off measurement: one admission-state digest per rank per idle epoch.
+        self._moe_cache_fingerprint = (
+            fingerprint_enabled() and self.engine.moe_offload_cache is not None
+        )
+        # Default-off, content-free request boundary stamps (rank 0 only; strict parse on all).
+        self._request_timeline = RequestTimeline(
+            "scheduler", logger.info,
+            enabled=timeline_enabled() and config.tp_info.is_primary(),
+        )
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -208,10 +223,35 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         if self._idle_checks_done:
             return
+        t0 = timeline_now(self)
         self._log_moe_cache_stats()
+        self._log_moe_cache_fingerprint()
+        self._admission_trace_idle()
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
         self._idle_checks_done = True
+        if t0:
+            # A request arriving now waits for this idle work; its timeline records it.
+            self._timeline_idle_work = (t0, timeline_now(self))
+
+    def _log_moe_cache_fingerprint(self) -> None:
+        if not getattr(self, "_moe_cache_fingerprint", False):
+            return
+        fingerprint = cache_fingerprint(self.engine.moe_offload_cache)
+        logger.info(format_fingerprint(self.config.tp_info.rank, fingerprint))
+
+    def _admission_trace_idle(self) -> None:
+        """Opt-in admission trace: arm at the first idle epoch, then flush at each later one."""
+        cache = getattr(getattr(self, "engine", None), "moe_offload_cache", None)
+        trace = getattr(cache, "_admission_trace", None)
+        if trace is None:
+            return
+        if trace.armed:
+            path = trace.flush("idle")
+            if path is not None:
+                logger.info("MoE admission trace flushed: %s", path.name)
+        else:
+            trace.arm()
 
     def _log_moe_cache_stats(self) -> None:
         cache = self.engine.moe_offload_cache
@@ -449,7 +489,10 @@ class Scheduler(SchedulerIOMixin):
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        traced = bool(timeline_now(self)) and batch.is_prefill
+        t_drain = timeline_now(self) if traced else 0
         copy_done.synchronize()
+        t_synced = timeline_now(self) if traced else 0
         if getattr(batch, "paired_head", None) is not None:
             self._release_paired_head_window(batch)
         reply: List[DetokenizeMsg] = []
@@ -597,6 +640,8 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+        if traced:
+            self._timeline_drained(batch, t_drain, t_synced)
 
     def _match_stop_str(self, req: Req, end_len: int | None = None) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -838,6 +883,8 @@ class Scheduler(SchedulerIOMixin):
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
             self.prefill_manager.add_one_req(msg, cache_ids=cache_ids)
+            if timeline_now(self):
+                self._request_timeline.stamp(msg.uid, "sched_enqueue")
             if _TRACE_COLLECTIVES:
                 logger.info(
                     "DSV41 request admitted rank=%d uid=%d input_tokens=%d "
@@ -850,6 +897,8 @@ class Scheduler(SchedulerIOMixin):
                 )
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
+            if timeline_now(self):
+                self._request_timeline.finish(msg.uid, "aborted")
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is None:
                 tombstones = self._abort_tombstones = {}
@@ -1184,6 +1233,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        t_sched = timeline_now(self)
         interleave = getattr(self, "_prefill_interleave", 0)
         batch = self._interleaved_decode_batch() if interleave else None
         batch = (
@@ -1209,7 +1259,40 @@ class Scheduler(SchedulerIOMixin):
             # continuation can spend it (a final chunk leaves none, and the next prompt's first
             # chunk resets it), so a paired head+tail forward is never split.
             self._interleave_budget = interleave
+        if t_sched:
+            self._timeline_scheduled(forward_input.batch, t_sched)
         return forward_input
+
+    def _timeline_scheduled(self, batch: Batch, t_sched: int) -> None:
+        """Per-request chunk scheduling span: planning collectives, pairing and preparation."""
+        timeline = self._request_timeline
+        if batch.is_prefill:
+            record = [t_sched, timeline.now(), int(batch.log_new_tokens),
+                      int(getattr(batch, "paired_head", None) is not None),
+                      int(getattr(batch, "dsv41_cone", None) is not None)]
+            for req in batch.reqs:
+                timeline.append(req.uid, "chunks", record)
+        else:
+            # C2: a resident decode step scheduled while a prompt still waits for its next chunk.
+            for pending in self.prefill_manager.pending_list:
+                timeline.add(pending.uid, "interleaved_decodes")
+
+    def _timeline_drained(self, batch: Batch, t_drain: int, t_synced: int) -> None:
+        """Close one prefill forward; the final chunk's drain publishes the first token."""
+        timeline = self._request_timeline
+        t_tx = timeline.now()
+        forward = getattr(batch, "_timeline_forward", None)
+        gpu_ms = None
+        if forward is not None:
+            forward[3].synchronize()
+            gpu_ms = round(forward[2].elapsed_time(forward[3]), 3)
+        record = [forward[0] if forward else None, forward[1] if forward else None,
+                  t_drain, t_synced, t_tx, gpu_ms]
+        for req in batch.reqs:
+            timeline.append(req.uid, "forwards", record)
+            if not isinstance(req, ChunkedReq):
+                timeline.stamp(req.uid, "first_token_tx", t=t_tx)
+                timeline.finish(req.uid)
 
     def _interleaved_decode_batch(self) -> Batch | None:
         """The resident rows' decode batch when a chunk boundary still owes them a step.
@@ -1420,7 +1503,16 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         if getattr(batch, "speculative", False):
             batch.draft_confidence = self.engine.draft_into_batch(batch)
+        traced = bool(timeline_now(self)) and batch.is_prefill
+        if traced:
+            t_forward = timeline_now(self)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(self.engine.stream)
         forward_output = self.engine.forward_batch(batch, sample_args)
+        if traced:
+            end.record(self.engine.stream)
+            batch._timeline_forward = (t_forward, timeline_now(self), start, end)
         if getattr(batch, "speculative", False):
             rows = torch.tensor(
                 [req.table_idx for req in batch.reqs],

@@ -313,6 +313,9 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             tools=spec.template_tools,
         )
     )
+    timeline = getattr(state, "timeline", None)
+    if timeline is not None:
+        timeline.stamp(uid, "tokenize_sent")  # no-op unless the opt-in timeline is enabled
     return uid
 
 

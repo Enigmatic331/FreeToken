@@ -33,6 +33,7 @@ from freetoken.utils import (
     init_logger,
     load_generation_sampling,
 )
+from freetoken.utils.request_timeline import RequestTimeline
 from pydantic import BaseModel
 
 from .args import ServerArgs
@@ -206,10 +207,14 @@ class FrontendManager:
     _frontend_tokenizer_lock: Any = field(default_factory=threading.Lock)
     # One-shot guard for warm_frontend_tokenizer(); benign if two polls race it.
     _frontend_warm_started: bool = False
+    # Default-off, content-free request boundary stamps (freetoken.utils.request_timeline).
+    timeline: Any = None
 
     def __post_init__(self) -> None:
         if self.stats is None:
             self.stats = StatsTracker()
+        if self.timeline is None:
+            self.timeline = RequestTimeline("frontend", logger.info)
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -251,6 +256,7 @@ class FrontendManager:
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
         self.stats.on_new_user(uid)
+        self.timeline.begin(uid, "uid_assigned")
         return uid
 
     async def listen(self):
@@ -266,8 +272,24 @@ class FrontendManager:
                 self.stats.observe(msg)
                 if msg.uid not in self.ack_map:
                     continue
+                if self.timeline.enabled:
+                    self._timeline_reply(msg)
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
+
+    def _timeline_reply(self, msg: UserReply) -> None:
+        timeline, uid = self.timeline, msg.uid
+        timeline.stamp(uid, "first_reply_rx")
+        if msg.prompt_tokens_delta:
+            timeline.stamp(uid, "admitted_rx")
+            timeline.count(uid, "prompt_tokens", int(msg.prompt_tokens_delta))
+            timeline.count(uid, "cached_tokens", int(msg.cached_tokens))
+        if msg.incremental_output:
+            timeline.stamp(uid, "first_text_rx")
+        if msg.completion_tokens_delta:
+            timeline.add(uid, "completion_tokens", int(msg.completion_tokens_delta))
+        if msg.finished:
+            timeline.stamp(uid, "finished_rx")
 
     def _resolve_rebuild(self, msg: CacheRebuildReply) -> None:
         """Terminal transition for a rebuild: rebuilding -> serving | failed. This is the ONLY
@@ -356,6 +378,8 @@ class FrontendManager:
         finally:
             self.ack_map.pop(uid, None)
             self.event_map.pop(uid, None)
+            # The protocol generator has consumed every reply it will; emit this uid's line.
+            self.timeline.finish(uid)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
@@ -469,6 +493,8 @@ async def _record_request_middleware(request: Request, call_next):
     import time as _time
 
     start = _time.monotonic()
+    # Arrival for the opt-in request timeline (CLOCK_MONOTONIC ns; consumed only when enabled).
+    request.state.ft_arrival_ns = _time.monotonic_ns()
     response = await call_next(request)
     duration_ms = int((_time.monotonic() - start) * 1000)
     ctype = response.headers.get("content-type", "")

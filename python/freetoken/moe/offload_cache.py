@@ -310,6 +310,8 @@ class OffloadMoeCache:
         # double buffer; decode continues to address the full stored range.
         self.prefill_expert_start = 0
         self.prefill_expert_count = self.num_experts
+        # Opt-in admission trace (freetoken.moe.admission_trace); None = no work anywhere.
+        self._admission_trace = None
 
     def set_prefill_expert_range(self, start: int, count: int) -> None:
         if start < 0 or count < 0 or start + count > self.num_experts:
@@ -720,6 +722,8 @@ class OffloadMoeCache:
             self._prefill_hit_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
 
     def _invalidate_prefill_buffer(self, buffer_id: int) -> None:
+        if self._admission_trace is not None:
+            self._admission_trace.note_invalidate(buffer_id)
         slot_start = buffer_id * self.num_experts
         slot_end = slot_start + self.num_experts
         old_ids = self.id_of_slot[slot_start:slot_end]
@@ -985,10 +989,16 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         stats = self.lru_stats[layer_id] if self.collect_stats else None
+        trace = self._admission_trace
+        if trace is not None:
+            trace.record_pre(1, layer_id, expert_ids, route_weights)
         if route_weights is not None:
             from freetoken.moe.empty_admission import ensure_nonempty
-            return ensure_nonempty(self, layer_id, expert_ids, route_weights, stats=stats)
-        ensure_experts(self, layer_id, expert_ids, stats=stats)
+            ensure_nonempty(self, layer_id, expert_ids, route_weights, stats=stats)
+        else:
+            ensure_experts(self, layer_id, expert_ids, stats=stats)
+        if trace is not None:
+            trace.record_post(1)
 
     def ensure_sparse_prefill_experts(
         self, layer_id: int, expert_ids: torch.Tensor
@@ -1000,7 +1010,12 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         stats = self.sparse_prefill_stats[layer_id] if self.collect_stats else None
+        trace = self._admission_trace
+        if trace is not None:
+            trace.record_sparse_pre(layer_id, expert_ids)
         ensure_experts_sparse_prefill(self, layer_id, expert_ids, stats=stats)
+        if trace is not None:
+            trace.record_post(3)
 
     def ensure_experts_hybrid(
         self, layer_id: int, expert_ids: torch.Tensor,
@@ -1025,15 +1040,22 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        trace = self._admission_trace
+        if trace is not None:
+            trace.record_pre(2, layer_id, expert_ids, route_weights,
+                             compute_misses_on_cpu=compute_misses_on_cpu, cpu_miss_limit=cpu_miss_limit)
         if route_weights is not None:
             from freetoken.moe.empty_admission import ensure_nonempty
-            return ensure_nonempty(self, layer_id, expert_ids, route_weights, hybrid=True,
+            ensure_nonempty(self, layer_id, expert_ids, route_weights, hybrid=True,
                 compute_misses_on_cpu=compute_misses_on_cpu, cpu_miss_limit=cpu_miss_limit)
-        ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction,
-            compute_misses_on_cpu=compute_misses_on_cpu,
-            cpu_miss_limit=cpu_miss_limit,
-        )
+        else:
+            ensure_experts_hybrid(
+                self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction,
+                compute_misses_on_cpu=compute_misses_on_cpu,
+                cpu_miss_limit=cpu_miss_limit,
+            )
+        if trace is not None:
+            trace.record_post(2)
 
     def uses_hybrid(self, bs: int) -> bool:
         return self.decode_target == "hybrid" and (
@@ -1046,6 +1068,8 @@ class OffloadMoeCache:
         self.finish_background_admission()
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        if self._admission_trace is not None:
+            self._admission_trace.note_materialize(layer_id)
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:

@@ -154,12 +154,32 @@ def register_openai_routes(
         )])
 
 
+def _timeline(state: Any):
+    """The frontend's opt-in request timeline when enabled, else None (no work)."""
+    timeline = getattr(state, "timeline", None)
+    return timeline if timeline is not None and timeline.enabled else None
+
+
+def _timeline_entry(state: Any, uid: int, request: Request | None, t_entry: int, **stamps) -> None:
+    timeline = _timeline(state)
+    if timeline is None:
+        return
+    arrival = getattr(getattr(request, "state", None), "ft_arrival_ns", None)
+    if arrival is not None:
+        timeline.stamp(uid, "http_arrival", t=arrival)
+    timeline.stamp(uid, "handler_entry", t=t_entry)
+    for stage, t in stamps.items():
+        if t:
+            timeline.stamp(uid, stage, t=t)
+
+
 async def handle_chat_completion(
     req: ChatCompletionRequest,
     request: Request | None,
     state: Any,
     model_sampling: dict[str, Any],
 ):
+    t_entry = time.monotonic_ns()
     if req.function_call is not None:
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
@@ -208,14 +228,19 @@ async def handle_chat_completion(
     except ValueError as exc:
         return create_error_response(str(exc))
 
+    t_prerender = t_prerendered = 0
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
         # through GenerationError; only the stream path needs the pre-check.
+        t_prerender = time.monotonic_ns()
         err = await prerender_error(spec, state)
+        t_prerendered = time.monotonic_ns()
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
     uid = await submit_generation(spec, state)
+    _timeline_entry(state, uid, request, t_entry,
+                    prerender_start=t_prerender, prerender_end=t_prerendered)
 
     if req.stream:
         chunks = stream_chat_completion_chunks(uid, req, state, spec)
@@ -262,6 +287,9 @@ async def stream_chat_completion_chunks(
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
         spec = chat_request_to_genspec(req, {})
+    timeline = _timeline(state)
+    if timeline is not None:
+        timeline.stamp(uid, "sse_first_yield")
     yield _sse(
         _chat_chunk(
             req,
@@ -289,6 +317,8 @@ async def stream_chat_completion_chunks(
             )
             break
         if isinstance(ev, ReasoningDelta):
+            if timeline is not None:
+                timeline.stamp(uid, "sse_first_text_yield")
             yield _sse(
                 _chat_chunk(
                     req,
@@ -297,6 +327,8 @@ async def stream_chat_completion_chunks(
                 )
             )
         elif isinstance(ev, ContentDelta):
+            if timeline is not None:
+                timeline.stamp(uid, "sse_first_text_yield")
             yield _sse(
                 _chat_chunk(
                     req,
@@ -407,6 +439,7 @@ async def handle_completion(
     state: Any,
     model_sampling: dict[str, Any],
 ):
+    t_entry = time.monotonic_ns()
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
@@ -422,6 +455,7 @@ async def handle_completion(
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
+        _timeline_entry(state, uid, request, t_entry)
         await state.send_one(
             TokenizeMsg(
                 uid=uid,
@@ -429,6 +463,8 @@ async def handle_completion(
                 sampling_params=_resolve_sampling(req, model_sampling, default_max_tokens),
             )
         )
+        if _timeline(state) is not None:
+            state.timeline.stamp(uid, "tokenize_sent")
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
@@ -476,6 +512,7 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
+    timeline = _timeline(state)
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
@@ -485,6 +522,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         if ack.incremental_output:
+            if timeline is not None:
+                timeline.stamp(uid, "sse_first_text_yield")
             yield _sse(
                 {
                     "id": f"cmpl-{uid}",
