@@ -34,13 +34,16 @@ def test_enabled_warmup_covers_row_specializations_without_collectives(monkeypat
     monkeypatch.setattr(hc, "_DIRECT_PRE", True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     device = torch.device("cuda:0")
-    allocations, calls, syncs = [], [], []
+    allocations, calls, syncs, phases = [], [], [], []
     def zeros(shape, *, device, dtype):
         value = SimpleNamespace(shape=shape, device=device, dtype=dtype)
         allocations.append(value)
         return value
     monkeypatch.setattr(torch, "zeros", zeros)
-    monkeypatch.setattr(hc, "hc_pre", lambda x, pre: calls.append((x, pre)))
+    def record(x, pre, **phase):
+        calls.append((x, pre))
+        phases.append(phase)
+    monkeypatch.setattr(hc, "hc_pre", record)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda d: syncs.append(d))
     hc.warmup_direct_pre(device, 5120, 4)
     assert len(allocations) == 6 and syncs == [device]
@@ -48,6 +51,8 @@ def test_enabled_warmup_covers_row_specializations_without_collectives(monkeypat
     assert [p.shape for _, p in calls] == [(r, 4) for r in (1, 2, 16)]
     assert all(x.device == p.device == device for x, p in calls)
     assert all(x.dtype == torch.bfloat16 and p.dtype == torch.float32 for x, p in calls)
+    # The warmup must select the direct variant in the prefill-only mode too.
+    assert phases == [{"prefill": True}] * 3
 
 
 def test_runtime_warms_hc_before_attention_bind(monkeypatch):

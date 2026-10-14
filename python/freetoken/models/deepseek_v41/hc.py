@@ -6,7 +6,36 @@ import os
 import torch
 import torch.nn.functional as F
 
-_DIRECT_PRE = os.environ.get("FREETOKEN_DSV41_HC_DIRECT_PRE", "0") == "1"
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
+
+_DIRECT_PRE_ENV = "FREETOKEN_DSV41_HC_DIRECT_PRE"
+
+
+def _direct_pre_mode() -> str:
+    """Strict parse of the opt-in direct BF16/FP16 HC-pre input.
+
+    Unset or ``0`` is ``off``. ``prefill`` feeds the original-dtype streams to the unchanged
+    combine kernel only from the prefill call sites, selected by the explicit execution phase
+    (the ``prefill=True`` keyword those call sites pass), never by row count: a C2 decode batch
+    may have two rows. ``1`` is the earlier all-phase variant, kept for reproducibility.
+    """
+    value = os.environ.get(_DIRECT_PRE_ENV)
+    if value is None or value == "0":
+        return "off"
+    if value == "1":
+        return "all"
+    if value == "prefill":
+        return "prefill"
+    raise ValueError(f"{_DIRECT_PRE_ENV} must be '0', '1' or 'prefill', got {value!r}")
+
+
+_DIRECT_PRE_MODE = _direct_pre_mode()
+# All phases (legacy ``1``); tests toggle this name directly.
+_DIRECT_PRE = _DIRECT_PRE_MODE == "all"
+# Prefill call sites only (``prefill``).
+_DIRECT_PRE_PREFILL = _DIRECT_PRE_MODE == "prefill"
 
 
 def identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
@@ -63,15 +92,33 @@ def hc_mixes(
     )
 
 
-def hc_pre(x: torch.Tensor, incoming_pre: torch.Tensor) -> torch.Tensor:
-    """Collapse streams with the mix emitted by the preceding sublayer."""
+def _check_prefill_phase() -> None:
+    """Defence in depth: a prefill-only path must never run inside a decode forward."""
+    from freetoken import core
+
+    batch = getattr(getattr(core, "_GLOBAL_CTX", None), "_batch", None)
+    if batch is not None and not batch.is_prefill:
+        raise RuntimeError("HC prefill direct-pre requested from a non-prefill forward")
+
+
+def hc_pre(x: torch.Tensor, incoming_pre: torch.Tensor, *, prefill: bool = False) -> torch.Tensor:
+    """Collapse streams with the mix emitted by the preceding sublayer.
+
+    ``prefill`` is the caller's explicit execution phase (``True`` only from the prefill
+    block/model paths); it selects the opt-in prefill-only direct input and nothing else.
+    """
 
     leading, hc_mult, dim = x.shape[:-2], x.shape[-2], x.shape[-1]
     if x.is_cuda:
         from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
 
         streams = x.reshape(-1, hc_mult, dim)
-        if not (_DIRECT_PRE and x.dtype in (torch.bfloat16, torch.float16)):
+        direct = x.dtype in (torch.bfloat16, torch.float16) and (
+            _DIRECT_PRE or (prefill and _DIRECT_PRE_PREFILL)
+        )
+        if direct and prefill:
+            _check_prefill_phase()
+        if not direct:
             streams = streams.float()
         # The combine kernel promotes each stream to FP32 before the same
         # multiply/add sequence. Avoid materializing an entire FP32 copy.
@@ -106,7 +153,7 @@ def hc_post(
 
 def warmup_direct_pre(device: torch.device, dim: int, hc_mult: int) -> None:
     """Load authority-local BF16-input modules before any unmatched receive."""
-    if not _DIRECT_PRE or device.type != "cuda":
+    if not (_DIRECT_PRE or _DIRECT_PRE_PREFILL) or device.type != "cuda":
         return
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("HC direct-pre warmup must precede graph capture")
@@ -114,8 +161,11 @@ def warmup_direct_pre(device: torch.device, dim: int, hc_mult: int) -> None:
     for rows in (1, 2, 16):
         x = torch.zeros((rows, hc_mult, dim), device=device, dtype=torch.bfloat16)
         pre = torch.zeros((rows, hc_mult), device=device, dtype=torch.float32)
-        hc_pre(x, pre)
+        # Startup has no active forward; the prefill keyword selects the direct variant.
+        hc_pre(x, pre, prefill=True)
     torch.cuda.synchronize(device)
+    logger.info("DSV4.1 HC direct-pre mode=%s: BF16 combine warmed for rows 1/2/16",
+                _DIRECT_PRE_MODE)
 
 
 __all__ = ["hc_mixes", "hc_post", "hc_pre", "identity_pre_mix", "warmup_direct_pre"]

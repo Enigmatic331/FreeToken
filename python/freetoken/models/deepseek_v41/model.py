@@ -1281,7 +1281,7 @@ class Block(nn.Module):
         prefill_trace.mark("engram.end")
         residual = hidden
         attn_pre, attn_post, attn_comb = self._mixes(hidden, "attn")
-        block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
+        block_input = self.attn_norm(hc_pre(hidden, incoming_pre, prefill=True))
         prefill_trace.mark("attn.begin")
         with profile_range("DSV41/Attention/Prefill"):
             if window_floor is None:
@@ -1297,7 +1297,7 @@ class Block(nn.Module):
 
         residual = hidden
         ffn_pre, ffn_post, ffn_comb = self._mixes(hidden, "ffn")
-        block_input = self.ffn_norm(hc_pre(hidden, attn_pre))
+        block_input = self.ffn_norm(hc_pre(hidden, attn_pre, prefill=True))
         prefill_trace.mark("ffn.begin")
         with profile_range("DSV41/MoE/Authority"):
             block_output = self.ffn(block_input, image_mask)
@@ -1327,7 +1327,7 @@ class Block(nn.Module):
         prefill_trace.mark("layer.begin")
         if self.engram is not None:
             raise RuntimeError(f"cone source layer {self.layer_id} has an Engram module")
-        block_input = self.attn_norm(hc_pre(hidden, incoming_pre))
+        block_input = self.attn_norm(hc_pre(hidden, incoming_pre, prefill=True))
         with profile_range("DSV41/Attention/PublishSource"):
             self.attn.publish_prefill_source(block_input, start_pos, table_idx)
         prefill_trace.mark("layer.end")
@@ -1576,7 +1576,7 @@ class Transformer(nn.Module):
                 image_mask=image_mask,
                 **({} if floor is None else {"window_floor": floor}),
             )
-        hidden = self.norm(hc_pre(hidden, incoming))
+        hidden = self.norm(hc_pre(hidden, incoming, prefill=True))
         self._dspark_hidden = (
             torch.cat(target_hiddens, dim=-1)[0] if target_hiddens else None
         )
@@ -1691,7 +1691,7 @@ class Transformer(nn.Module):
                     states[0] = None
                     head.runtime.reset()
         hidden, incoming = states[1][0], states[1][1]
-        hidden = self.norm(hc_pre(hidden, incoming))
+        hidden = self.norm(hc_pre(hidden, incoming, prefill=True))
         self._dspark_hidden = None
         return project_logits(hidden[:, -1], self.head)
 
