@@ -92,6 +92,79 @@ def hc_mixes(
     )
 
 
+def hc_mixes_from_prepared(
+    flat: torch.Tensor,
+    square: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+    norm_eps: float,
+    fused_rms: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Derive HC coefficients from an exact post-mix preparation.
+
+    ``flat`` and ``square`` are distinct, contiguous FP32 tensors.  Keeping the
+    original ``F.linear`` and ``mean`` calls here preserves their production
+    dispatch, shapes, strides, and reduction order.
+    """
+
+    if flat.dtype != torch.float32 or square.dtype != torch.float32:
+        raise ValueError("prepared HC tensors must be FP32")
+    if flat.shape != square.shape or not flat.is_contiguous() or not square.is_contiguous():
+        raise ValueError("prepared HC tensors must be distinct contiguous peers")
+    if flat.data_ptr() == square.data_ptr():
+        raise ValueError("prepared HC flat and square buffers must not alias")
+    leading = flat.shape[:-1]
+    mixes = F.linear(flat, weight.float())
+    square_mean = square.mean(-1, keepdim=True)
+    if mixes.is_cuda and fused_rms:
+        from freetoken.kernel.triton.dsv41 import hc_sinkhorn_rmsprep
+
+        return hc_sinkhorn_rmsprep(
+            mixes,
+            square_mean,
+            scale,
+            base,
+            hc_mult=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+            eps=eps,
+            norm_eps=norm_eps,
+        )
+    mixes *= torch.rsqrt(square_mean + norm_eps)
+    rows = mixes.reshape(-1, mixes.shape[-1])
+    if rows.is_cuda:
+        from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
+
+        pre, post, comb = hc_split_sinkhorn(
+            rows, scale, base, hc_mult, sinkhorn_iters, eps
+        )
+        return (
+            pre.view(*leading, hc_mult),
+            post.view(*leading, hc_mult),
+            comb.view(*leading, hc_mult, hc_mult),
+        )
+    pre = torch.sigmoid(rows[:, :hc_mult] * scale[0] + base[:hc_mult]) + eps
+    post = 2 * torch.sigmoid(
+        rows[:, hc_mult : 2 * hc_mult] * scale[1]
+        + base[hc_mult : 2 * hc_mult]
+    )
+    comb = rows[:, 2 * hc_mult :] * scale[2] + base[2 * hc_mult :]
+    comb = comb.view(-1, hc_mult, hc_mult).softmax(-1) + eps
+    comb /= comb.sum(-2, keepdim=True) + eps
+    for _ in range(sinkhorn_iters - 1):
+        comb /= comb.sum(-1, keepdim=True) + eps
+        comb /= comb.sum(-2, keepdim=True) + eps
+    return (
+        pre.view(*leading, hc_mult),
+        post.view(*leading, hc_mult),
+        comb.view(*leading, hc_mult, hc_mult),
+    )
+
+
 def _check_prefill_phase() -> None:
     """Defence in depth: a prefill-only path must never run inside a decode forward."""
     from freetoken import core
@@ -123,6 +196,22 @@ def hc_pre(x: torch.Tensor, incoming_pre: torch.Tensor, *, prefill: bool = False
         # The combine kernel promotes each stream to FP32 before the same
         # multiply/add sequence. Avoid materializing an entire FP32 copy.
         result = hc_pre_combine(streams, incoming_pre.reshape(-1, hc_mult), x.dtype)
+        return result.view(*leading, dim)
+    return (incoming_pre.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
+
+
+def hc_pre_decode_direct(x: torch.Tensor, incoming_pre: torch.Tensor) -> torch.Tensor:
+    """Decode-only HC pre-combine that reads the stored BF16 streams directly."""
+
+    leading, hc_mult, dim = x.shape[:-2], x.shape[-2], x.shape[-1]
+    if x.is_cuda:
+        from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
+
+        result = hc_pre_combine(
+            x.reshape(-1, hc_mult, dim),
+            incoming_pre.reshape(-1, hc_mult),
+            x.dtype,
+        )
         return result.view(*leading, dim)
     return (incoming_pre.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
 
@@ -168,4 +257,12 @@ def warmup_direct_pre(device: torch.device, dim: int, hc_mult: int) -> None:
                 _DIRECT_PRE_MODE)
 
 
-__all__ = ["hc_mixes", "hc_post", "hc_pre", "identity_pre_mix", "warmup_direct_pre"]
+__all__ = [
+    "hc_mixes",
+    "hc_mixes_from_prepared",
+    "hc_post",
+    "hc_pre",
+    "hc_pre_decode_direct",
+    "identity_pre_mix",
+    "warmup_direct_pre",
+]

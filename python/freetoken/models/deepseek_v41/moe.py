@@ -114,6 +114,45 @@ def _broadcast_decode_dispatch(
     return wire_hidden, wire_weights, wire_ids
 
 
+def _broadcast_prefilled_decode_dispatch(
+    communicator,
+    execution,
+    wire: torch.Tensor,
+    hidden_shape: tuple[int, ...],
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Broadcast an authority-filled decode wire without recopying its views.
+
+    Expert workers deliberately keep using :func:`_broadcast_decode_dispatch`;
+    both sides enter the same single broadcast with the same int32 payload.
+    """
+
+    root = execution.backbone_rank
+    if root is None or execution.rank != root:
+        raise RuntimeError("prefilled decode dispatch is authority-root only")
+    hidden_elements = 1
+    for extent in hidden_shape:
+        hidden_elements *= int(extent)
+    if hidden_elements % 2:
+        raise RuntimeError("prefilled dispatch requires an even BF16 hidden size")
+    rows = int(hidden_shape[0])
+    route_elements = rows * int(top_k)
+    hidden_words = hidden_elements // 2
+    expected = hidden_words + 2 * route_elements
+    if wire.dtype != torch.int32 or wire.ndim != 1 or wire.numel() != expected:
+        raise RuntimeError(
+            f"prefilled dispatch wire has {tuple(wire.shape)}/{wire.dtype}; "
+            f"expected int32[{expected}]"
+        )
+    wire_hidden = wire[:hidden_words].view(torch.bfloat16).view(hidden_shape)
+    wire_weights = wire[
+        hidden_words : hidden_words + route_elements
+    ].view(torch.float32).view(rows, top_k)
+    wire_ids = wire[hidden_words + route_elements :].view(rows, top_k)
+    wire = communicator.broadcast(wire, root)
+    return wire_hidden, wire_weights, wire_ids
+
+
 def _prepare_partitioned_routes(
     weights: torch.Tensor,
     ids: torch.Tensor,
@@ -288,6 +327,12 @@ class RoutedExperts(ExpertParallelOffloadMoELayer):
 
     def _maybe_all_reduce(self, routes: torch.Tensor) -> torch.Tensor:
         with profile_range("DSV41/EP/RouteAllReduce"):
+            if getattr(self, "_authority_route_passthrough", False):
+                # Keep the qualified communicator and collective payload, but
+                # leave the six route slots intact for hc_post_mixprep's exact
+                # ordered reduction.  Only the authority sets this in a
+                # try/finally-scoped context; workers retain the old path.
+                return DistributedCommunicator().all_reduce(routes)
             return super()._maybe_all_reduce(routes)
 
     # Bound by PrefillEarlyRefill when FREETOKEN_DSV41_PREFILL_EARLY_REFILL=1.

@@ -1474,6 +1474,9 @@ class Transformer(nn.Module):
         warmup_direct_pre(device, self.args.dim, self.args.hc_mult)
         for block in self.layers:
             block.attn.bind(device)
+        from .authority_fusion import warmup_authority_fusion
+
+        warmup_authority_fusion(self, device)
         packed_indexers = [
             block.attn.indexer for block in self.layers
             if block.attn.indexer is not None
@@ -2558,13 +2561,28 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         else:
             cmp_stage_cap = int(positions.max().item())
         with profile_range("DSV41/Batch/Decode"):
-            result = self._model.decode(
-                input_ids.view(batch.padded_size, 1),
-                positions,
-                cmp_stage_cap,
-                engram_rows=engram_rows,
-                capture_dspark=capture_dspark,
+            from .authority_fusion import (
+                authority_fusion_eligible,
+                decode_authority_fused,
             )
+
+            if authority_fusion_eligible(batch, self._execution):
+                result = decode_authority_fused(
+                    self._model,
+                    input_ids.view(batch.padded_size, 1),
+                    positions,
+                    cmp_stage_cap,
+                    engram_rows=engram_rows,
+                    capture_dspark=capture_dspark,
+                )
+            else:
+                result = self._model.decode(
+                    input_ids.view(batch.padded_size, 1),
+                    positions,
+                    cmp_stage_cap,
+                    engram_rows=engram_rows,
+                    capture_dspark=capture_dspark,
+                )
         if capture_dspark:
             hidden = self._model._dspark_hidden
             self._dspark_target_features = (
