@@ -128,13 +128,23 @@ def validate_live_candidate_runtime(
         raise RuntimeError(f"candidate pin drift: {commit}/{tree}")
     if status:
         raise RuntimeError(f"candidate worktree is not clean:\n{status}")
-    visible = subprocess.run(
-        ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    ).stdout.splitlines()
-    uuids = [value.strip() for value in visible if value.strip()]
+    # nvidia-smi enumerates physical devices and does not honor
+    # CUDA_VISIBLE_DEVICES.  Prove the process-visible CUDA namespace instead;
+    # qualification must expose exactly the authority GPU as logical device 0.
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError(
+            f"authority GPU isolation drift: torch sees {torch.cuda.device_count()} devices"
+        )
+    raw_uuid = getattr(torch.cuda.get_device_properties(0), "uuid", None)
+    if isinstance(raw_uuid, bytes):
+        raw_uuid = raw_uuid.decode()
+    if raw_uuid:
+        normalized_uuid = str(raw_uuid)
+        if not normalized_uuid.startswith("GPU-"):
+            normalized_uuid = f"GPU-{normalized_uuid}"
+        uuids = [normalized_uuid]
+    else:
+        uuids = []
     if uuids != [AUTHORITY_UUID]:
         raise RuntimeError(f"authority GPU isolation drift: {uuids}")
     resolved_run = run_dir.resolve()
@@ -168,6 +178,18 @@ def cudagraph_marker_sidecar(
     destinations = tuple(captured.wire_destinations)
     if [item["layer"] for item in destinations] != list(range(40)):
         raise RuntimeError("CUDA graph wire-hidden destination receipt is incomplete")
+    hidden_destinations = tuple(
+        {"layer": item["layer"], "base_ptr": item["base_ptr"], "nbytes": item["nbytes"]}
+        for item in destinations
+    )
+    tail_destinations = tuple(
+        {
+            "layer": item["layer"],
+            "base_ptr": item["tail_base_ptr"],
+            "nbytes": item["tail_nbytes"],
+        }
+        for item in destinations
+    )
     return {
         "schema": "authority-cudagraph-marker-events-v2",
         "rows": rows,
@@ -185,7 +207,10 @@ def cudagraph_marker_sidecar(
             "end": "broadcast_start(layer)",
             "required_memcpy_kind": "Device-to-Device",
         },
-        "copy_destinations": {"wire_hidden": destinations},
+        "copy_destinations": {
+            "wire_hidden": hidden_destinations,
+            "wire_tail": tail_destinations,
+        },
         "validation_status": "RAW_UNEVALUATED",
         "validator_requirement": (
             "successor evaluator must parse real event-record nodes, prove graph "
@@ -396,7 +421,7 @@ class BoundaryRecorder:
         self._records.append(Boundary(self._token, 0, "token_start", self._event(), time.monotonic_ns()))
 
     def wire_destination(self, layer: int, wire_hidden: torch.Tensor) -> None:
-        """Receipt the exact D2D hidden-copy target used by one MoE layer."""
+        """Receipt the hidden and route-tail D2D targets of one real wire."""
 
         if not self._require_wire_destinations:
             raise RuntimeError("wire destination observed outside capture scope")
@@ -411,11 +436,20 @@ class BoundaryRecorder:
             or not wire_hidden.is_contiguous()
         ):
             raise RuntimeError(f"wire-hidden geometry drift at layer {layer}")
+        layout = expected_wire_layout(int(wire_hidden.shape[0]))
+        base_ptr = int(wire_hidden.data_ptr())
+        storage = wire_hidden.untyped_storage()
+        if int(storage.data_ptr()) != base_ptr or int(storage.nbytes()) < layout.total_bytes:
+            raise RuntimeError(f"wire-hidden is not the leading view of the real wire at layer {layer}")
         self._wire_destinations.append(
             {
                 "layer": layer,
-                "base_ptr": int(wire_hidden.data_ptr()),
-                "nbytes": int(wire_hidden.numel() * wire_hidden.element_size()),
+                "base_ptr": base_ptr,
+                "nbytes": layout.weights_offset,
+                "wire_base_ptr": base_ptr,
+                "wire_nbytes": layout.total_bytes,
+                "tail_base_ptr": base_ptr + layout.weights_offset,
+                "tail_nbytes": layout.total_bytes - layout.weights_offset,
             }
         )
 
@@ -738,10 +772,13 @@ class CapturedAuthorityDecode:
         )
         self.input_ids.copy_(replacement)
         self.rig.fill_engram_rows(self.engram_rows, seed=seed)
+        self.rig.reset()
+        # This digest is the actual pre-replay state: reset first, receipt
+        # second.  Capturing before reset accidentally receipts the previous
+        # replay's dirty state and cannot prove replay independence.
         pre_reset_sha256 = TensorSnapshot.capture(
             mutable_attention_state(self.rig.pool)
         ).digest()
-        self.rig.reset()
         measurement_start_monotonic_ns = time.monotonic_ns()
         self.graph.replay()
         torch.cuda.synchronize()

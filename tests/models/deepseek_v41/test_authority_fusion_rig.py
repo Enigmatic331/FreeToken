@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import torch
 
 from .authority_fusion_rig import (
     BoundaryRecorder,
+    CapturedAuthorityDecode,
     CUDA_NODE_COUNT,
     CUDA_NODE_INVENTORY_SHA256,
     ExpertComputeStub,
@@ -113,7 +115,8 @@ def test_pre_boundary_definition_is_mechanical():
 
 def test_wire_destination_receipt_is_exact_and_ordered():
     recorder = BoundaryRecorder(event_factory=_Events())
-    wire_hidden = torch.zeros(2, 5120, dtype=torch.bfloat16)
+    wire = torch.empty(5120 + 24, dtype=torch.int32)
+    wire_hidden = wire[:5120].view(torch.bfloat16).view(2, 5120)
     with recorder.require_wire_destinations():
         recorder.begin_token()
         for layer in range(40):
@@ -126,13 +129,18 @@ def test_wire_destination_receipt_is_exact_and_ordered():
     assert [item["layer"] for item in receipt] == list(range(40))
     assert {item["base_ptr"] for item in receipt} == {wire_hidden.data_ptr()}
     assert {item["nbytes"] for item in receipt} == {20480}
+    assert {item["tail_base_ptr"] for item in receipt} == {wire_hidden.data_ptr() + 20480}
+    assert {item["tail_nbytes"] for item in receipt} == {96}
+    assert {item["wire_nbytes"] for item in receipt} == {20576}
 
 
 def test_cudagraph_sidecar_pins_d2d_destinations_and_dot_grammar(tmp_path):
     dot = tmp_path / "full.dot"
     dot.write_text('digraph "cuda" { a -> b; }\n')
     destinations = tuple(
-        {"layer": layer, "base_ptr": 0x100000 + layer * 0x10000, "nbytes": 10240}
+        {"layer": layer, "base_ptr": 0x100000 + layer * 0x10000, "nbytes": 10240,
+         "wire_base_ptr": 0x100000 + layer * 0x10000, "wire_nbytes": 10288,
+         "tail_base_ptr": 0x100000 + layer * 0x10000 + 10240, "tail_nbytes": 48}
         for layer in range(40)
     )
     captured = SimpleNamespace(marker_events=({"kind": "token_start", "layer": 0},), wire_destinations=destinations)
@@ -141,7 +149,14 @@ def test_cudagraph_sidecar_pins_d2d_destinations_and_dot_grammar(tmp_path):
     )
     assert value["schema"] == "authority-cudagraph-marker-events-v2"
     assert value["copy_scope"]["required_memcpy_kind"] == "Device-to-Device"
-    assert value["copy_destinations"]["wire_hidden"] == destinations
+    assert value["copy_destinations"]["wire_hidden"] == tuple(
+        {"layer": row["layer"], "base_ptr": row["base_ptr"], "nbytes": row["nbytes"]}
+        for row in destinations
+    )
+    assert value["copy_destinations"]["wire_tail"] == tuple(
+        {"layer": row["layer"], "base_ptr": row["tail_base_ptr"], "nbytes": row["tail_nbytes"]}
+        for row in destinations
+    )
     assert value["dot_receipt"]["producer"] == "torch.cuda.CUDAGraph.debug_dump"
     assert value["validation_status"] == "RAW_UNEVALUATED"
     assert len(value["dot_sha256"]) == 64
@@ -224,11 +239,15 @@ def test_live_candidate_runtime_checks_clean_tree_cache_and_uuid(monkeypatch, tm
                 return SimpleNamespace(stdout=tree + "\n")
             if command[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
                 return SimpleNamespace(stdout="")
-        if command[0] == "nvidia-smi":
-            return SimpleNamespace(stdout="GPU-d151df0f-4c65-0eb2-48f5-c10b135f63ff\n")
         raise AssertionError(command)
 
     monkeypatch.setattr("subprocess.run", clean_run)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _index: SimpleNamespace(uuid="d151df0f-4c65-0eb2-48f5-c10b135f63ff"),
+    )
     receipt = validate_live_candidate_runtime(
         candidate_root=tmp_path,
         expected_commit=commit,
@@ -244,6 +263,39 @@ def test_live_candidate_runtime_checks_clean_tree_cache_and_uuid(monkeypatch, tm
             expected_tree=tree,
             run_dir=run_dir,
         )
+
+
+def test_live_candidate_runtime_rejects_more_than_one_process_visible_gpu(
+    monkeypatch, tmp_path
+):
+    commit, tree = "a" * 40, "b" * 40
+    run_dir = tmp_path / "run"
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(run_dir / "triton"))
+    monkeypatch.setenv("FREETOKEN_KERNEL_CACHE_DIR", str(run_dir / "freetoken"))
+
+    def clean_run(command, **_kwargs):
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=commit + "\n")
+        if command[-2:] == ["rev-parse", "HEAD^{tree}"]:
+            return SimpleNamespace(stdout=tree + "\n")
+        if command[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+            return SimpleNamespace(stdout="")
+        raise AssertionError(command)
+
+    monkeypatch.setattr("subprocess.run", clean_run)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    with pytest.raises(RuntimeError, match="torch sees 2 devices"):
+        validate_live_candidate_runtime(
+            candidate_root=tmp_path,
+            expected_commit=commit,
+            expected_tree=tree,
+            run_dir=run_dir,
+        )
+
+
+def test_captured_replay_resets_before_pre_reset_digest():
+    source = inspect.getsource(CapturedAuthorityDecode.replay)
+    assert source.index("self.rig.reset()") < source.index("pre_reset_sha256 =")
 
 
 def test_pre_chain_dot_is_derived_from_exact_captured_structure(tmp_path):
