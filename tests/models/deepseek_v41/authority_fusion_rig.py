@@ -85,6 +85,10 @@ LAYER_CLASSES = {
 LAYER_WEIGHTS = {0: 1, 1: 1, 2: 2, 5: 28, 13: 1, 14: 1, 20: 1, 24: 4, 39: 1}
 
 
+class AuthorityRigInfrastructureError(RuntimeError):
+    """A qualification-harness failure that cannot establish a model verdict."""
+
+
 def validate_live_environment() -> dict[str, str]:
     """Apply the same fail-closed live environment gate to CLI and pytest."""
 
@@ -174,12 +178,21 @@ def validate_cudagraph_debug_dump_capability(path: Path) -> dict[str, Any]:
         target.copy_(source)
         target.add_(1)
     graph.instantiate()
-    graph.debug_dump(str(path))
+    try:
+        graph.debug_dump(str(path))
+    except Exception as exc:
+        raise AuthorityRigInfrastructureError(
+            f"retained CUDA graph debug dump failed: {path}"
+        ) from exc
     if not path.is_file() or not path.stat().st_size:
-        raise RuntimeError(f"retained CUDA graph debug dump absent/empty: {path}")
+        raise AuthorityRigInfrastructureError(
+            f"retained CUDA graph debug dump absent/empty: {path}"
+        )
     raw = path.read_bytes()
     if b"digraph" not in raw:
-        raise RuntimeError(f"retained CUDA graph debug dump is not DOT: {path}")
+        raise AuthorityRigInfrastructureError(
+            f"retained CUDA graph debug dump is not DOT: {path}"
+        )
     return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
 
 
@@ -189,7 +202,9 @@ def cudagraph_marker_sidecar(
     """Build the fail-closed raw-DOT/event/destination correlation receipt."""
 
     if not dot_path.is_file() or not dot_path.stat().st_size:
-        raise RuntimeError(f"CUDA graph debug dump absent/empty: {dot_path}")
+        raise AuthorityRigInfrastructureError(
+            f"CUDA graph debug dump absent/empty: {dot_path}"
+        )
     destinations = tuple(captured.wire_destinations)
     if [item["layer"] for item in destinations] != list(range(40)):
         raise RuntimeError("CUDA graph wire-hidden destination receipt is incomplete")
@@ -1996,9 +2011,16 @@ class RealWeightAuthorityRig:
             )
             if graph_dir is not None:
                 dot_path = graph_dir / f"{arm}.dot"
-                captured[arm].graph.debug_dump(str(dot_path))
+                try:
+                    captured[arm].graph.debug_dump(str(dot_path))
+                except Exception as exc:
+                    raise AuthorityRigInfrastructureError(
+                        f"CUDA graph debug dump failed: {dot_path}"
+                    ) from exc
                 if not dot_path.is_file() or not dot_path.stat().st_size:
-                    raise RuntimeError(f"CUDA graph debug dump absent/empty: {dot_path}")
+                    raise AuthorityRigInfrastructureError(
+                        f"CUDA graph debug dump absent/empty: {dot_path}"
+                    )
                 marker_path = graph_dir / f"{arm}.markers.json"
                 marker_path.write_text(
                     json.dumps(

@@ -28,6 +28,7 @@ import torch
 
 from .authority_fusion_rig import (
     APPROVED_EXTENSION_HASHES,
+    AuthorityRigInfrastructureError,
     CUDA_NODE_COUNT,
     CUDA_NODE_INVENTORY_SHA256,
     RealWeightAuthorityRig,
@@ -43,6 +44,16 @@ from .authority_fusion_rig import (
 
 
 SCHEMA = "authority-fusion-real-weight-rig-v1"
+
+
+def failure_class(exc: BaseException) -> str:
+    """Classify by exception type only; messages never grant a baseline hold."""
+
+    if isinstance(exc, AuthorityRigInfrastructureError):
+        return "harness_infrastructure"
+    if isinstance(exc, AssertionError):
+        return "correctness"
+    return "unknown"
 
 
 def _sha256(path: Path) -> str:
@@ -514,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
                 "schema": SCHEMA,
                 "command": args.command,
                 "verdict": "FAIL_CLOSED",
+                "failure_class": failure_class(exc),
                 "exception_type": type(exc).__name__,
                 "exception": str(exc),
             },

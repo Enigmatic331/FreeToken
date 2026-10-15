@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from .authority_fusion_rig import (
+    AuthorityRigInfrastructureError,
     BoundaryRecorder,
     CapturedAuthorityDecode,
     CUDA_NODE_COUNT,
@@ -33,6 +34,7 @@ from .authority_fusion_rig import (
     validate_live_environment,
     validate_junit_inventory,
 )
+from .authority_fusion_rig_cli import failure_class
 
 
 class _Event:
@@ -42,6 +44,14 @@ class _Event:
 
     def record(self):
         self.recorded = True
+
+
+def test_failure_class_is_type_based_and_fail_closed():
+    assert failure_class(AuthorityRigInfrastructureError("graph dump failed")) == (
+        "harness_infrastructure"
+    )
+    assert failure_class(AssertionError("output mismatch")) == "correctness"
+    assert failure_class(RuntimeError("CUDA graph debug dump absent/empty")) == "unknown"
 
 
 class _Events:
