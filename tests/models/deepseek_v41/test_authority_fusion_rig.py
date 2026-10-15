@@ -26,7 +26,6 @@ from .authority_fusion_rig import (
     cudagraph_marker_sidecar,
     current_qualification_rig,
     disjoint_full_loc_map,
-    enable_cudagraph_debug_mode,
     expected_wire_layout,
     installed_qualification_rig,
     protocol_receipt,
@@ -210,19 +209,20 @@ def test_live_environment_is_shared_and_fail_closed(monkeypatch):
         validate_live_environment()
 
 
-def test_cudagraph_debug_mode_uses_instance_api(monkeypatch):
-    calls = []
-
-    class Graph:
-        def __init__(self):
-            calls.append("init")
-
-        def enable_debug_mode(self):
-            calls.append("enable")
-
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
-    enable_cudagraph_debug_mode()
-    assert calls == ["init", "enable"]
+def test_g4_retains_and_instantiates_debug_graphs_outside_timing():
+    capture = inspect.getsource(__import__(
+        "tests.models.deepseek_v41.authority_fusion_rig",
+        fromlist=["RealWeightAuthorityRig"],
+    ).RealWeightAuthorityRig.capture_complete_token)
+    matrix = inspect.getsource(__import__(
+        "tests.models.deepseek_v41.authority_fusion_rig",
+        fromlist=["RealWeightAuthorityRig"],
+    ).RealWeightAuthorityRig.run_g4_matrix)
+    assert "keep_graph: bool = False" in capture
+    assert "CUDAGraph(keep_graph=keep_graph)" in capture
+    assert "if keep_graph:" in capture and "graph.instantiate()" in capture
+    assert "keep_graph=graph_dir is not None" in matrix
+    assert "enable_debug_mode" not in matrix
 
 
 def test_live_candidate_runtime_checks_clean_tree_cache_and_uuid(monkeypatch, tmp_path):

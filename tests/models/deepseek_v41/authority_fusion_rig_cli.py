@@ -471,12 +471,21 @@ def main(argv: list[str] | None = None) -> int:
             identity = _process_identity(args, run_dir, preflight)
             result = {"schema": SCHEMA, "command": "identity", "identity": identity}
         else:
+            if args.command in ("g4", "qualify"):
+                from tests.models.deepseek_v41.authority_fusion_rig import (
+                    validate_cudagraph_debug_dump_capability,
+                )
+
+                preflight["cudagraph_debug_dump"] = validate_cudagraph_debug_dump_capability(
+                    run_dir / "capability" / "cudagraph-debug.dot"
+                )
+                _write_json(run_dir / "preflight.json", preflight)
             rig = _load_rig(args)
             rig.invocation_id = preflight["invocation_id"]
             identity = _process_identity(args, run_dir, preflight)
             stages: dict[str, Any] = {}
-            # Run the exact pytest inventory before G4 enables process-global
-            # CUDA-graph debug mode. It reuses this exact loaded rig/PID.
+            # Run the exact pytest inventory in this loaded rig/PID before the
+            # G4 timing matrix. Retained debug graphs are scoped to G4 only.
             inventory = (
                 _run_pinned_cuda_inventory(rig, args, run_dir)
                 if args.command == "qualify"

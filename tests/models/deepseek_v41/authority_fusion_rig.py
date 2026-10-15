@@ -161,11 +161,26 @@ def validate_live_candidate_runtime(
     }
 
 
-def enable_cudagraph_debug_mode() -> None:
-    """Enable process-global graph debugging through the instance API."""
+def validate_cudagraph_debug_dump_capability(path: Path) -> dict[str, Any]:
+    """Fail early unless this PyTorch/CUDA build can emit a retained graph DOT."""
 
-    controller = torch.cuda.CUDAGraph()
-    controller.enable_debug_mode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.cuda.set_device(0)
+    source = torch.arange(16, dtype=torch.float32, device="cuda")
+    target = torch.empty_like(source)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        target.copy_(source)
+        target.add_(1)
+    graph.instantiate()
+    graph.debug_dump(str(path))
+    if not path.is_file() or not path.stat().st_size:
+        raise RuntimeError(f"retained CUDA graph debug dump absent/empty: {path}")
+    raw = path.read_bytes()
+    if b"digraph" not in raw:
+        raise RuntimeError(f"retained CUDA graph debug dump is not DOT: {path}")
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
 
 
 def cudagraph_marker_sidecar(
@@ -1465,6 +1480,7 @@ class RealWeightAuthorityRig:
         stage_cap_override: int | None = None,
         pool=None,
         capture_layers: bool = True,
+        keep_graph: bool = False,
     ) -> CapturedAuthorityDecode:
         """Capture exactly one full authority token including all PRE markers."""
 
@@ -1487,7 +1503,7 @@ class RealWeightAuthorityRig:
             stage_cap_override=stage_cap_override,
         )
         self.reset()
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(keep_graph=keep_graph)
         torch.cuda.synchronize()
         with torch.cuda.graph(graph, pool=pool):
             with self.capture_wire_destinations(fused=fused):
@@ -1515,6 +1531,10 @@ class RealWeightAuthorityRig:
                                 engram_rows=engram_rows,
                             )
                 self.recorder.end_token()
+        if keep_graph:
+            # With keep_graph=True PyTorch intentionally defers instantiation.
+            # Do it once here, before debug dumping and outside all G4 timing.
+            graph.instantiate()
         marker_events = self.recorder.marker_receipt()
         event_ids = [item["event_id"] for item in marker_events]
         cuda_events = [item["cuda_event"] for item in marker_events]
@@ -1956,7 +1976,6 @@ class RealWeightAuthorityRig:
         captured: dict[str, CapturedAuthorityDecode] = {}
         if graph_dir is not None:
             graph_dir.mkdir(parents=True, exist_ok=True)
-            enable_cudagraph_debug_mode()
         # Rotated arm order is deliberately different from capture order.
         # PyTorch shared-pool graphs are valid only when replayed in capture
         # order, so every arm owns an independent graph pool here.
@@ -1973,6 +1992,7 @@ class RealWeightAuthorityRig:
                 seed=seed_base,
                 policy=policy,
                 capture_layers=False,
+                keep_graph=graph_dir is not None,
             )
             if graph_dir is not None:
                 dot_path = graph_dir / f"{arm}.dot"
@@ -2142,7 +2162,7 @@ __all__ = [
     "cudagraph_marker_sidecar",
     "current_qualification_rig",
     "disjoint_full_loc_map",
-    "enable_cudagraph_debug_mode",
+    "validate_cudagraph_debug_dump_capability",
     "expected_wire_layout",
     "mutable_attention_state",
     "installed_qualification_rig",

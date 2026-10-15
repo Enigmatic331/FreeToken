@@ -50,13 +50,19 @@ def authority_rig():
     yield rig
 
 
-def test_g2_process_import_extension_checkpoint_protocol_identity(authority_rig):
+def test_g2_process_import_extension_checkpoint_protocol_identity(authority_rig, tmp_path):
     candidate = Path(os.environ["FREETOKEN_AUTHORITY_RIG_CANDIDATE_ROOT"])
     identity = process_identity_receipt(candidate, APPROVED_EXTENSION_HASHES)
     checkpoint = checkpoint_receipt(Path(os.environ["FREETOKEN_AUTHORITY_RIG_MODEL_PATH"]))
     assert identity["pid"] == os.getpid()
     assert checkpoint["shards"]
     assert len(protocol_receipt()["sha256"]) == 64
+    # Qualify the installed torch/CUDA graph-dump path inside an existing
+    # pinned node so the frozen ten-node inventory remains unchanged.
+    from .authority_fusion_rig import validate_cudagraph_debug_dump_capability
+
+    receipt = validate_cudagraph_debug_dump_capability(tmp_path / "capability.dot")
+    assert receipt["bytes"] > 0 and len(receipt["sha256"]) == 64
 
 
 def test_g2_real_m1_wire_offsets_alignment(authority_rig):
