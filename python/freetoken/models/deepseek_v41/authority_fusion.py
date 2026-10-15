@@ -81,7 +81,15 @@ def authority_fusion_eligible(batch, execution) -> bool:
 
 
 def _tensor_version(tensor: torch.Tensor) -> int:
-    return int(getattr(tensor, "_version", 0))
+    try:
+        return int(getattr(tensor, "_version", 0))
+    except RuntimeError as exc:
+        # CUDA-graph warmup runs under inference_mode(), whose tensors
+        # deliberately have no version counter.  Identity plus the forward
+        # epoch still scopes the memo; use a stable sentinel for that mode.
+        if "Inference tensors do not track version counter" not in str(exc):
+            raise
+        return -1
 
 
 @dataclass(slots=True)

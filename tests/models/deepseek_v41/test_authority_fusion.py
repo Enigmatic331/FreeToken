@@ -236,6 +236,16 @@ def test_prepared_mix_requires_identity_epoch_and_version():
         prepared.require(source, 7)
 
 
+def test_prepared_mix_accepts_inference_tensor_without_version_counter():
+    with torch.inference_mode():
+        source = torch.zeros(1, 1, 4, 8, dtype=torch.bfloat16)
+        flat = source.flatten(-2).float()
+        square = flat.square()
+        prepared = fusion.PreparedMix.capture(flat, square, source, epoch=7)
+        assert prepared.source_version == -1
+        assert prepared.require(source, 7) == (flat, square)
+
+
 def test_prepared_mix_rejects_aliasing():
     source = torch.zeros(1, 1, 4, 8, dtype=torch.bfloat16)
     flat = source.flatten(-2).float()
