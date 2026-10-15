@@ -12,6 +12,7 @@ import torch
 
 from .authority_fusion_rig import (
     AuthorityRigInfrastructureError,
+    AUTHORITY_UUID,
     BoundaryRecorder,
     CapturedAuthorityDecode,
     CUDA_NODE_COUNT,
@@ -207,7 +208,7 @@ def test_live_environment_is_shared_and_fail_closed(monkeypatch):
         "FREETOKEN_AUTHORITY_RIG_LIVE": "1",
         "FREETOKEN_DSV41_AUTHORITY_FUSION": "1",
         "FREETOKEN_DSV41_FUSED_DECODE_DISPATCH": "1",
-        "CUDA_VISIBLE_DEVICES": "GPU-d151df0f-4c65-0eb2-48f5-c10b135f63ff",
+        "CUDA_VISIBLE_DEVICES": AUTHORITY_UUID,
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     for name, value in values.items():
@@ -256,7 +257,7 @@ def test_live_candidate_runtime_checks_clean_tree_cache_and_uuid(monkeypatch, tm
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _index: SimpleNamespace(uuid="d151df0f-4c65-0eb2-48f5-c10b135f63ff"),
+        lambda _index: SimpleNamespace(uuid=AUTHORITY_UUID.removeprefix("GPU-")),
     )
     receipt = validate_live_candidate_runtime(
         candidate_root=tmp_path,

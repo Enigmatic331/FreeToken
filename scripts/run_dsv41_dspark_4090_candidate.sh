@@ -17,7 +17,7 @@ esac
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export FREETOKEN_LOAD_VISION=1
-export FREETOKEN_KERNEL_CACHE_DIR="${FREETOKEN_KERNEL_CACHE_DIR:-/home/enigmatic331/models/dsv41-flash-results/kernel-cache-sm89-sm120}"
+export FREETOKEN_KERNEL_CACHE_DIR="${FREETOKEN_KERNEL_CACHE_DIR:-/tmp/freetoken-dsv41-kernel-cache}"
 export TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-/tmp/freetoken-dsv41-dspark-4090-tvm-cache}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MALLOC_ARENA_MAX=4
