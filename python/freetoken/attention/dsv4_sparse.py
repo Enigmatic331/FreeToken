@@ -29,6 +29,7 @@ the <= 31 alignment ones -- permanently -1, hence masked in the kernel.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -41,6 +42,26 @@ from .dsv4_indexer import IndexerBackendMixin
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+
+TOKEN_BOUNDARY_OVERLAP_ENV = "FREETOKEN_DSV41_TOKEN_BOUNDARY_OVERLAP"
+# Rows of the cached decode ``last_indices``. Decode batches are padded to at most
+# max_running_req rows (2 under C2); a larger batch keeps the original construction.
+_DECODE_LAST_ROWS = 64
+
+
+def decode_last_cache(device: torch.device) -> torch.Tensor | None:
+    """Opt-in token-boundary overlap: an address-stable, never-written ``arange`` that serves
+    every decode batch's ``last_indices``.
+
+    ``prepare_metadata`` runs on the scheduler stream after it has been made to wait on the
+    in-flight forward, so the original ``torch.tensor(..., device=cuda)`` (a pageable H2D,
+    i.e. a ``cudaStreamSynchronize``) blocked the host until that forward finished and the
+    next token could not be queued behind it. Built once here, at backend construction,
+    before any serving traffic. None (the original path, byte for byte) unless enabled.
+    """
+    if os.getenv(TOKEN_BOUNDARY_OVERLAP_ENV, "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    return torch.arange(_DECODE_LAST_ROWS, dtype=torch.int32, device=device)
 
 
 @dataclass
@@ -179,6 +200,7 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self._window_ar = torch.arange(self.window_size, device=self.device)
+        self._decode_last = decode_last_cache(self.device)
 
     # Read the pool live: a runtime rebuild swaps it with no backend rebind (same reason the
     # model reads its buffers off ctx.kv_cache per access).
@@ -194,9 +216,11 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
-        last = torch.tensor(
-            [r.extend_len for r in batch.padded_reqs], dtype=torch.int32, device=self.device
-        ).cumsum_(0) - 1
+        last = self._decode_last_indices(batch)
+        if last is None:
+            last = torch.tensor(
+                [r.extend_len for r in batch.padded_reqs], dtype=torch.int32, device=self.device
+            ).cumsum_(0) - 1
         if not batch.is_decode:
             # Segments tile the flat token stream per request: (offset, extend_len, table_idx,
             # start_pos). Built host-side here (the scheduler stream under overlap) from the
@@ -307,6 +331,20 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         )
 
     # ----- internals --------------------------------------------------------------------
+    def _decode_last_indices(self, batch: Batch) -> torch.Tensor | None:
+        """A view of the cached decode ``arange`` when it equals the original
+        ``cumsum(extend_len) - 1``, else None (the caller builds it as before). Every padded
+        decode row -- real or the engine's dummy -- forwards exactly one token, so the
+        original values are ``arange(padded_size)``; the check makes any other shape fall
+        back instead of relying on that. Host-only: no device op is issued here."""
+        cached = getattr(self, "_decode_last", None)
+        if cached is None or not batch.is_decode:
+            return None
+        reqs = batch.padded_reqs
+        if len(reqs) > cached.shape[0] or any(r.extend_len != 1 for r in reqs):
+            return None
+        return cached[: len(reqs)]
+
     def _table_rows(self, batch: Batch) -> torch.Tensor:
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
         return batch.active_table_idx.to(torch.int64)

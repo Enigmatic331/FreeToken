@@ -7,7 +7,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.sparse_attn import sparse_attn_paged
 
-from .dsv4_sparse import DSV4SparseAttnBackend
+from .dsv4_sparse import DSV4SparseAttnBackend, decode_last_cache
 
 
 class DSV41SparseAttnBackend(DSV4SparseAttnBackend):
@@ -26,6 +26,7 @@ class DSV41SparseAttnBackend(DSV4SparseAttnBackend):
         self.capture_bs = []
         self.max_graph_bs = 0
         self._window_ar = torch.arange(self.window_size, device=self.device)
+        self._decode_last = decode_last_cache(self.device)
 
     def compress_pool(self, layer_id: int, tier: str) -> torch.Tensor:
         if tier == "attn":
