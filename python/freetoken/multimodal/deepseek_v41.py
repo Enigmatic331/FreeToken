@@ -55,12 +55,18 @@ class DeepseekV41Processor:
             results.append((patches, n_vit_h, n_vit_w, types))
         return results
 
-    def process(self, prompt: str, messages: Any) -> TokenizedMultimodalPrompt:
+    # tokenize.py hands over ids the control-token guard already built
+    accepts_prompt_ids = True
+
+    def process(
+        self, prompt: str, messages: Any, prompt_ids: list[int] | None = None
+    ) -> TokenizedMultimodalPrompt:
         sources = image_sources(messages)
         if not sources:
             raise ValueError("multimodal processing requested without an image")
         images = self._images(sources)
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        if prompt_ids is None:
+            prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         placeholder_count = sum(
             token == self.args.image_token_id for token in prompt_ids
         )

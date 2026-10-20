@@ -11,6 +11,7 @@ from freetoken.message import TokenizeMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
 
+from .control_guard import ControlTokenGuard
 from .effort import (
     EffortProfile,
     ThinkingProfile,
@@ -66,6 +67,10 @@ class TokenizeManager:
         self.enable_multimodal = enable_multimodal
         self._multimodal_processor = None
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
+        # Client text must not become control tokens on the encoder path (control_guard.py).
+        self._control_guard = (
+            ControlTokenGuard(tokenizer) if self._dsv4_encoder is not None else None
+        )
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
@@ -83,7 +88,19 @@ class TokenizeManager:
 
         results: list[TokenizedMultimodalPrompt] = []
         for msg in msgs:
-            prompt = self.render_prompt(msg)
+            prompt, originals = self._prepare_prompt(msg)
+            prompt_ids = None
+            if originals:
+                guard = self._control_guard
+                prompt_ids = guard.encode(
+                    prompt, originals, self._encode_template_segment, add_special_tokens=True
+                )
+                logger.info(
+                    "encoded %d reserved control-token strings in request %s as plain text",
+                    len(originals),
+                    msg.uid,
+                )
+                prompt = guard.restore(prompt, originals)
             sources = image_sources(msg.text)
             if sources:
                 if not self.enable_multimodal:
@@ -109,7 +126,23 @@ class TokenizeManager:
                         )
                     else:
                         self._multimodal_processor = QwenVLProcessor(str(model_path))
-                results.append(self._multimodal_processor.process(prompt, msg.text))
+                if prompt_ids is not None and getattr(
+                    self._multimodal_processor, "accepts_prompt_ids", False
+                ):
+                    results.append(
+                        self._multimodal_processor.process(
+                            prompt, msg.text, prompt_ids=prompt_ids
+                        )
+                    )
+                else:
+                    results.append(self._multimodal_processor.process(prompt, msg.text))
+                continue
+            if prompt_ids is not None:
+                results.append(
+                    TokenizedMultimodalPrompt(
+                        input_ids=torch.tensor(prompt_ids, dtype=torch.int32)
+                    )
+                )
                 continue
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None
             input_ids = self.tokenizer.encode(
@@ -125,8 +158,21 @@ class TokenizeManager:
         validate a request before committing an SSE stream. Sanitizes
         ``reasoning_effort`` first: every render path (worker, frontend
         validation, count_tokens) must quantize identically."""
+        prompt, originals = self._prepare_prompt(msg)
+        if originals:
+            prompt = self._control_guard.restore(prompt, originals)
+        return prompt
+
+    def _encode_template_segment(self, text: str) -> list[int]:
+        return self.tokenizer.encode(
+            text, return_tensors="pt", add_special_tokens=False
+        ).view(-1).tolist()
+
+    def _prepare_prompt(self, msg: TokenizeMsg) -> tuple[str, list[str]]:
+        """The rendered prompt plus, on the encoder path, the client texts that
+        were swapped for placeholders before rendering (empty when none were)."""
         if not isinstance(msg.text, list):
-            return msg.text
+            return msg.text, []
         if not self.enable_multimodal:
             from freetoken.multimodal.qwen_vl import image_sources
 
@@ -134,9 +180,25 @@ class TokenizeManager:
                 raise ValueError(
                     "image inputs are disabled; start the server with --vision-device"
                 )
-        return self._render(
+        return self._render_guarded(
             msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
         )
+
+    def _render_guarded(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any],
+    ) -> tuple[str, list[str]]:
+        if self._dsv4_encoder is not None:
+            return _apply_dsv4_chat_encoder(
+                self._dsv4_encoder,
+                messages,
+                tools,
+                chat_template_kwargs,
+                guard=self._control_guard,
+            )
+        return self._render(messages, tools, chat_template_kwargs), []
 
     def _render(
         self,
@@ -149,7 +211,7 @@ class TokenizeManager:
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs
-            )
+            )[0]
         # Broadcast the effort in every spelling the ecosystem's templates read
         # (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
         # variables) -- the same rule the thinking toggles use. An explicit
@@ -290,7 +352,10 @@ def _apply_dsv4_chat_encoder(
     messages: list[dict],
     tools: list[dict] | None,
     chat_template_kwargs: dict,
-) -> str:
+    guard: ControlTokenGuard | None = None,
+) -> tuple[str, list[str]]:
+    """Render with the checkpoint's encoder. With ``guard``, reserved strings in
+    client text are placeholders in the result and listed in the second element."""
     rendered_messages = [dict(message) for message in messages]
     for message in rendered_messages:
         if message.get("tool_calls"):
@@ -298,13 +363,18 @@ def _apply_dsv4_chat_encoder(
     if tools:
         _attach_tools_to_dsv4_messages(rendered_messages, tools)
 
+    originals: list[str] = []
+    if guard is not None:
+        rendered_messages, originals = guard.neutralize(rendered_messages)
+
     # No effort filtering here: the caller sanitized already, and the probe
     # needs raw values to reach the encoder's own validation.
-    return encoder.encode_messages(
+    prompt = encoder.encode_messages(
         rendered_messages,
         thinking_mode=resolve_thinking_mode(chat_template_kwargs, tools),
         reasoning_effort=chat_template_kwargs.get("reasoning_effort"),
     )
+    return prompt, originals
 
 
 def _dsv4_tool_calls(tool_calls: list[dict]) -> list[dict]:
