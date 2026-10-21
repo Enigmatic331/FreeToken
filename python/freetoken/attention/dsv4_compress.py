@@ -85,7 +85,9 @@ class CompressorBackendMixin:
         self, layer_id: int, tier: str, rows: torch.Tensor, kv: torch.Tensor
     ) -> None:
         pool = self.compress_pool(layer_id, tier)
-        pool.index_copy_(0, rows, kv.to(pool.dtype))
+        if isinstance(pool, torch.Tensor):
+            kv = kv.to(pool.dtype)
+        pool.index_copy_(0, rows, kv)  # a packed V4.1 pool takes PackedRows as is
 
     # ----- compress-state ring ---------------------------------------------------------
     def carry_state_loc(self, window_slot: int, ring_size: int) -> torch.Tensor:

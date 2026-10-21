@@ -6,6 +6,7 @@ import torch
 
 from freetoken.utils import init_logger
 
+from .dsv41_packed_kv import PackedRows, packed_kv_enabled_for_source
 from .dsv4_paged_pool import CompressStateRing, DSV4PagedKVCache
 
 
@@ -180,12 +181,17 @@ class DSV41PagedKVCache(DSV4PagedKVCache):
                 raise ValueError(f"V4.1 source layer {layer} has ratio {ratio}")
             self.cmp_scratch_base[layer] = sizes.cmp_blocks[layer]
             self.idx_scratch_base[layer] = sizes.idx_blocks[layer]
-            self.cmp_pool[layer] = torch.zeros(
-                sizes.cmp_blocks[layer] + self.n_scratch,
-                self.head_dim,
-                device=device,
-                dtype=dtype,
-            )
+            if packed_kv_enabled_for_source(layer):  # unpacked to identical BF16 in-kernel
+                self.cmp_pool[layer] = PackedRows.zeros(
+                    sizes.cmp_blocks[layer] + self.n_scratch, self.head_dim, device
+                )
+            else:
+                self.cmp_pool[layer] = torch.zeros(
+                    sizes.cmp_blocks[layer] + self.n_scratch,
+                    self.head_dim,
+                    device=device,
+                    dtype=dtype,
+                )
             self.idx_pool[layer] = torch.zeros(
                 sizes.idx_blocks[layer] + self.n_scratch,
                 self.index_head_dim,
@@ -212,7 +218,7 @@ class DSV41PagedKVCache(DSV4PagedKVCache):
             raise ValueError(f"layer {layer_id} has no V4.1 KV source")
         return max(candidates)
 
-    def compressed_pool_for(self, layer_id: int) -> torch.Tensor:
+    def compressed_pool_for(self, layer_id: int) -> torch.Tensor | PackedRows:
         source = self.source_layer_of(layer_id)
         result = self.cmp_pool[source]
         assert result is not None

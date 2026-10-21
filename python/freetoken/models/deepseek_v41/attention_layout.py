@@ -88,7 +88,12 @@ class AttentionLayout:
 
         if max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
-        item = 2  # compressed/window KV and index keys are BF16 dequantized storage
+        from freetoken.kvcache.dsv41_packed_kv import (
+            packed_kv_enabled_for_source,
+            packed_row_bytes,
+        )
+
+        item = 2  # window KV and index keys are BF16 dequantized storage
         window = self.args.n_layers * self.args.window_size * self.args.head_dim * item
         compressed = index = state = 0
         for layer_id in self.args.kv_source_layers:
@@ -96,7 +101,12 @@ class AttentionLayout:
             if max_seq_len % ratio:
                 raise ValueError(f"max_seq_len {max_seq_len} is not divisible by ratio {ratio}")
             rows = max_seq_len // ratio
-            compressed += rows * self.args.head_dim * item
+            cmp_row = (
+                packed_row_bytes(self.args.head_dim)
+                if packed_kv_enabled_for_source(layer_id)
+                else self.args.head_dim * item
+            )
+            compressed += rows * cmp_row
             index += rows * self.args.index_head_dim * item
             if ratio > 1:
                 # FP32 KV and softmax-score carries, each [ratio, head_dim].

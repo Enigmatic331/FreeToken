@@ -62,13 +62,23 @@ def dsv41_pool_sizes(
     )
 
 
+def _cmp_row_bytes(args, source_layer: int) -> int:
+    """One compressed main-KV row: BF16, or packed FP4 with FREETOKEN_DSV41_PACKED_KV."""
+    from .dsv41_packed_kv import packed_kv_enabled_for_source, packed_row_bytes
+
+    if packed_kv_enabled_for_source(source_layer):
+        return packed_row_bytes(int(args.head_dim))
+    return int(args.head_dim) * _BF16
+
+
 def dsv41_pool_bytes(sizes: DSV4PoolSizes, args, n_scratch: int = 1) -> int:
     kv_bytes = int(args.head_dim) * _BF16
     index_bytes = int(args.index_head_dim) * _BF16
     total = int(args.n_layers) * sizes.n_win_slots * kv_bytes
     total += (sizes.full_token + 1) * _INT64
     for layer, ratio in _sources(args):
-        total += (sizes.cmp_blocks[layer] + n_scratch) * kv_bytes
+        cmp_bytes = _cmp_row_bytes(args, layer)
+        total += (sizes.cmp_blocks[layer] + n_scratch) * cmp_bytes
         total += (sizes.idx_blocks[layer] + n_scratch) * index_bytes
         if ratio == 2:
             # One ring row is kv|score, each head_dim-wide FP32.
@@ -80,8 +90,9 @@ def dsv41_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
     kv_bytes = int(args.head_dim) * _BF16
     index_bytes = int(args.index_head_dim) * _BF16
     total = int(args.n_layers) * round(swa_ratio * P) * kv_bytes
-    for _layer, ratio in _sources(args):
-        total += (P // ratio) * (kv_bytes + index_bytes)
+    for layer, ratio in _sources(args):
+        cmp_bytes = _cmp_row_bytes(args, layer)
+        total += (P // ratio) * (cmp_bytes + index_bytes)
         if ratio == 2:
             total += round(swa_ratio * _PAIR_RING) * 2 * int(args.head_dim) * _FP32
     return int(total)
@@ -89,9 +100,9 @@ def dsv41_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
 
 def dsv41_kv_unit_bytes(args, P: int = 128) -> int:
     per_page = P * _INT64
-    for _layer, ratio in _sources(args):
+    for layer, ratio in _sources(args):
         per_page += (P // ratio) * (
-            int(args.head_dim) * _BF16 + int(args.index_head_dim) * _BF16
+            _cmp_row_bytes(args, layer) + int(args.index_head_dim) * _BF16
         )
     return -(-per_page // P)
 

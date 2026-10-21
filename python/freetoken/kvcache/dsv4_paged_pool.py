@@ -572,7 +572,11 @@ class DSV4PagedKVCache(BaseKVCachePool):
     def total_bytes(self) -> int:
         n = self.full_to_window.numel() * self.full_to_window.element_size()
         n += sum(t.numel() * t.element_size() for t in self.window_pool)
-        n += sum(t.numel() * t.element_size() for t in self.cmp_pool if t is not None)
+        n += sum(
+            t.numel_bytes() if hasattr(t, "numel_bytes") else t.numel() * t.element_size()
+            for t in self.cmp_pool
+            if t is not None
+        )
         n += sum(t.numel() * t.element_size() for t in self.idx_pool if t is not None)
         n += sum(
             r.buffer.numel() * r.buffer.element_size()

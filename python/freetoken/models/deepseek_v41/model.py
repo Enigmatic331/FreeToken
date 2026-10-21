@@ -334,14 +334,46 @@ class Attention(nn.Module):
         freqs = self.freqs_cis.index_select(0, positions)
         index_k = self.indexer.index_keys(latent[0], freqs)
         self.attn.compress_pool(self.layer_id, "idx").index_copy_(0, rows, index_k)
-        from freetoken.kernel.triton.dsv41 import rope_fp4_roundtrip
+        # Prefill publishes a large contiguous batch.  Packing contiguously and then
+        # copying its two compact planes is faster here than issuing random stores
+        # from every pack program.  Decode/verify keep the direct graph-safe writer.
+        self._store_compressed_rows(latent[0], freqs, rows, direct=False)
 
-        compressed = rope_fp4_roundtrip(
-            latent[0], freqs, self.rope_head_dim, compressed_kv=True
+    def _compressed_rows(self, latent: torch.Tensor, freqs: torch.Tensor):
+        """RoPE plus the checkpoint's FP4 rounding of compressed KV rows ``[n, dim]``:
+        BF16 values, or the same values packed when the pool is packed
+        (FREETOKEN_DSV41_PACKED_KV, kvcache/dsv41_packed_kv.py)."""
+        from freetoken.kernel.triton.dsv41 import rope_fp4_pack, rope_fp4_roundtrip
+        from freetoken.kvcache.dsv41_packed_kv import PackedRows
+
+        if isinstance(self.attn.compress_pool(self.layer_id, "attn"), PackedRows):
+            return rope_fp4_pack(latent, freqs, self.rope_head_dim)
+        return rope_fp4_roundtrip(
+            latent, freqs, self.rope_head_dim, compressed_kv=True
         )
-        self.attn.compress_pool(self.layer_id, "attn").index_copy_(
-            0, rows, compressed
-        )
+
+    def _store_compressed_rows(
+        self,
+        latent: torch.Tensor,
+        freqs: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        direct: bool = True,
+    ) -> None:
+        """RoPE/quantize and publish rows.
+
+        Graph-captured decode and verify use the direct indexed writer to avoid
+        temporary allocations and two extra launches.  Bulk prefill instead packs
+        contiguous rows first: its coalesced stores outperform per-row indexed stores.
+        """
+        from freetoken.kernel.triton.dsv41 import rope_fp4_pack_into
+        from freetoken.kvcache.dsv41_packed_kv import PackedRows
+
+        pool = self.attn.compress_pool(self.layer_id, "attn")
+        if isinstance(pool, PackedRows) and direct:
+            rope_fp4_pack_into(latent, freqs, self.rope_head_dim, pool, rows)
+            return
+        pool.index_copy_(0, rows, self._compressed_rows(latent, freqs))
 
     def _sparse_consumer_ids(
         self,
@@ -682,17 +714,7 @@ class Attention(nn.Module):
             completed,
         )
         self.attn.scatter_compressed(self.layer_id, "idx", idx_dest, index_k)
-        from freetoken.kernel.triton.dsv41 import rope_fp4_roundtrip
-
-        compressed = rope_fp4_roundtrip(
-            latent[:, 0],
-            group_freqs,
-            self.rope_head_dim,
-            compressed_kv=True,
-        )
-        self.attn.scatter_compressed(
-            self.layer_id, "attn", cmp_dest, compressed
-        )
+        self._store_compressed_rows(latent[:, 0], group_freqs, cmp_dest)
 
     def _publish_source_verify(
         self,
@@ -718,17 +740,7 @@ class Attention(nn.Module):
             positions, ratio, self.layer_id, "idx", completed
         )
         self.attn.scatter_compressed(self.layer_id, "idx", idx_dest, index_k)
-        from freetoken.kernel.triton.dsv41 import rope_fp4_roundtrip
-
-        compressed = rope_fp4_roundtrip(
-            latent,
-            group_freqs,
-            self.rope_head_dim,
-            compressed_kv=True,
-        )
-        self.attn.scatter_compressed(
-            self.layer_id, "attn", cmp_dest, compressed
-        )
+        self._store_compressed_rows(latent, group_freqs, cmp_dest)
 
     def _index_decode(
         self,
