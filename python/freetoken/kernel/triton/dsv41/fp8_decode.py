@@ -1,4 +1,4 @@
-"""Opt-in, exact-order native FP8 decode tuning for V4.1 on SM120.
+"""Opt-in, exact-order native FP8 decode tuning for V4.1.
 
 The native FP8 bytes, E8M0 scales, activation quantizer and split-K boundaries
 are unchanged. Only launch geometry and loop unrolling differ. Unsupported
@@ -23,6 +23,7 @@ from freetoken.kernel.triton.e4m3_compat import FORCE_EMU
 
 # Read once before startup warmup/capture; never switch an already loaded graph.
 ENABLED = os.getenv("FREETOKEN_DSV41_FP8_DECODE_TUNING", "0") == "1"
+SM89_ENABLED = os.getenv("FREETOKEN_DSV41_SM89_FP8_DECODE_TUNING", "0") == "1"
 
 # (N, K): (rows per CTA, unchanged split-K, warps, loop-unroll factor).
 # Qualified in isolation on all 290 native checkpoint projections. Whole-model
@@ -38,17 +39,40 @@ SM120_CONFIGS = {
     (32768, 1280): (32, 1, 2, 2),
 }
 
+# Qualified in isolation on four official-checkpoint weights per shape and
+# 1,006 byte-identical inputs per weight.  Full 40+40 checkpoint qualification
+# and whole-model serving qualification are required before deployment.
+SM89_CONFIGS = {
+    (5120, 8192): (16, 4, 2, 2),
+    (32768, 1280): (32, 1, 2, 2),
+}
+
+
+def _tuned_config(x: torch.Tensor, weight: torch.Tensor):
+    """Return this tensor-local device's opt-in config, or ``None``."""
+    if (not ENABLED and not SM89_ENABLED) or FORCE_EMU:
+        return None
+    if not x.is_cuda or weight.ndim != 2 or x.ndim < 1:
+        return None
+    if not x.shape[-1]:
+        return None
+    rows = x.numel() // x.shape[-1]
+    if rows not in (1, 2):
+        return None
+    shape = tuple(weight.shape)
+    if shape not in SM120_CONFIGS and shape not in SM89_CONFIGS:
+        return None
+    capability = torch.cuda.get_device_capability(x.device)
+    if capability == (12, 0) and ENABLED:
+        return SM120_CONFIGS.get(shape)
+    if capability == (8, 9) and SM89_ENABLED:
+        return SM89_CONFIGS.get(shape)
+    return None
+
 
 def use_tuned_decode(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Host-only routing; inspect the tensor's device, never a foreign rank."""
-    rows = x.numel() // x.shape[-1] if x.ndim >= 1 and x.shape[-1] else 0
-    return (
-        ENABLED and not FORCE_EMU and x.is_cuda
-        and weight.ndim == 2 and x.ndim >= 1
-        and rows in (1, 2)
-        and tuple(weight.shape) in SM120_CONFIGS
-        and torch.cuda.get_device_capability(x.device) == (12, 0)
-    )
+    return _tuned_config(x, weight) is not None
 
 
 @triton.jit
@@ -84,7 +108,7 @@ def tuned_fp8_linear_32(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """One/two-row SM120 path; caller must check ``use_tuned_decode`` first.
+    """One/two-row tuned path; caller must check ``use_tuned_decode`` first.
 
     Two-row decode deliberately reuses the qualified one-row kernel independently
     for each row.  Besides avoiding the tiny generic M=2 GEMM, this preserves the
@@ -106,7 +130,9 @@ def tuned_fp8_linear_32(
             dim=0,
         )
         return out.reshape(*lead, n)
-    bn, sk, nw, unroll = SM120_CONFIGS[(n, k)]
+    config = _tuned_config(x, weight)
+    assert config is not None
+    bn, sk, nw, unroll = config
     compute_dtype = x.dtype if x.dtype in _TL_DTYPE else torch.bfloat16
     sb = scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
     sb = sb.contiguous()

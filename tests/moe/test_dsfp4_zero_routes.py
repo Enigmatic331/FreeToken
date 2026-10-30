@@ -70,6 +70,43 @@ def test_decode_launch_geometry(monkeypatch, enabled, capability, sms, expected)
         fp4._decode_launch_geometry.cache_clear()
 
 
+@pytest.mark.parametrize("selected,kind,capability,expected", [
+    ("", "cuda", (8, 0), (64, 64, 64, 8, 8, 1)),
+    ("m32n64w4s2", "cpu", (8, 0), (64, 64, 64, 8, 8, 1)),
+    ("m32n64w4s2", "cuda", (8, 9), (64, 64, 64, 8, 8, 1)),
+    ("m32n64w4s2", "cuda", (8, 0), (32, 64, 64, 8, 4, 2)),
+    ("m32n64w8s1", "cuda", (8, 0), (32, 64, 64, 8, 8, 1)),
+    ("m64n32w4s2", "cuda", (8, 0), (64, 32, 64, 8, 4, 2)),
+])
+def test_prefill_launch_geometry(monkeypatch, selected, kind, capability, expected):
+    calls = []
+    device = torch.device(kind, 2) if kind == "cuda" else torch.device("cpu")
+    monkeypatch.setattr(fp4, "_SM80_PREFILL_CONFIG", selected)
+
+    def probe(actual):
+        calls.append(actual)
+        return capability
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", probe)
+    fp4._prefill_launch_geometry.cache_clear()
+    try:
+        assert fp4._prefill_launch_geometry(device) == expected
+        assert fp4._prefill_launch_geometry(device) == expected
+        assert calls == ([device] if selected and kind == "cuda" else [])
+    finally:
+        fp4._prefill_launch_geometry.cache_clear()
+
+
+def test_prefill_launch_geometry_rejects_unknown(monkeypatch):
+    monkeypatch.setattr(fp4, "_SM80_PREFILL_CONFIG", "mystery")
+    fp4._prefill_launch_geometry.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="unknown FREETOKEN_DSV41_SM80"):
+            fp4._prefill_launch_geometry(torch.device("cuda", 0))
+    finally:
+        fp4._prefill_launch_geometry.cache_clear()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("route_outputs", [False, True])

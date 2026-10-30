@@ -629,9 +629,12 @@ class MoE(nn.Module):
         self.fused_route_prep = _fused_route_prep_enabled()
         self.fused_decode_dispatch = _fused_decode_dispatch_enabled()
 
-    def attach_prefill_communicator(self, communicator) -> None:
+    def attach_prefill_communicator(
+        self, communicator, route_communicators=None
+    ) -> None:
         self._prefill_comm = communicator
         self.experts.prefill_communicator = communicator
+        self.experts.packed_prefill_communicators = route_communicators
 
     def _phase_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         root = self.execution.backbone_rank
@@ -642,13 +645,8 @@ class MoE(nn.Module):
         if self._prefill_comm is None and self.execution.participates_in_prefill:
             raise RuntimeError("V4.1 active prefill rank has no subgroup communicator")
         communicator = self._prefill_comm
-        if self.execution.rank == root:
-            for peer in self.execution.prefill_active_ranks:
-                if peer != root:
-                    communicator.send(tensor, peer)
-            return tensor
         if self.execution.participates_in_prefill:
-            return communicator.recv(tensor, root)
+            return communicator.broadcast(tensor, root)
         raise RuntimeError("inactive prefill rank attempted a phase broadcast")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

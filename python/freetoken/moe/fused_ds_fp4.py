@@ -31,6 +31,18 @@ _TL_DTYPE = None
 _SKIP_ZERO_ROUTES = os.environ.get("FREETOKEN_DSV41_SKIP_ZERO_ROUTES", "0") == "1"
 _SM89_WIDE_GRID = os.environ.get("FREETOKEN_DSV41_SM89_WIDE_GRID", "0") == "1"
 _PREFILL_SKIP_INACTIVE = os.environ.get("FREETOKEN_DSV41_PREFILL_SKIP_INACTIVE", "0") == "1"
+_SM80_PREFILL_CONFIG = os.environ.get("FREETOKEN_DSV41_SM80_FP4_PREFILL_CONFIG", "")
+
+
+_PREFILL_CONFIGS = {
+    # Accepted cross-architecture control.  Keep this as the default everywhere.
+    "control": (64, 64, 64, 8, 8, 1),
+    # SM80 candidates retain K=64, so they cannot change the per-output reduction
+    # tree.  They only trade route/N tile count, warp occupancy and load pipelining.
+    "m32n64w4s2": (32, 64, 64, 8, 4, 2),
+    "m32n64w8s1": (32, 64, 64, 8, 8, 1),
+    "m64n32w4s2": (64, 32, 64, 8, 4, 2),
+}
 
 
 @lru_cache(maxsize=None)
@@ -63,6 +75,28 @@ def _decode_launch_geometry(device: torch.device) -> tuple[int, int, int]:
     ):
         return 8, 128, 1
     return 16, 128, 1
+
+
+@lru_cache(maxsize=None)
+def _prefill_launch_geometry(device: torch.device) -> tuple[int, int, int, int, int, int]:
+    """Return ``(M, N, K, group-M, warps, stages)`` for grouped FP4 prefill.
+
+    Production historically used one SM90-oriented shape on every architecture.
+    The optional SM80 policy is deliberately architecture-gated and enumerated:
+    an unknown value fails at startup instead of silently changing serving math,
+    while non-SM80 ranks remain byte-for-byte on the accepted control path.
+    """
+    if not _SM80_PREFILL_CONFIG:
+        return _PREFILL_CONFIGS["control"]
+    if _SM80_PREFILL_CONFIG not in _PREFILL_CONFIGS:
+        choices = ", ".join(sorted(_PREFILL_CONFIGS))
+        raise ValueError(
+            "unknown FREETOKEN_DSV41_SM80_FP4_PREFILL_CONFIG="
+            f"{_SM80_PREFILL_CONFIG!r}; expected one of: {choices}"
+        )
+    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (8, 0):
+        return _PREFILL_CONFIGS["control"]
+    return _PREFILL_CONFIGS[_SM80_PREFILL_CONFIG]
 
 
 def _compute_type(dtype: torch.dtype):
@@ -282,12 +316,13 @@ def routed_experts_fp4_prefill(
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
     routes = T * top_k
-    # One static config for every density (no autotune): the kernel is
-    # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
-    # as tighter tiles while keeping the wgmma-wide M tile on sm_90.
+    # The accepted control remains the default.  An explicitly selected SM80
+    # shape can expose more CTAs on the 70-SM CMP ranks without perturbing the
+    # SM89/SM120 path or changing K=64's accumulation order.
+    bm, bn, bk, gm, nw, ns = _prefill_launch_geometry(x.device)
     cfg = dict(
-        BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
-        num_warps=8, num_stages=1,
+        BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk, GROUP_SIZE_M=gm,
+        num_warps=nw, num_stages=ns,
     )
     skip_inactive = _PREFILL_SKIP_INACTIVE and activation_block_size == 32
     if skip_inactive:

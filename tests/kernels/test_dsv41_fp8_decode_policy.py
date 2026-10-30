@@ -25,6 +25,14 @@ def test_preserves_splitk(shape, cfg):
     assert cfg[3] in (1,2)
 
 
+@pytest.mark.parametrize("shape,cfg", tuned.SM89_CONFIGS.items())
+def test_sm89_preserves_splitk(shape, cfg):
+    n,k = shape
+    assert cfg[1] == _decode_cfg(n,k,32)[1]
+    assert n % 32 == k % (cfg[1]*32) == 0
+    assert cfg[3] in (1,2)
+
+
 @pytest.mark.parametrize("case", ["disabled","emulated","cpu","prefill","unknown","sm89","sm80"])
 def test_fallbacks_do_not_route_to_tuned_kernel(monkeypatch, case):
     monkeypatch.setattr(tuned,"ENABLED",case != "disabled")
@@ -63,6 +71,25 @@ def test_two_row_decode_routes_to_tuned_kernel(monkeypatch, shape):
     )
     assert tuned.use_tuned_decode(tensor(shape), tensor((512, 5120)))
     assert queried == ["cuda:7"]
+
+
+@pytest.mark.parametrize("shape", [(1, 8192), (2, 1280)])
+def test_sm89_routes_only_separately_enabled_qualified_shapes(monkeypatch, shape):
+    monkeypatch.setattr(tuned, "ENABLED", False)
+    monkeypatch.setattr(tuned, "SM89_ENABLED", True)
+    monkeypatch.setattr(tuned, "FORCE_EMU", False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    weight = (5120, 8192) if shape[-1] == 8192 else (32768, 1280)
+    assert tuned.use_tuned_decode(tensor(shape), tensor(weight))
+    assert not tuned.use_tuned_decode(tensor((1, 5120)), tensor((512, 5120)))
+
+
+def test_sm89_flag_does_not_route_sm120(monkeypatch):
+    monkeypatch.setattr(tuned, "ENABLED", False)
+    monkeypatch.setattr(tuned, "SM89_ENABLED", True)
+    monkeypatch.setattr(tuned, "FORCE_EMU", False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    assert not tuned.use_tuned_decode(tensor((1, 8192)), tensor((5120, 8192)))
 
 
 @pytest.mark.parametrize("selected", [False,True])

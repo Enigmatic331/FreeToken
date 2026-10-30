@@ -1025,11 +1025,14 @@ class MoEState(nn.Module):
             if len(peers) == 1:
                 self.experts.packed_prefill_peer_rank = peers[0]
 
-    def attach_prefill_communicator(self, communicator) -> None:
+    def attach_prefill_communicator(
+        self, communicator, route_communicators=None
+    ) -> None:
         if self.experts is None:
             raise RuntimeError("routed experts must be attached first")
         self._prefill_comm = communicator
         self.experts.prefill_communicator = communicator
+        self.experts.packed_prefill_communicators = route_communicators
 
     def _phase_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         """Exclude decode-only auxiliary ranks from prefill collectives."""
@@ -1043,13 +1046,8 @@ class MoEState(nn.Module):
         if self._prefill_comm is None and self.execution.participates_in_prefill:
             raise RuntimeError("V4.1 active prefill rank has no subgroup communicator")
         communicator = self._prefill_comm
-        if self.execution.rank == root:
-            for peer in self.execution.prefill_active_ranks:
-                if peer != root:
-                    communicator.send(tensor, peer)
-            return tensor
         if self.execution.participates_in_prefill:
-            return communicator.recv(tensor, root)
+            return communicator.broadcast(tensor, root)
         raise RuntimeError("inactive prefill rank attempted a phase broadcast")
 
     def forward(
@@ -1520,10 +1518,14 @@ class Transformer(nn.Module):
             )
             logger.info("CSA2-S sparse consumer logits on layers %s", sparse_layers)
 
-    def attach_prefill_communicator(self, communicator) -> None:
+    def attach_prefill_communicator(
+        self, communicator, route_communicators=None
+    ) -> None:
         self._attach_routed_experts()
         for block in self.layers:
-            block.ffn.attach_prefill_communicator(communicator)
+            block.ffn.attach_prefill_communicator(
+                communicator, route_communicators
+            )
 
     def attach_engram_table(self, layer_id: int, table) -> None:
         block = self.layers[layer_id]
@@ -1869,9 +1871,11 @@ class DeepseekV41ExpertWorkerModel:
     def attach_engram_coordinator(self, coordinator) -> None:
         self.engram_coordinator = coordinator
 
-    def attach_prefill_communicator(self, communicator) -> None:
+    def attach_prefill_communicator(
+        self, communicator, route_communicators=None
+    ) -> None:
         for layer in self.layers:
-            layer.attach_prefill_communicator(communicator)
+            layer.attach_prefill_communicator(communicator, route_communicators)
 
     def forward(self, input_ids: torch.Tensor, cone=None) -> torch.Tensor:
         if self.engram_coordinator is None:
@@ -2255,6 +2259,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                 device_id=torch.device("cuda", torch.cuda.current_device()),
             )
         prefill_group = None
+        prefill_route_groups = {}
         if self._execution.uses_prefill_subgroup:
             prefill_ranks = self._execution.prefill_active_ranks
             # Every global rank calls new_group in the same order; inactive
@@ -2270,6 +2275,17 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
                 timeout=timedelta(seconds=engine_config.distributed_timeout),
                 device_id=torch.device("cuda", torch.cuda.current_device()),
             )
+            if len(prefill_ranks) > 2:
+                root = self._execution.backbone_rank
+                for peer in prefill_ranks:
+                    if peer == root:
+                        continue
+                    prefill_route_groups[peer] = torch.distributed.new_group(
+                        ranks=[root, peer],
+                        backend="nccl",
+                        timeout=timedelta(seconds=engine_config.distributed_timeout),
+                        device_id=torch.device("cuda", torch.cuda.current_device()),
+                    )
             # Inactive prefill ranks wait here without submitting an early NCCL
             # collective ahead of the active ranks' point-to-point route traffic.
             self._phase_barrier_group = torch.distributed.new_group(
@@ -2319,8 +2335,28 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         ):
             if prefill_group is None:
                 raise RuntimeError("V4.1 active prefill rank has no NCCL subgroup")
+            prefill_communicator = TorchProcessGroupCommunicator(
+                prefill_group, name="prefill"
+            )
+            route_communicators = None
+            if prefill_route_groups:
+                root = self._execution.backbone_rank
+                route_communicators = {}
+                for peer, group in prefill_route_groups.items():
+                    if rank not in (root, peer):
+                        continue
+                    remote = peer if rank == root else root
+                    route = TorchProcessGroupCommunicator(
+                        group, name=f"prefill-routes-{root}-{peer}"
+                    )
+                    warm = torch.zeros(
+                        1, dtype=torch.int32,
+                        device=torch.device("cuda", torch.cuda.current_device()),
+                    )
+                    route.broadcast(warm, root)
+                    route_communicators[remote] = route
             self._model.attach_prefill_communicator(
-                TorchProcessGroupCommunicator(prefill_group, name="prefill")
+                prefill_communicator, route_communicators
             )
         coordinator = EngramCoordinator(
             tables, execution=self._execution, communicator=communicator

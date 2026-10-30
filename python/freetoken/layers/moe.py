@@ -802,7 +802,19 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             )
         return peers[0]
 
-    def _packed_prefill_communicator(self):
+    def _packed_prefill_communicator(self, peer: int | None = None):
+        pairwise = getattr(self, "packed_prefill_communicators", None)
+        if pairwise is not None:
+            if peer is None:
+                raise RuntimeError(
+                    "multi-peer packed prefill requires an explicit remote peer"
+                )
+            try:
+                return pairwise[int(peer)]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"no packed prefill communicator for remote peer {peer}"
+                ) from exc
         communicator = getattr(self, "prefill_communicator", None)
         return communicator if communicator is not None else DistributedCommunicator()
 
@@ -912,10 +924,13 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                 )
             pending.append((peer, indices, packed, scale))
 
-        communicator = self._packed_prefill_communicator()
+        pairwise = getattr(self, "packed_prefill_communicators", None)
+        communicator = self._packed_prefill_communicator(
+            remote_indices[0][0] if len(remote_indices) == 1 else None
+        ) if pairwise is None or len(remote_indices) == 1 else None
         recv_many = (
             getattr(communicator, "recv_many", None)
-            if _EP_PACKED_GROUPED_P2P
+            if _EP_PACKED_GROUPED_P2P and communicator is not None
             else None
         )
         if recv_many is not None:
@@ -937,11 +952,12 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             for peer, _indices, packed, scale in pending:
                 if packed is None:
                     continue
+                peer_communicator = self._packed_prefill_communicator(peer)
                 if scale is not None:
                     # The native NCCL wrapper has no FP8/uint8 datatype mapping.
                     # Four E4M3 values are carried as one int32 word.
-                    communicator.recv(scale, peer)
-                communicator.recv(packed, peer)
+                    peer_communicator.recv(scale, peer)
+                peer_communicator.recv(packed, peer)
         self._packed_prefill_pending = (tuple(pending), recv_stream)
 
     def routed_forward(
@@ -1006,10 +1022,10 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
                 f"{tuple(routes.shape[:2])} != {tuple(local_topk_weights.shape)}"
             )
 
-        communicator = self._packed_prefill_communicator()
         flat_routes = routes.view(-1, routes.shape[-1])
         owned = local_topk_weights.ne(0).reshape(-1)
         if info.rank != root:
+            communicator = self._packed_prefill_communicator(root)
             owned_indices = torch.nonzero(owned, as_tuple=False).flatten()
             if owned_indices.numel() != 0:
                 packed = flat_routes.index_select(0, owned_indices).contiguous()
@@ -1053,6 +1069,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             for peer, remote_indices in remote:
                 if remote_indices.numel() == 0:
                     continue
+                communicator = self._packed_prefill_communicator(peer)
                 if _EP_PACKED_WIRE_DTYPE == "fp8":
                     scale = routes.new_empty(
                         (remote_indices.numel(),), dtype=torch.bfloat16
@@ -1233,7 +1250,7 @@ class ExpertParallelOffloadMoELayer(OffloadMoELayer):
             # Mark before sending, so even a failed send cannot let this stream
             # recycle a buffer that an already queued send may still read.
             tensor.record_stream(send_stream)
-        communicator = self._packed_prefill_communicator()
+        communicator = self._packed_prefill_communicator(root)
         with torch.cuda.stream(send_stream):
             for tensor in payload:
                 communicator.send(tensor, root)
