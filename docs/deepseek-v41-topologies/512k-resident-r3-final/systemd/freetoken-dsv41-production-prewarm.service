@@ -1,0 +1,17 @@
+[Unit]
+Description=FreeToken DeepSeek V4.1 production stochastic prewarm and readiness gate
+Requires=freetoken-dsv41-production.service
+After=freetoken-dsv41-production.service network-online.target
+
+[Service]
+Type=oneshot
+User=enigmatic331
+Group=enigmatic331
+StateDirectory=freetoken-dsv41
+ExecStart=/usr/local/libexec/freetoken-dsv41-production-prewarm.py --receipt /var/lib/freetoken-dsv41/prewarm.json
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

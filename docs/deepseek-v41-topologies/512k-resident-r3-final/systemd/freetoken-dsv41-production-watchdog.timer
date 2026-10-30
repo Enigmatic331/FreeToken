@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic health guard for FreeToken DeepSeek V4.1 production
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=3min
+RandomizedDelaySec=10s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

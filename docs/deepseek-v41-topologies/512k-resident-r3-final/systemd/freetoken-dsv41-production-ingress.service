@@ -1,0 +1,17 @@
+[Unit]
+Description=Proxy stable DeepSeek V4.1 production ingress to qualified loopback service
+Requires=freetoken-dsv41-production-ingress.socket
+After=freetoken-dsv41-production-ingress.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19291
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+TimeoutStopSec=10s

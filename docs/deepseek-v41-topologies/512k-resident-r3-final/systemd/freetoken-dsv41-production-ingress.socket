@@ -1,0 +1,13 @@
+[Unit]
+Description=Stable Docker/Tokios ingress for FreeToken DeepSeek V4.1 production
+Requires=docker.service freetoken-dsv41-production-prewarm.service
+After=docker.service freetoken-dsv41-production-prewarm.service
+
+[Socket]
+ListenStream=172.17.0.1:1919
+Accept=no
+NoDelay=true
+Service=freetoken-dsv41-production-ingress.service
+
+[Install]
+WantedBy=sockets.target

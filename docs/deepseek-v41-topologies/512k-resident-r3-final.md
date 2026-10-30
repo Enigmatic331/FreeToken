@@ -71,6 +71,12 @@ release bundle and operator runbook are retained under:
   release-512k-residentr3-final/
 ```
 
+The exact production systemd units, prewarm/watchdog helpers, and sealed OCR
+fixture are also versioned in
+[`512k-resident-r3-final/`](512k-resident-r3-final/README.md). They retain the
+qualified host paths and GPU UUIDs intentionally and must be reviewed before
+installation on another machine.
+
 Do not copy this topology to a different driver, PCIe layout, GPU order, or
 checkpoint without rerunning exact output, near-capacity, cleanup, and thermal
 gates.

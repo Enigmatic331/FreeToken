@@ -1,0 +1,57 @@
+[Unit]
+Description=FreeToken DeepSeek V4.1 Flash 512K resident-r3 production (final)
+Wants=network-online.target docker.service romed8-dimm-fan-control.service freetoken-dsv41-production-prewarm.service freetoken-dsv41-production-ingress.socket
+After=network-online.target docker.service romed8-dimm-fan-control.service
+StartLimitIntervalSec=1800
+StartLimitBurst=2
+Conflicts=freetoken-dsv41-dualcmp-controlc-512k-residentr3-prefill-candidate.service freetoken-dsv41-dualcmp-controlc-512k-stackedprefill-candidate.service freetoken-dsv41-dualcmp-controlc-384k-candidate.service freetoken-deepseek-256k-ep3-4090-native-vision.service freetoken-deepseek-experimental.service freetoken-deepseek.service
+
+[Service]
+Type=exec
+User=enigmatic331
+Group=enigmatic331
+WorkingDirectory=/home/enigmatic331/models/worktrees/FreeToken-dsv41-sm89-fp8-r3prefill
+Environment=PYTHONPATH=/home/enigmatic331/models/dsv41-flash-results/2026-10-29-dual-cmp-topology/runtime-overlay:/home/enigmatic331/models/worktrees/FreeToken-dsv41-sm89-fp8-r3prefill/python
+Environment=CUDA_VISIBLE_DEVICES=GPU-b07c6380-30b2-6f41-08a8-7600ecf0b77f,GPU-d2a539a9-01d9-756a-3070-4575e0e5038d,GPU-72bae46d-4409-18f9-0de5-94efdae9e359,GPU-004c0f0f-3341-09af-24cf-4334c542124a
+Environment=NCCL_P2P_DISABLE=1
+Environment=NCCL_IB_DISABLE=1
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=TRITON_CACHE_DIR=/home/enigmatic331/models/dsv41-flash-results/2026-10-29-dual-cmp-topology/residentr3-serving-cache-triton-attempt1
+Environment=FREETOKEN_KERNEL_CACHE_DIR=/home/enigmatic331/models/dsv41-flash-results/2026-10-29-dual-cmp-topology/residentr3-serving-cache-freetoken-attempt1
+Environment="TVM_FFI_CUDA_ARCH_LIST=8.0 8.9"
+Environment=TVM_FFI_CACHE_DIR=/home/enigmatic331/models/dsv41-flash-results/2026-10-29-dual-cmp-topology/residentr3-serving-cache-tvm-attempt1
+Environment=FREETOKEN_DSV41_PACKED_KV=0
+Environment=FREETOKEN_DSV41_PACKED_KV_SOURCES=
+Environment=FREETOKEN_DSV41_INDEXER_MAX_LOGITS_MB=512
+Environment=FREETOKEN_DSV41_CUDA_GRAPH=1
+Environment=FREETOKEN_DSV41_DECODE_REFILL_OVERLAP=1
+Environment=FREETOKEN_DSV41_FUSED_ROUTE_PREP=1
+Environment=FREETOKEN_DSV41_FUSED_DECODE_DISPATCH=1
+Environment=FREETOKEN_MOE_PRELOAD_FULL=1
+Environment=FREETOKEN_DSV41_PHASE_CACHE_PRIORITY=1
+Environment=FREETOKEN_DSV41_PREFILL_SKIP_INACTIVE=1
+Environment=FREETOKEN_DSV41_AUTHORITY_FUSION=1
+Environment=FREETOKEN_DSV41_NATIVE_BF16_HEAD=1
+Environment=FREETOKEN_DSV41_SM89_FP8_DECODE_TUNING=1
+Environment=FREETOKEN_DSV41_FP8_DECODE_TUNING=0
+Environment=FREETOKEN_EP_PREFILL_ROUTE_TILE_TOKENS=4096
+Environment=FREETOKEN_EP_PACKED_ASYNC_SEND=1
+Environment=FREETOKEN_DSV41_SM80_FP4_PREFILL_CONFIG=m64n32w4s2
+Environment=FREETOKEN_LOAD_VISION=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+Environment=MALLOC_ARENA_MAX=4
+Environment=LOG_PID=1
+ExecStart=/home/enigmatic331/FreeToken/.venv/bin/python -B -m freetoken.cli serve --model /home/enigmatic331/models/DeepSeek-V4.1-Flash-1017 --served-model-name DeepSeek-V4.1-Flash-1017 --host 127.0.0.1 --port 19291 --gpu 0,1,2,3 --tp-size 4 --disable-pynccl --dsv41-backbone-rank 0 --dsv41-expert-shards 80,140,84,80 --dsv41-prefill-expert-shards 160,144,0,80 --dsv41-expert-storage-ranges 0:160,80:224,220:84,304:80 --dsv41-engram-ranks 0,1 --max-running-requests 1 --max-seq-len-override 524288 --max-prefill-length 8192 --num-tokens 524288 --swa-full-tokens-ratio 0.28125 --memory-ratio 0.90 --cache-type radix --moe-backend offload --moe-cache-sizes 960,1472,3360,3360 --moe-prefill-hit-d2d --moe-collect-stats --expert-load serial --attention-backend dsv4_sparse --cuda-graph-max-bs 1 --sampling-defaults none --default-temperature 1.0 --default-top-p 0.95 --reasoning-parser deepseekv32 --default-reasoning-effort 25 --decode-log-interval 8 --moe-sparse-prefill-max-tokens 256 --vision-device 0
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=infinity
+TimeoutStopSec=5min
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=freetoken-dsv41-production
+
+[Install]
+WantedBy=multi-user.target

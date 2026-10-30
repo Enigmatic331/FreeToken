@@ -1,0 +1,9 @@
+[Unit]
+Description=Bounded health recovery for FreeToken DeepSeek V4.1 production
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/freetoken-dsv41-production-watchdog.py
+StateDirectory=freetoken-dsv41
+TimeoutStartSec=90s
