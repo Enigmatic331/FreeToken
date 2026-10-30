@@ -86,9 +86,15 @@ def wait_idle(deadline_s: float = 90, *, allow_uninitialized: bool = False) -> d
 
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
-    os.replace(temporary, path)
+    # A fixed ``prewarm.json.tmp`` can be left behind by an interrupted or
+    # manually run root invocation and then block the unprivileged service.
+    # A per-process temporary name makes retries independent of stale files.
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:

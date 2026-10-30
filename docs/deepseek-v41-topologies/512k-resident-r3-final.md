@@ -58,6 +58,36 @@ compute while retaining a measured 2,924 MiB minimum free at 506K context.
   cold 40K and 21.3776 token/s median decode, with the full topology passing
   soak, cancellation, and boot-readiness gates.
 
+### Ada tensor-rate unlock qualification
+
+The production host also qualifies `gpu-unlock` 1.1.1 for the exact RTX 4090
+and RTX 4080 SUPER PCI addresses. Both devices must independently report
+`fmla32=0`, `imla2=0`, and `imla4=0`; a kernel log message alone is not an
+acceptance check. The 4080 SUPER path is explicitly experimental and is never
+selected through a wildcard target.
+
+With only the RTX 4090 unlocked, the sealed 40K gate measured 32.5571 seconds
+median TTFT / 1,228.61 prefill token/s. With both Ada devices unlocked, it
+measured 31.8289 seconds / 1,256.72 token/s across three exact repeats, with a
+31.7950-31.8537 second 95% mean confidence interval. That is a further 2.24%
+TTFT reduction relative to the 4090-only boot and 4.21% relative to stock.
+The combined decode median was 21.5084 token/s, effectively flat (-0.13%)
+relative to the 4090-only result and 0.61% above stock. All exact hashes,
+zero-static-CMP-miss checks, cleanup, and thermal gates passed; the combined
+40K run peaked at 68C GPU / 56C DIMM.
+
+The ordinary GRUB boot carries the exact-address targets, rather than relying
+on a one-shot menu entry:
+
+```text
+gpu_unlock.targets=0000:c1:00.0,0000:45:00.0 gpu_unlock.ad103_experimental=1
+```
+
+The enabled post-boot collector records kernel evidence, exact UUID-bound
+rate readbacks, model readiness, and a PASS/FAIL receipt on every matching
+boot. Preserve a stock GRUB rollback and do not promote a different card,
+VBIOS, driver, kernel, or PCI address without repeating these gates.
+
 ## Production identity
 
 The machine release uses `freetoken-dsv41-production.service`, loopback

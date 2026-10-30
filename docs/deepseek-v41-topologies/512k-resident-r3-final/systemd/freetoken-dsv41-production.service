@@ -1,6 +1,6 @@
 [Unit]
 Description=FreeToken DeepSeek V4.1 Flash 512K resident-r3 production (final)
-Wants=network-online.target docker.service romed8-dimm-fan-control.service freetoken-dsv41-production-prewarm.service freetoken-dsv41-production-ingress.socket
+Wants=network-online.target docker.service romed8-dimm-fan-control.service freetoken-dsv41-production-prewarm.service
 After=network-online.target docker.service romed8-dimm-fan-control.service
 StartLimitIntervalSec=1800
 StartLimitBurst=2
